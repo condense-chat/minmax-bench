@@ -1,0 +1,134 @@
+"""Strategy model.
+
+The benchmark's strategy set is a **matrix** of :class:`Strategy` entries. Each
+entry pairs a generic :class:`StrategyRunner` (the reusable *implementation* of a
+technique — condense, headroom, …) with a :class:`StrategyConfig` (its vars,
+e.g. condense's dense profile + sync/async mode). Resolving an entry yields a
+:class:`ResolvedStrategy` — the concrete, executor-facing object (endpoint +
+headers) that :mod:`minmax_bench.executors` consumes.
+
+Two execution kinds exist:
+* ``proxy`` — an HTTP endpoint that rewrites the request server-side.
+* ``noop``  — the mandatory uncompressed baseline (the "vanilla" run).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+from ..models import Provider
+
+ExecutorKind = Literal["proxy", "noop"]
+CacheModel = Literal["retroactive", "none"]
+
+
+@dataclass
+class ProxyConfig:
+    """How to reach a proxy strategy and forward to the real upstream."""
+
+    base_url: str
+    provider: Provider = Provider.anthropic
+    # Env var holding the UPSTREAM provider key the proxy forwards with.
+    api_key_env: str = "ANTHROPIC_API_KEY"
+    extra_headers: dict[str, str] = field(default_factory=dict)
+    anthropic_version: str = "2023-06-01"
+    # Optional anthropic-beta header value (e.g. 1M-context) for Anthropic proxies.
+    anthropic_beta: str | None = None
+    # Full endpoint path override (e.g. condense mounts "/anthropic/v1/messages").
+    # When None, the default provider path is used.
+    path: str | None = None
+    # Minimum seconds between requests to this endpoint (the shared EndpointGate
+    # paces global request starts to stay under the proxy's rate limit).
+    min_request_interval: float = 0.0
+    # "Think time" inserted *after* each turn, proportional to that turn's output
+    # tokens (out_tokens * this), to simulate a real user reading/working before the
+    # next request. Gives background (async) compaction wall-clock time to land, so
+    # async savings are measured realistically. 0 = no wait (e.g. sync mode).
+    think_secs_per_output_token: float = 0.0
+    # Upper bound on a single turn's think time (0 = uncapped), so one huge output
+    # turn doesn't stall the run for minutes.
+    think_cap_seconds: float = 0.0
+    # Header name this proxy uses to key its own session cache by our per-run test
+    # uuid (e.g. condense's "x-condense-session-id"). None = the proxy has no such
+    # cache, so no session header is sent (avoids leaking one strategy's header
+    # onto another strategy's requests).
+    session_id_header: str | None = None
+    # Flatten history tool_use/tool_result into text and send no structured tool
+    # calls. Needed for Gemini's OpenAI endpoint, which rejects functionCall parts
+    # that lack a thought_signature.
+    flatten_tools: bool = False
+
+
+@dataclass
+class ResolvedStrategy:
+    """Concrete, executor-facing strategy (a matrix entry resolved with its config)."""
+
+    name: str
+    kind: ExecutorKind
+    description: str = ""
+    proxy: ProxyConfig | None = None
+    # Informational: how the strategy interacts with prompt caching.
+    #   retroactive -> rewrites historical turns; may invalidate cache (condense)
+    #   none        -> baseline
+    cache_model: CacheModel = "retroactive"
+
+    def __post_init__(self):
+        if self.kind == "proxy" and self.proxy is None:
+            raise ValueError(f"proxy strategy {self.name!r} needs a ProxyConfig")
+
+
+@dataclass
+class StrategyConfig:
+    """The vars for one matrix variant (e.g. condense's ``profile`` + ``mode``)."""
+
+    params: dict[str, Any] = field(default_factory=dict)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        v = self.params.get(key, default)
+        return default if v is None else v
+
+
+class StrategyRunner:
+    """Generic, reusable implementation of a technique. Subclasses build a
+    :class:`ResolvedStrategy` from a :class:`StrategyConfig`.
+
+    ``tool`` names the local tool the runner needs (for auto-setup / preflight),
+    or ``None`` for pure-local runners (noop, upstream, rewrite).
+    """
+
+    key: str = ""
+    kind: ExecutorKind = "noop"
+    tool: str | None = None
+
+    def build(self, name: str, config: StrategyConfig) -> ResolvedStrategy:
+        raise NotImplementedError
+
+    def describe(self, config: StrategyConfig) -> str:  # noqa: ARG002
+        return ""
+
+
+@dataclass
+class Strategy:
+    """One matrix entry: a named ``runner + config`` variant to benchmark."""
+
+    name: str
+    runner: StrategyRunner
+    config: StrategyConfig = field(default_factory=StrategyConfig)
+    enabled: bool = True     # pre-selected in the wizard
+    mandatory: bool = False  # always runs (the vanilla baseline)
+
+    @property
+    def kind(self) -> ExecutorKind:
+        return self.runner.kind
+
+    @property
+    def tool(self) -> str | None:
+        return self.runner.tool
+
+    @property
+    def description(self) -> str:
+        return self.runner.describe(self.config)
+
+    def resolve(self) -> ResolvedStrategy:
+        return self.runner.build(self.name, self.config)

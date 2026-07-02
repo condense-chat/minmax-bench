@@ -1,0 +1,198 @@
+# minmax-bench
+
+**A token- and cost-savings benchmark for context-reduction proxies.**
+
+`minmax-bench` takes real coding-agent sessions, replays them turn-by-turn the way
+a harness actually calls the model, drives each turn through a context-reduction
+**strategy**, and reports how many **tokens** and how much **USD** each strategy
+saves — bucketed by input-chain length and accounting for prompt caching.
+
+It compares proxies like [`headroom`](https://pypi.org/project/headroom-ai/) and
+`condense` on an equal footing, using only their **public** interfaces — no access
+to any strategy's source is required.
+
+> **Scope.** This repo measures **cost** (tokens and dollars). It does *not* yet
+> measure whether a compressed session stays *correct* — trajectory / quality
+> evaluations that prove the reductions don't degrade the agent are planned
+> follow-up work, not included here.
+
+## Methodology
+
+```
+session ─▶ harness simulator ─▶ [request points] ─▶ strategy (via executor) ─▶ usage ─▶ cost ─▶ bucketed report
+```
+
+- **Harness simulator.** A recorded session is chopped into the exact sequence of
+  model calls a real harness would make: each assistant turn is one call whose
+  request prefix is every preceding message (user → tool_use → tool_result →
+  assistant → …). Replayed deterministically from the transcript.
+- **Scored against the uncompressed baseline.** Every strategy is compared to the
+  *baseline* (no compression) for the same `(session, turn)`, then **bucketed by
+  the baseline input-chain length** so every strategy is bucketed identically and
+  comparisons are apples-to-apples.
+- **Caching is modeled, on purpose.** Savings that destroy the prompt cache aren't
+  real savings. Proxy strategies rewrite *historical* turns, which can invalidate
+  the cache from the edit point on. The proxy executor reads the upstream's real,
+  cache-aware `usage` (cache-read vs cache-write tiers); cost uses cache-aware
+  per-model pricing. That's why the **cost** tables differ from the raw-token
+  tables — a strategy can save tokens yet cost more if it trades cheap cache-reads
+  for dearer cache-writes.
+- **The 200k context cap.** Models have a hard context ceiling (Haiku: 200k). A
+  turn whose prompt exceeds it is rejected, so runs can be **truncated to a token
+  budget** (`--token-budget 190k`) to keep every scored turn valid — otherwise the
+  deepest turns of long sessions drop out and skew the buckets.
+
+Two measurement paths (executors):
+
+- **proxy** — send the real request to the strategy's Anthropic/OpenAI-compatible
+  proxy, capped to 1 output token, and read the upstream's real cache-aware
+  `usage` (reflecting the proxy's server-side compression). Used for `headroom`,
+  `condense`, `upstream`, `gemini`.
+- **noop** — the uncompressed baseline (recorded usage, or a local token count).
+
+## Install
+
+Requires [uv](https://docs.astral.sh/uv/) and Python ≥ 3.11.
+
+```bash
+uv sync                 # core
+uv sync --extra hf      # + HuggingFace loaders for the SWE-chat dataset
+cp .env.dist .env       # then fill in only the keys for what you run
+```
+
+## Quick start (offline, no keys)
+
+The richest no-spend demo is re-scoring and replaying the committed reference runs
+(see [Checking the cached replays](#checking-the-cached-replays)):
+
+```bash
+uv run minmax-bench report 202f98bd-a2f1-4390-8307-658b451b7727   # per-bucket tables
+uv run minmax-bench replay 202f98bd-a2f1-4390-8307-658b451b7727   # animated evolution
+uv run minmax-bench strategies                                    # list strategies
+uv run minmax-bench info                                          # configured keys/endpoints
+```
+
+A `run` on the built-in sample computes the baseline offline (every comparison
+strategy is a proxy that needs keys — see below — so those turns are skipped
+without them):
+
+```bash
+uv run minmax-bench run --dataset sample
+```
+
+## Running against real strategies
+
+```bash
+# headroom (proxy): pip install "headroom-ai[proxy]" then run the proxy
+headroom proxy --port 8787 --mode cache      # or --mode token (max compression)
+uv run minmax-bench run -d swe-chat:32 -s headroom -m claude-haiku-4-5
+
+# condense (proxy): creds are read from the local `dense` CLI config (~/.config/dense)
+uv run minmax-bench run -d swe-chat:32 -s condense-async -m claude-haiku-4-5
+
+# gemini (direct, OpenAI-compatible chat/completions): set GEMINI_API_KEY in .env
+uv run minmax-bench run -d swe-chat:32 -s gemini -m gemini-3.1-flash-lite
+```
+
+> **Proxy runs cost real money.** Each request hits the real upstream (with
+> `max_tokens=1`), so you pay for the *input* tokens of every replayed turn. Use
+> `--limit/-n` to cap sessions and `--token-budget` to cap chain length while
+> iterating.
+
+## Checking the cached replays
+
+`runs/` ships two committed **reference runs** you can inspect with **zero spend** —
+every number is recomputed from stored token usage, and the animated evolution is
+replayed from the same cache. No API keys or network needed.
+
+```bash
+# re-score from the stored usage (prints the per-bucket tables):
+uv run minmax-bench report 202f98bd-a2f1-4390-8307-658b451b7727
+uv run minmax-bench report cba32b86-99ba-4ed7-bf7c-e385edf2ec99
+
+# replay the animated context + cost evolution:
+uv run minmax-bench replay 202f98bd-a2f1-4390-8307-658b451b7727
+uv run minmax-bench replay cba32b86-99ba-4ed7-bf7c-e385edf2ec99
+```
+
+- **`run-202f98bd`** — `headroom` vs `headroom-kompress` vs `condense-async` on
+  Haiku 4.5 over `swe-chat:32` (6 long sessions), **truncated to 190k** so every
+  scored turn is under the 200k cap. This is the clean head-to-head.
+- **`run-cba32b86`** — baseline + `condense-async`, **untruncated**, over the full
+  long sessions (baseline totals **~$73.6** on replay). Shows how savings grow with
+  chain length into the 200k–400k+ bands.
+
+What to look at: each strategy gets a **tokens-saved** and a **cost-saved (USD)**
+table, bucketed by input-chain length, with an `ALL` aggregate row. Cost-saved
+trails token-saved because compression trades cheap cache-reads for dearer
+cache-writes — that gap is the point of modeling the cache.
+
+Each run directory is self-describing: `run.json` (manifest), `report.json`
+(bucketed metrics), `models/<model>/baseline.json` + `.../strategies/<name>.json`
+(raw per-turn usage), and a `README.md`.
+
+## Retesting yourself
+
+Produce your own run — each is written under `runs/run-<uuid>/` and is itself
+replayable and re-scorable exactly like the reference runs above:
+
+```bash
+uv run minmax-bench run -d swe-chat:32 \
+  -s headroom -s headroom-kompress -s condense-async \
+  -m claude-haiku-4-5 --token-budget 190k --json out/run.json
+```
+
+- `--token-budget 190k` keeps every turn under Haiku's 200k cap so long sessions
+  don't drop out of the buckets.
+- `-n/--limit N` caps how many conversations load (cheaper iteration).
+- `--run <uuid>` resumes an existing run, reusing its caches and spending only on
+  what's missing.
+- Re-price or re-bucket any finished run without re-spending:
+  `uv run minmax-bench report <uuid> --edges 16000,32000,100000,200000`.
+
+## Reading the output
+
+Per strategy, two tables bucketed by input-chain length:
+
+- **tokens saved** — baseline vs strategy prompt tokens, per-tier and percent.
+- **cost saved (USD)** — the same after cache-aware pricing.
+
+Empty buckets are dropped; the `ALL` row is the aggregate. `--json PATH` writes the
+full bucket stats for further analysis.
+
+### Illustrative findings (from the reference runs)
+
+| strategy | cost saved (truncated 190k) | notes |
+|---|---|---|
+| `condense-async` | **28%** (37% untruncated) | scales *up* with chain length — 53% saved in the 400k+ band |
+| `headroom` (cache mode) | ~14% | preserves the prefix cache |
+| `headroom-kompress` (token mode) | ~2% | rewrites history, torching the cache — token savings barely survive to cost |
+
+Take these as illustrative of *this* dataset/model, not universal — rerun on your
+own sessions to compare.
+
+## Layout
+
+```
+minmax_bench/
+  models.py        normalized session/message/usage model
+  harness/         session -> request points (harness simulator)
+  strategies/      strategy registry: noop, upstream, headroom, condense, gemini
+  executors/       proxy | noop measurement
+  providers.py     normalized -> Anthropic/OpenAI request bodies (+ cache breakpoints)
+  chain.py         exact cache-aware costing of a full reconstructed chain
+  tokens.py        local token counting + incremental cache model
+  pricing.py       cache-aware per-model cost
+  report/          bucketing + rich tables + JSON
+  data/            dataset loaders + offline sample
+  cli.py           `minmax-bench` entrypoint
+runs/              committed reference runs (replayable, no spend)
+```
+
+## Status / caveats
+
+- Offline token counts use `tiktoken` (an approximation for Claude); the proxy
+  executor supplies exact provider numbers when you need them.
+- Trajectory / quality evaluation — proving the compressed sessions stay correct —
+  is future work, not in this repo yet. This benchmark answers "how much does it
+  save," not "does it still work."

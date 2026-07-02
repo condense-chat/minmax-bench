@@ -1,0 +1,34 @@
+{
+  "uuid": "cba32b86-99ba-4ed7-bf7c-e385edf2ec99",
+  "created_utc": "2026-07-02T14:43:07+00:00",
+  "dataset": "swe-chat:32",
+  "strategies": [
+    "condense-async"
+  ],
+  "models": [
+    "claude-haiku-4-5"
+  ],
+  "encoding": "o200k_base",
+  "count_mode": "local",
+  "max_tokens": 1,
+  "edges": [
+    16000,
+    32000,
+    100000,
+    200000,
+    400000
+  ],
+  "session_limit": null,
+  "point_limit": null,
+  "longest": null,
+  "token_limit": null,
+  "session_ids": [
+    "e5367972-885e-46b8-bcdf-22e3e6b87525",
+    "1a289c77-a9da-491d-954a-2df7f0dd6a17",
+    "af03813b-aac6-4f96-8512-ae01cc818643",
+    "1284c080-f9cd-45f8-9942-ff58f5c517e5",
+    "1e3d6988-e6c2-4e7b-92a5-47e46e390af3",
+    "2a55af89-4e4f-4460-b18f-42a07287ae76"
+  ],
+  "session_test_uuids": {}
+}
