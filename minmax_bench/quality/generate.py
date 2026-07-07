@@ -35,6 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from minmax_bench.quality import engine as eng  # the teacher-forced replay engine
+from minmax_bench.quality.engine import DEFAULT_TASKS, resolve_tasks
 
 DATASET = "terminal-bench/terminal-bench-2-1"
 DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -48,7 +49,6 @@ UTC = timezone.utc  # noqa: UP017  (scripts run on system python3, may be 3.10)
 # is the canonical token-mode arm. 'headroom-kompress' (compression with NO retrieval,
 # the cost bench's strategy of that name) is kept as an ABLATION, not a headline arm.
 HEADROOM_MODES = {"headroom": "cache", "headroom-kompress": "token", "headroom-ccr": "token"}
-
 
 # ------------------------------------------------------------------ FULL: drive Harbor per arm/task
 def _arm_wiring(arm, env):
@@ -120,10 +120,16 @@ def _validate_full(args, env):
 
 def full(args, env):
     arms = _validate_full(args, env)
-    tasks = args.tasks.split(",")
+    tasks = resolve_tasks(args.tasks)
     out = args.out
     os.makedirs(out, exist_ok=True)
     model = args.model or DEFAULT_MODEL
+    kv = args.k_vanilla or args.k + 1
+    trials = len(tasks) * (kv + args.k * (len(arms) - 1))
+    print(f"[plan] {len(arms)} arms ({', '.join(arms)}) x {len(tasks)} tasks "
+          f"({', '.join(tasks)}) x k={args.k} (vanilla {kv}) = {trials} trials, "
+          f"cost ceiling ~${trials * args.budget_usd:.0f} "
+          f"(--budget-usd {args.budget_usd:g}/trial cap)")
     for arm in arms:
         # the vanilla band is the noise floor every arm is judged against — one extra
         # vanilla run sharpens every verdict, so it defaults to k+1
@@ -346,7 +352,7 @@ def judge_milestones(args, env):
         sys.exit("milestone judge needs an API key:\n  - " + "\n  - ".join(problems))
     arms = ["vanilla"] + [a for a in args.arms.split(",") if a]
     result, mpath = {}, f"{args.out}/milestones.json"
-    for task in args.tasks.split(","):
+    for task in resolve_tasks(args.tasks):
         sess = {arm: _runs(args.out, arm, task) for arm in arms}  # glob once per (task, arm)
         ref = next((p for p, r in sess["vanilla"] if r == "1"), None)
         if not ref:
@@ -385,7 +391,11 @@ def main():
                          "judge = LLM milestone scoring of existing runs")
     ap.add_argument("--agent", default="claude-code")
     ap.add_argument("--arms", default="condense,headroom-ccr")
-    ap.add_argument("--tasks", help="comma list (full mode / milestone judge)")
+    ap.add_argument("--tasks", default=None,
+                    help="comma list of terminal-bench task ids, or a number N for the "
+                         "first N curated defaults; omitted = 5 (see --list-tasks)")
+    ap.add_argument("--list-tasks", action="store_true",
+                    help="print the curated default tasks and exit")
     ap.add_argument("--out", default="results/jobs/run")
     ap.add_argument("--model", default=None)
     # full
@@ -423,6 +433,12 @@ def main():
     ap.add_argument("--conv", type=int, default=0, help="conversation index within --swechat")
     args = ap.parse_args()
 
+    if args.list_tasks:
+        for i, t in enumerate(DEFAULT_TASKS, 1):
+            print(f"{i}. {t}{'   <- default 5' if i == 5 else ''}")
+        print("any other terminal-bench-2-1 id also works: "
+              "https://hub.harborframework.com/datasets")
+        return
     if args.agent not in SUPPORTED_AGENTS:
         sys.exit(f"--agent {args.agent} is not implemented yet (TODO). "
                  "Only 'claude-code' is wired.")
@@ -431,12 +447,8 @@ def main():
         os.environ.setdefault(k, v)
     env = dict(os.environ)
     if args.mode == "full":
-        if not args.tasks:
-            sys.exit("--mode full needs --tasks")
         full(args, env)
     elif args.mode == "judge":
-        if not args.tasks:
-            sys.exit("--mode judge needs --tasks")
         judge_milestones(args, env)
     else:
         if not (args.session or args.swechat):

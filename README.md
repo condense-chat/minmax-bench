@@ -225,12 +225,15 @@ python3 scripts/report.py --from runs/quality-sample --tasks kv-store-grpc --arm
 **Generate your own** (Docker + `uv tool install harbor` + `.env` keys):
 
 ```bash
-# generate (spends: runs the agent), then report (pure display)
-python3 scripts/generate.py --mode full --tasks "kv-store-grpc,fix-code-vulnerability" \
-  --arms condense,headroom-ccr --out results/jobs/run1 --milestones
-python3 scripts/report.py --from results/jobs/run1 --tasks "kv-store-grpc,fix-code-vulnerability" \
-  --arms condense,headroom-ccr
+# generate (spends: runs the agent), then report (pure display).
+# No task names needed: the default is 5 curated terminal-bench tasks
+# (--list-tasks shows them; --tasks 2 or --tasks a,b to narrow).
+python3 scripts/generate.py --mode full --out results/jobs/run1 --milestones
+python3 scripts/report.py --from results/jobs/run1 --tasks 5
 ```
+
+`generate` prints its plan up front (arms × tasks × k = N trials + the cost ceiling from
+`--budget-usd`) before spending anything.
 
 The quality bench is **pure standard library** — nothing to install to *analyze* runs; Docker + Harbor
 are only needed to *generate* them.

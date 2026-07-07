@@ -28,7 +28,7 @@ import re
 
 # one session parser for the spend side (generate/engine) and the display side — the
 # quality package is pure stdlib, so this keeps the "nothing to install to analyze" rule
-from minmax_bench.quality.engine import SESSION_GLOB, extract_action, parse_session
+from minmax_bench.quality.engine import SESSION_GLOB, extract_action, parse_session, resolve_tasks
 
 AGENT_SESSION_GLOB = {  # only claude-code is wired; others are TODO
     "claude-code": SESSION_GLOB,
@@ -193,7 +193,7 @@ def build(args):
             continue
     incr = _load_incremental(root, arms)
     rows = []
-    for task in args.tasks.split(","):
+    for task in resolve_tasks(args.tasks):
         v = _cell_stats(idx.get(f"vanilla-{task}"))
         row = {"task": task, "vanilla": v, "arms": {}}
         for arm in arms:
@@ -350,7 +350,9 @@ def main():
     ap = argparse.ArgumentParser(
         description="display the quality bench (reads generate.py's artifacts)")
     ap.add_argument("--from", default="results/jobs", help="results root produced by generate.py")
-    ap.add_argument("--tasks", required=True)
+    ap.add_argument("--tasks", default=None,
+                    help="comma list, a number N for the first N curated defaults, "
+                         "or omitted = 5 (must cover what generate.py ran)")
     ap.add_argument("--arms", default="condense,headroom-ccr")
     ap.add_argument("--agent", default="claude-code", choices=list(AGENT_SESSION_GLOB))
     ap.add_argument("--format", default="html", choices=["html", "md"])

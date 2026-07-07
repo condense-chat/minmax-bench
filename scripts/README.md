@@ -20,7 +20,8 @@ generate.py --mode {full,incremental}     # full = end-to-end trajectory; increm
                                            #   headroom-ccr      = token mode + retrieve loop (full
                                            #                       CCR — headroom's intended config)
                                            #   headroom-kompress = token mode, no retrieval (ablation)
-            --tasks a,b,c  --out results/jobs/run
+            --tasks 5      # or a,b,c by name; omitted = 5 curated defaults (--list-tasks)
+            --out results/jobs/run
 ```
 
 - **`--mode full`** — runs the agent end-to-end through [Harbor](https://github.com/laude-institute/terminal-bench)
@@ -85,8 +86,6 @@ python3 scripts/report.py --from runs/quality-sample --tasks kv-store-grpc --arm
 
 # generate then display (needs Docker + harbor + .env keys)
 cp .env.dist .env      # ANTHROPIC_API_KEY, CONDENSE_API_KEY
-python3 scripts/generate.py --mode full --tasks kv-store-grpc,fix-code-vulnerability \
-  --arms condense,headroom-ccr --out results/jobs/run1 --milestones
-python3 scripts/report.py --from results/jobs/run1 --tasks kv-store-grpc,fix-code-vulnerability \
-  --arms condense,headroom-ccr
+python3 scripts/generate.py --mode full --out results/jobs/run1 --milestones   # 5 default tasks
+python3 scripts/report.py --from results/jobs/run1 --tasks 5
 ```

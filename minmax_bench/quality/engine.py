@@ -61,6 +61,35 @@ def rates_for(model):
         return PRICES[DEFAULT_PRICE_MODEL]
     return PRICES[best]
 
+# Curated terminal-bench-2-1 tasks, validated in earlier bench runs and roughly ordered
+# from short/cheap to long/expensive. `--tasks 5` (or omitting --tasks) takes the first N;
+# any dataset task id also works by name (browse: https://hub.harborframework.com/datasets).
+DEFAULT_TASKS = [
+    "kv-store-grpc",                # short; known to expose planning-induction divergence
+    "fix-code-vulnerability",       # short, focused edit
+    "pypi-server",                  # medium service setup
+    "write-compressor",             # medium algorithmic
+    "schemelike-metacircular-eval", # medium-long interpreter work
+    "dna-assembly",                 # long
+    "qemu-alpine-ssh",              # long, infra-heavy
+    "torch-pipeline-parallelism",   # long, GPU-flavored
+    "torch-tensor-parallelism",     # long, GPU-flavored
+]
+
+
+def resolve_tasks(raw):
+    """--tasks: omitted -> first 5 curated; an integer N -> first N; else comma names."""
+    if not raw:
+        return DEFAULT_TASKS[:5]
+    if raw.strip().isdigit():
+        n = int(raw)
+        if n > len(DEFAULT_TASKS):
+            sys.exit(f"--tasks {n}: only {len(DEFAULT_TASKS)} curated defaults exist — "
+                     f"name additional tasks explicitly (see --list-tasks)")
+        return DEFAULT_TASKS[:n]
+    return [t for t in raw.split(",") if t.strip()]
+
+
 # NOTE: teacher-forced replay executes no tools, so headroom's CCR retrieve loop cannot
 # engage here — the 'headroom' arm below measures the proxy only (cache or token mode,
 # per the driver's --headroom-mode). CCR is only measurable in generate.py --mode full.
