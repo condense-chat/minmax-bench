@@ -226,14 +226,17 @@ python3 scripts/report.py --from runs/quality-sample --tasks kv-store-grpc --arm
 
 ```bash
 # generate (spends: runs the agent), then report (pure display).
-# No task names needed: the default is 5 curated terminal-bench tasks
-# (--list-tasks shows them; --tasks 2 or --tasks a,b to narrow).
+# No task names needed: the default is the first 5 recommended terminal-bench tasks
+# (--list-tasks shows everything; --tasks 2, --tasks random:8 --seed 42, or --tasks a,b).
 python3 scripts/generate.py --mode full --out results/jobs/run1 --milestones
 python3 scripts/report.py --from results/jobs/run1 --tasks 5
 ```
 
 `generate` prints its plan up front (arms × tasks × k = N trials + the cost ceiling from
-`--budget-usd`) before spending anything.
+`--budget-usd`) before spending anything. Defaults: k=4 trials per arm and k+1 for the
+vanilla baseline (the noise floor every arm is judged against — the extra run sharpens
+every verdict). `--dataset` selects the harbor dataset; only
+`terminal-bench/terminal-bench-2-1` is validated so far.
 
 The quality bench is **pure standard library** — nothing to install to *analyze* runs; Docker + Harbor
 are only needed to *generate* them.
