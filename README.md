@@ -11,10 +11,11 @@ It compares proxies like [`headroom`](https://pypi.org/project/headroom-ai/) and
 `condense` on an equal footing, using only their **public** interfaces — no access
 to any strategy's source is required.
 
-> **Scope.** This repo measures **cost** (tokens and dollars). It does *not* yet
-> measure whether a compressed session stays *correct* — trajectory / quality
-> evaluations that prove the reductions don't degrade the agent are planned
-> follow-up work, not included here.
+> **Scope.** This repo measures both halves of the trade-off: **cost** (tokens and
+> dollars, above) and **quality** — whether a compressed session stays *correct*, i.e.
+> the agent still does the same work. The quality half is the
+> [trajectory-preservation bench](#quality--trajectory-preservation-bench) below; the
+> cost numbers are only trustworthy where it confirms the trajectory is preserved.
 
 ## Methodology
 
@@ -171,6 +172,65 @@ full bucket stats for further analysis.
 Take these as illustrative of *this* dataset/model, not universal — rerun on your
 own sessions to compare.
 
+## Quality / trajectory-preservation bench
+
+The cost tables above assume compaction **preserves the trajectory** — the agent does the same
+work in about the same number of steps. That assumption is load-bearing: if a method makes the
+agent wander or take more turns, the "savings" is partly illusory (more turns = more cost). This
+bench tests it by running the **full agent** (not a replay) under each method on real coding tasks
+([Terminal-Bench](https://github.com/laude-institute/terminal-bench) via
+[Harbor](https://github.com/laude-institute/harbor)) and comparing the trajectories to a
+**vanilla-vs-vanilla noise floor**. The bar is not "identical to control" (two vanilla runs already
+differ) — it's **"within the vanilla-vs-vanilla spread."**
+
+Per task, vanilla `k≈3` sets the floor; each method's runs are tested against it, axis by axis:
+
+| axis | question |
+|---|---|
+| **length** | does compaction change the # of steps? *(the load-bearing axis)* |
+| **rework** | does it re-fetch info it already had? *(compaction amnesia; range-aware)* |
+| **milestone** | does it accomplish the same subgoals? *(approach-agnostic, LLM-judged)* |
+| **solve** | does it still pass the verifier? |
+
+A verdict is **✓** if the method's distribution *overlaps* vanilla's (indistinguishable), **✗** if
+disjoint — and needs **≥ 2 runs per arm** (a single run can't be told from a fluke; this kills the
+k=1 mirage where length and cost swing wildly). Full tooling + reproduction: [`scripts/README.md`](scripts/README.md).
+
+**Offline demo — no keys, no Docker (~30 s)** — a tiny sample of real recorded runs ships in
+`results/sample/`:
+
+```bash
+python3 scripts/preservation_index.py --root results/sample --tasks kv-store-grpc \
+  --out results/sample/report.html
+```
+
+→ `kv-store-grpc   length  vanilla 5[5-6]   condense 12[11-14]   ✗ DIVERGES` — on this task condense
+~doubles the trajectory (both still solve). That's the whole point, visible from a fresh clone.
+
+**Generate your own** (Docker + `uv tool install harbor` + `.env` keys):
+
+```bash
+OUT=results/jobs/run1 bash scripts/run_cc_matrix.sh "kv-store-grpc,fix-code-vulnerability" 3 vanilla,condense
+python3 scripts/preservation_index.py --root results/jobs --tasks "kv-store-grpc,fix-code-vulnerability" \
+  --out results/fidelity/index.html --milestones
+```
+
+The quality bench is **pure standard library** — nothing to install to *analyze* runs; Docker + Harbor
+are only needed to *generate* them.
+
+### Quality findings (so far)
+
+Reported impartially, including results unfavorable to condense.
+
+- **Preservation mostly holds** — on 8/9 tasks with enough runs, condense's trajectory length is
+  statistically indistinguishable from vanilla, redundant re-work is zero, and the same subgoals are
+  reached. A per-turn cost claim is sound *where both arms solve reliably.*
+- **One real exception — short tasks (`kv-store`):** condense consistently ~doubles the trajectory
+  (5 → 12 steps) by **inducing todo-tool planning + verification** — behavioral, *not* amnesia. This
+  *explains* that task's large full-run cost gap (which looked like noise at k=1).
+- **Token savings ≠ dollar savings** — compaction busts the prompt cache (the same effect behind the
+  `headroom-token` cost result above); verified two ways (teacher-forced replay + real runs).
+
 ## Layout
 
 ```
@@ -187,6 +247,14 @@ minmax_bench/
   data/            dataset loaders + offline sample
   cli.py           `minmax-bench` entrypoint
 runs/              committed reference runs (replayable, no spend)
+
+scripts/           quality / trajectory-preservation bench (see scripts/README.md)
+  preservation_index.py   vanilla-floor vs method, per-axis overlap verdict  ← main entry
+  fidelity_replay.py      teacher-forced per-step replay (paired, cache-aware)
+  fidelity_trajectory.py  node-by-node explorer + range-aware re-work
+  run_cc_matrix.sh        drive Harbor runs per method (vanilla/condense/headroom/ccr)
+harbor_agents/     custom Harbor agents (self-contained condense / headroom-CCR wiring)
+results/sample/    tiny bundled recorded runs for the offline quality demo
 ```
 
 ## Status / caveats
