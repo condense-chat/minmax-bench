@@ -234,9 +234,10 @@ def incremental(args, env):
 
     if args.swechat:
         msgs, points, model, used = eng.load_swechat(args.swechat, args.conv)
-        tmpl_body["model"] = model
+        tmpl_body["model"] = args.model or model  # --model replays on a cheaper model
         tmpl_body["tools"] = eng.build_tools(used, tmpl_body["tools"])
-        print(f"[swechat #{args.conv}] model={model}, {len(used)} tools", file=sys.stderr)
+        print(f"[swechat #{args.conv}] model={tmpl_body['model']} "
+              f"(recorded {model}), {len(used)} tools", file=sys.stderr)
     else:
         eng.patch_cwd(tmpl_body, args.template, args.cwd_patch)
         msgs, points = eng.parse_session(args.session)

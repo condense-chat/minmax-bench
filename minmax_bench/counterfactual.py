@@ -237,6 +237,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     for arm in all_arms:
         path = out_dir / f"{arm}.jsonl"
         spent, n_ok, n_action, n_exact, ctx_total = 0.0, 0, 0, 0, 0
+        ctx_series = []
         with path.open("w") as f, Progress(
             TextColumn(f"[cyan]{arm:9}[/]"), BarColumn(),
             TextColumn("{task.completed}/{task.total} [dim]{task.fields[stat]}[/]"),
@@ -262,9 +263,11 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                     n_ok += 1
                     n_action += action
                     n_exact += exact
-                    ctx_total += (usage.get("input_tokens", 0)
-                                  + usage.get("cache_read_input_tokens", 0)
-                                  + usage.get("cache_creation_input_tokens", 0))
+                    step_ctx = (usage.get("input_tokens", 0)
+                                + usage.get("cache_read_input_tokens", 0)
+                                + usage.get("cache_creation_input_tokens", 0))
+                    ctx_total += step_ctx
+                    ctx_series.append(step_ctx)
                     rec.update(replay=rep, agree_exact=exact, agree_action=action,
                                sim=round(sim, 3), usage=usage, cost_usd=round(c, 4))
                 f.write(json.dumps(rec) + "\n")
@@ -274,6 +277,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         summary["arms"][arm] = {
             "steps_ok": n_ok, "agree_action": n_action, "agree_exact": n_exact,
             "avg_ctx_tokens": (ctx_total // n_ok) if n_ok else 0,
+            "ctx_series": ctx_series,
             "cost_usd": round(spent, 4), "file": str(path),
         }
     # backtest anchor: what these same turns ACTUALLY consumed when the session ran
@@ -325,6 +329,25 @@ def render_summary(summary: dict, console: Console) -> None:
             f"{costd:+.0%}" if costd is not None else "—",
         )
     console.print(t)
+    ctrl_series = ctrl.get("ctx_series") or []
+    for arm, a in summary["arms"].items():
+        if arm == "control" or not ctrl_series:
+            continue
+        series = a.get("ctx_series") or []
+        pairs = list(zip(series, ctrl_series, strict=False))
+        onset = next((i for i, (x, c) in enumerate(pairs) if c and x < c * 0.9), None)
+        if onset is None:
+            console.print(
+                f"[yellow]{arm} never compacted this session[/] — its context matched "
+                f"control at every replayed step, so it acted as a passthrough (session "
+                f"below its trigger). Agreement/cost deltas above are sampling noise, "
+                f"not a compaction effect.")
+        else:
+            deepest = max((1 - x / c) for x, c in pairs[onset:] if c)
+            console.print(
+                f"[green]{arm} compacted from step {onset}[/] "
+                f"(context −{deepest:.0%} vs control at the deepest point) — fidelity and "
+                f"$ deltas from step {onset} on are measuring real compaction.")
     if rec:
         console.print(
             "[dim]* recorded = what these turns actually consumed when the session ran (its own "

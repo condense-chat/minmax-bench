@@ -323,8 +323,12 @@ def table(d):
                 cells.append((_v(a["milestone_ok"]), a["milestone_ok"]))
             if d["has_incr"]:
                 inc = a.get("incr") or {}
-                fid = ("—" if inc.get("fid") is None
-                       else f"{inc['fid']:.0%} · {inc['fid_ctrl']:.0%}")
+                if inc.get("fid") is None:
+                    fid = "—"
+                elif abs(inc.get("comp") or 0) < 0.02:
+                    fid = "⊘ passthrough"  # no compression -> fid deltas are noise
+                else:
+                    fid = f"{inc['fid']:.0%} · {inc['fid_ctrl']:.0%}"
                 cells += [(fid, None), (_pct(inc.get("comp")), None),
                           (_pct(inc.get("costd")), None)]
             rows.append(cells)
@@ -337,7 +341,9 @@ SUB = ("vanilla = the noise floor; ✓ = the arm's band overlaps vanilla's, ✗ 
        "(--ctx-gate, default 50k): condense's whole-conversation compaction cannot have "
        "triggered and headroom only compresses individual tool outputs >200 tokens, so a "
        "len ✗ on a ⊘ task is a BEHAVIORAL effect of the arm's wiring, not compaction damage. "
-       "fid = per-step action agreement, read against the control column, not against 100%. "
+       "fid = per-step action agreement vs the control noise floor; it is only shown when "
+       "the arm actually compressed (|comp| ≥ 2%) — ⊘ passthrough means the replay proved "
+       "no compaction happened, so agreement deltas would be noise. "
        "No model was called to produce this.")
 
 
