@@ -200,8 +200,7 @@ k=1 mirage where length and cost swing wildly). Full tooling + reproduction: [`s
 `results/sample/`:
 
 ```bash
-python3 scripts/preservation_index.py --root results/sample --tasks kv-store-grpc \
-  --out results/sample/report.html
+python3 scripts/report.py --mode full --tasks kv-store-grpc --root results/sample
 ```
 
 → `kv-store-grpc   length  vanilla 5[5-6]   condense 12[11-14]   ✗ DIVERGES` — on this task condense
@@ -211,8 +210,7 @@ python3 scripts/preservation_index.py --root results/sample --tasks kv-store-grp
 
 ```bash
 OUT=results/jobs/run1 bash scripts/run_cc_matrix.sh "kv-store-grpc,fix-code-vulnerability" 3 vanilla,condense
-python3 scripts/preservation_index.py --root results/jobs --tasks "kv-store-grpc,fix-code-vulnerability" \
-  --out results/fidelity/index.html --milestones
+python3 scripts/report.py --mode full --tasks "kv-store-grpc,fix-code-vulnerability" --root results/jobs --milestones
 ```
 
 The quality bench is **pure standard library** — nothing to install to *analyze* runs; Docker + Harbor
@@ -249,11 +247,11 @@ minmax_bench/
 runs/              committed reference runs (replayable, no spend)
 
 scripts/           quality / trajectory-preservation bench (see scripts/README.md)
-  preservation_index.py   vanilla-floor vs method, per-axis overlap verdict  ← main entry
-  fidelity_replay.py      teacher-forced per-step replay (paired, cache-aware)
-  fidelity_trajectory.py  node-by-node explorer + range-aware re-work
-  run_cc_matrix.sh        drive Harbor runs per method (vanilla/condense/headroom/ccr)
-harbor_agents/     custom Harbor agents (self-contained condense / headroom-CCR wiring)
+  report.py               the one report command: --mode full|replay, --arms, --format  ← main entry
+  fidelity_replay.py      shared session I/O + teacher-forced replay engine (report.py imports it)
+  run_cc_matrix.sh        drive Harbor to generate runs per arm (vanilla/condense/headroom/ccr)
+  capture_cc_template.py  (utility) re-capture the request template for replay
+harbor_agents/     custom Harbor agent (self-contained headroom-CCR wiring)
 results/sample/    tiny bundled recorded runs for the offline quality demo
 ```
 

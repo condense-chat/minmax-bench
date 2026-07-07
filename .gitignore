@@ -24,3 +24,5 @@ results/sample/*.html
 scratchpad/
 *.nohup
 **/.DS_Store
+/report.html
+/report.md
