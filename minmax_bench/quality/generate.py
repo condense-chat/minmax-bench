@@ -76,17 +76,24 @@ def _proxy_up():
 
 
 def _start_proxy(out, mode):
+    if _proxy_up():
+        # something already listens on the port — its MODE is unknown, and running the
+        # arm against the wrong mode silently mislabels the results
+        sys.exit(f"port {HRPORT} is already serving a proxy of unknown mode; stop it "
+                 f"(or set HRPORT) before running a headroom arm that needs mode={mode}")
     log = open(f"{out}/headroom-{mode}.log", "w")
     p = subprocess.Popen(["headroom", "proxy", "--port", str(HRPORT), "--mode", mode],
                          stdout=log, stderr=subprocess.STDOUT)
     p._tmb_log = log  # closed in _stop_proxy
-    for _ in range(20):
+    for _ in range(90):  # token mode cold-starts slowly (model/tokenizer downloads)
         if _proxy_up():
             print(f"[headroom] proxy up on :{HRPORT} (mode={mode})")
             return p
+        if p.poll() is not None:
+            break
         time.sleep(1)
-    print("[headroom] proxy failed to start", file=sys.stderr)
-    return p
+    _stop_proxy(p)
+    sys.exit(f"[headroom] proxy failed to start (mode={mode}) — see {out}/headroom-{mode}.log")
 
 
 def _stop_proxy(p):
