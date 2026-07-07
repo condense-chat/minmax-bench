@@ -33,13 +33,20 @@ class HeadroomCcrClaudeCode(ClaudeCode):
 
     async def install(self, environment) -> None:
         # Base installs Claude Code (node/npm). Then we add python3 + headroom-ai.
+        # Harbor's agent-setup phase has a hard timeout (360s by default) and a cold
+        # apt-get update alone can eat most of it — skip anything already present and
+        # pair this agent with --agent-timeout-multiplier (generate.py raises it
+        # automatically for the headroom-ccr arm).
         await super().install(environment)
         await self.exec_as_root(
             environment,
             command=(
-                "if command -v apk >/dev/null 2>&1; then apk add --no-cache python3 py3-pip; "
-                "elif command -v apt-get >/dev/null 2>&1; then "
-                "  apt-get update && apt-get install -y python3 python3-pip; "
+                "if command -v python3 >/dev/null 2>&1 "
+                "&& python3 -m pip --version >/dev/null 2>&1; "
+                "then echo 'python3+pip present, skipping'; "
+                "elif command -v apk >/dev/null 2>&1; then apk add --no-cache python3 py3-pip; "
+                "elif command -v apt-get >/dev/null 2>&1; then apt-get update && "
+                "  apt-get install -y --no-install-recommends python3 python3-pip; "
                 "elif command -v yum >/dev/null 2>&1; then yum install -y python3 python3-pip; fi"
             ),
             env={"DEBIAN_FRONTEND": "noninteractive"},

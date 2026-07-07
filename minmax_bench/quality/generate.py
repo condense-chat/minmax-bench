@@ -124,8 +124,11 @@ def full(args, env):
                        "-n", str(args.concurrency),
                        "-o", cell, "--ak", f"max_budget_usd={args.budget_usd}",
                        "--allow-agent-host", allow, *extra]
-                if args.agent_timeout_mult:
-                    cmd += ["--agent-timeout-multiplier", str(args.agent_timeout_mult)]
+                # the CCR agent installs python3 + headroom-ai + the mcp SDK per container;
+                # harbor's default 360s agent-setup timeout is not enough on a cold image
+                mult = args.agent_timeout_mult or (3 if arm == "headroom-ccr" else None)
+                if mult:
+                    cmd += ["--agent-timeout-multiplier", str(mult)]
                 renv = {**os.environ, "ANTHROPIC_BASE_URL": base,
                         "PYTHONPATH": os.getcwd() + os.pathsep + os.environ.get("PYTHONPATH", "")}
                 if arm == "headroom-kompress":
