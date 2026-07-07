@@ -198,7 +198,8 @@ def judge_milestones(args, env):
 
 def main():
     ap = argparse.ArgumentParser(description="generate trajectory data (spends); report.py displays it")
-    ap.add_argument("--mode", choices=["full", "incremental"], default="full")
+    ap.add_argument("--mode", choices=["full", "incremental", "judge"], default="full",
+                    help="full/incremental = generate trajectories; judge = LLM milestone scoring of existing runs")
     ap.add_argument("--agent", default="claude-code")
     ap.add_argument("--arms", default="condense,headroom")
     ap.add_argument("--tasks", help="comma list (full mode / milestone judge)")
@@ -224,11 +225,18 @@ def main():
 
     if AGENTS.get(args.agent) is None:
         sys.exit(f"--agent {args.agent} is not implemented yet (TODO). Only 'claude-code' is wired.")
-    env = {**eng.load_env(), **os.environ}
+    # export .env into the process env so Harbor / headroom subprocesses inherit the keys
+    for k, v in eng.load_env().items():
+        os.environ.setdefault(k, v)
+    env = dict(os.environ)
     if args.mode == "full":
         if not args.tasks:
             sys.exit("--mode full needs --tasks")
         full(args, env)
+    elif args.mode == "judge":
+        if not args.tasks:
+            sys.exit("--mode judge needs --tasks")
+        judge_milestones(args, env)
     else:
         if not args.session:
             sys.exit("--mode incremental needs --session")

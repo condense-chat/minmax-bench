@@ -139,8 +139,10 @@ def overlaps(a, b):
 
 
 def runs_for(root, arm, task, agent):
+    # match <arm>-<task> whether directly under root (a single generate --out) or one/more
+    # dirs deep (pooling several job dirs). ** matches zero-or-more path segments.
     out, seen = [], set()
-    for rt in sorted(glob.glob(f"{root}/*/{arm}-{task}/*/*/verifier/reward.txt")):
+    for rt in sorted(glob.glob(f"{root}/**/{arm}-{task}/*/*/verifier/reward.txt", recursive=True)):
         inst = os.path.dirname(os.path.dirname(rt))
         s = glob.glob(os.path.join(inst, AGENT_SESSION_GLOB[agent]), recursive=True)
         if s and s[0] not in seen:
@@ -195,6 +197,8 @@ def _load_incremental(dirpath, arms):
         return {}
     def rows(p):
         d = {}
+        if not os.path.exists(p):
+            return d
         for line in open(p):
             try:
                 r = json.loads(line)
