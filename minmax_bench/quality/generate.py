@@ -25,6 +25,7 @@ import argparse
 import glob
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -82,7 +83,12 @@ def _start_proxy(out, mode):
         sys.exit(f"port {HRPORT} is already serving a proxy of unknown mode; stop it "
                  f"(or set HRPORT) before running a headroom arm that needs mode={mode}")
     log = open(f"{out}/headroom-{mode}.log", "w")
-    p = subprocess.Popen(["headroom", "proxy", "--port", str(HRPORT), "--mode", mode],
+    # nothing is installed into the user's global environment: if the headroom CLI
+    # isn't already on PATH (e.g. project venv), run it via uvx in an isolated,
+    # ephemeral environment
+    base_cmd = (["headroom"] if shutil.which("headroom")
+                else ["uvx", "--from", "headroom-ai[proxy]", "headroom"])
+    p = subprocess.Popen([*base_cmd, "proxy", "--port", str(HRPORT), "--mode", mode],
                          stdout=log, stderr=subprocess.STDOUT)
     p._tmb_log = log  # closed in _stop_proxy
     for _ in range(90):  # token mode cold-starts slowly (model/tokenizer downloads)
@@ -119,6 +125,9 @@ def full(args, env):
     os.makedirs(out, exist_ok=True)
     model = args.model or DEFAULT_MODEL
     for arm in arms:
+        # the vanilla band is the noise floor every arm is judged against — one extra
+        # vanilla run sharpens every verdict, so it defaults to k+1
+        k = (args.k_vanilla or args.k + 1) if arm == "vanilla" else args.k
         proxy = None
         try:
             if arm in HEADROOM_MODES and not args.dry_run:
@@ -127,7 +136,7 @@ def full(args, env):
             for task in tasks:
                 cell = f"{out}/{arm}-{task}"
                 cmd = ["harbor", "run", "-d", DATASET, "-a", agent, "-m", model,
-                       "-i", f"terminal-bench/{task}", "-k", str(args.k),
+                       "-i", f"terminal-bench/{task}", "-k", str(k),
                        "-n", str(args.concurrency),
                        "-o", cell, "--ak", f"max_budget_usd={args.budget_usd}",
                        "--allow-agent-host", allow, *extra]
@@ -142,7 +151,7 @@ def full(args, env):
                     print("[note] headroom-kompress = token-mode compression WITHOUT the CCR "
                           "retrieve loop (ablation); headroom's intended token-mode config "
                           "is the headroom-ccr arm")
-                print(f"### {arm} / {task} (k={args.k}, base={base}) ###")
+                print(f"### {arm} / {task} (k={k}, base={base}) ###")
                 if args.dry_run:
                     print("   " + " ".join(cmd))
                     continue
@@ -150,7 +159,7 @@ def full(args, env):
                 # attempted — report.py uses this to expose survivorship instead of
                 # silently shrinking n (a reward.txt-less trial is a failure, not noise)
                 os.makedirs(cell, exist_ok=True)
-                json.dump({"k": args.k, "arm": arm, "task": task,
+                json.dump({"k": k, "arm": arm, "task": task,
                            "started_utc": datetime.now(UTC).isoformat(timespec="seconds")},
                           open(f"{cell}/attempted.json", "w"))
                 # per-trial wall budget: the timeout must cover all k trials of the cell,
@@ -159,10 +168,10 @@ def full(args, env):
                 with open(f"{out}/_runlog.txt", "a") as runlog:
                     try:
                         subprocess.run(cmd, env=renv, stdout=runlog, stderr=subprocess.STDOUT,
-                                       timeout=args.wall_timeout * args.k)
+                                       timeout=args.wall_timeout * k)
                     except subprocess.TimeoutExpired:
                         print(f"[timeout] {arm}/{task} killed after "
-                              f"{args.wall_timeout * args.k}s — partial trials recorded",
+                              f"{args.wall_timeout * k}s — partial trials recorded",
                               file=sys.stderr)
         finally:
             _stop_proxy(proxy)
@@ -247,10 +256,16 @@ def incremental(args, env):
 # ------------------------------------------------------------------ milestone judge (LLM, gen-side)
 EXTRACT = ('Analyze this coding task and ONE solved reference trajectory, and extract 5-8 '
            'ORDERED, APPROACH-AGNOSTIC milestones ANY valid solution would hit (do not encode '
-           'this particular approach).\nTASK:\n{task}\nREFERENCE TRAJECTORY:\n{summary}\n'
+           'this particular approach). Each milestone must be checkable from a trajectory of '
+           'tool calls, their results, and the final message.\nTASK:\n{task}\n'
+           'REFERENCE TRAJECTORY:\n{summary}\n'
            'Return ONLY JSON {{"milestones":[{{"id":1,"name":"..."}}]}}')
-COVER = ('TASK:\n{task}\nMILESTONES:\n{ms}\nANOTHER trajectory:\n{summary}\nFor each milestone, '
-         'did THIS agent achieve it? Return ONLY JSON {{"coverage":[{{"id":1,"achieved":true}}]}}')
+COVER = ('TASK:\n{task}\nMILESTONES:\n{ms}\nANOTHER trajectory (steps show tool(target) -> '
+         'result snippet; "answer:" lines and FINAL MESSAGE are the agent\'s own text):\n'
+         '{summary}\nFor each milestone, did THIS agent achieve it? Mark achieved=true when '
+         'the actions, their results, or the final message provide evidence it was reached; '
+         'mark false when the trajectory shows it was not attempted or clearly failed.\n'
+         'Return ONLY JSON {{"coverage":[{{"id":1,"achieved":true}}]}}')
 
 
 def _digest(a):
@@ -263,11 +278,41 @@ def _digest(a):
     return f"{a.get('name')}({tgt})" if tgt else a.get("name", "?")
 
 
+def _result_snippet(msgs, i, limit=110):
+    """Short tool-result snippet for the decision at msgs[i] (the next user turn)."""
+    if i + 1 >= len(msgs) or msgs[i + 1]["role"] != "user":
+        return ""
+    for b in msgs[i + 1]["content"]:
+        if isinstance(b, dict) and b.get("type") == "tool_result":
+            c = b.get("content")
+            if isinstance(c, list):
+                c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+            s = " ".join(str(c or "").split())[:limit]
+            if s:
+                return (" -> ERROR: " if b.get("is_error") else " -> ") + s
+            return ""
+    return ""
+
+
 def _summary(path):
+    """Judge-readable trajectory: tool(target) -> result per step, answers, final message.
+
+    Results and the agent's own text are what let the judge VERIFY a milestone rather
+    than guess from tool names — without them, solved runs score near-zero coverage.
+    """
     msgs, points = eng.parse_session(path)
     task = next((b["text"] for b in msgs[0]["content"] if b.get("type") == "text"), "")[:600]
-    out = [f"{n}. {_digest(eng.extract_action(msgs[i]['content']))}"
-           for n, i in enumerate(points[:80])]
+    out, final = [], ""
+    for n, i in enumerate(points[:80]):
+        a = eng.extract_action(msgs[i]["content"])
+        if a.get("type") == "text":
+            text = " ".join(a.get("text", "").split())
+            out.append(f"{n}. answer: {text[:200]}")
+            final = text  # last text answer wins
+        else:
+            out.append(f"{n}. {_digest(a)}{_result_snippet(msgs, i)}")
+    if final:
+        out.append(f"FINAL MESSAGE: {final[:600]}")
     return task, "\n".join(out)
 
 
@@ -344,7 +389,12 @@ def main():
     ap.add_argument("--out", default="results/jobs/run")
     ap.add_argument("--model", default=None)
     # full
-    ap.add_argument("--k", type=int, default=3)
+    ap.add_argument("--k", type=int, default=4,
+                    help="trials per arm/task; band-overlap verdicts need >=2 and get "
+                         "fragile below 4 (a low-k verdict can flip as bands widen)")
+    ap.add_argument("--k-vanilla", type=int, default=None,
+                    help="trials for the vanilla baseline (default k+1: the noise floor "
+                         "is shared by every comparison)")
     ap.add_argument("--budget-usd", type=float, default=5.0)
     ap.add_argument("--wall-timeout", type=int, default=2400,
                     help="PER-TRIAL wall budget in seconds (the cell gets wall_timeout * k)")
