@@ -30,6 +30,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from minmax_bench.quality import engine as eng
+from minmax_bench.quality.engine import recorded_usage  # noqa: F401  (re-export)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CC_PROJECTS = Path.home() / ".claude" / "projects"
@@ -144,31 +145,6 @@ def session_meta(path: Path) -> dict:
             if cwd and model:
                 break
     return {"cwd": cwd, "model": model}
-
-
-def recorded_usage(path: Path) -> list[dict]:
-    """Per-decision-point usage as RECORDED in the session (one per assistant response).
-
-    Ordered by first occurrence of each requestId — matching parse_session's merged
-    assistant messages closely enough to anchor a backtest: "what did these turns
-    actually consume when the session ran", next to what the replays consumed.
-    """
-    seen, out = set(), []
-    with path.open(encoding="utf-8") as fh:
-        for line in fh:
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if rec.get("isSidechain") or rec.get("type") != "assistant":
-                continue
-            rid = rec.get("requestId")
-            u = rec.get("message", {}).get("usage") or {}
-            if not u or rid in seen:
-                continue  # a response split across records repeats the same usage
-            seen.add(rid)
-            out.append(u)
-    return out
 
 
 def _prefix_chars(msgs: list[dict], points: list[int]) -> list[int]:

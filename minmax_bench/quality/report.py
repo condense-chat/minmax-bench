@@ -28,7 +28,13 @@ import re
 
 # one session parser for the spend side (generate/engine) and the display side — the
 # quality package is pure stdlib, so this keeps the "nothing to install to analyze" rule
-from minmax_bench.quality.engine import SESSION_GLOB, extract_action, parse_session, resolve_tasks
+from minmax_bench.quality.engine import (
+    SESSION_GLOB,
+    extract_action,
+    parse_session,
+    recorded_usage,
+    resolve_tasks,
+)
 
 AGENT_SESSION_GLOB = {  # only claude-code is wired; others are TODO
     "claude-code": SESSION_GLOB,
@@ -164,13 +170,21 @@ def index_runs(root, agent):
 
 
 # ---------------------------------------------------------------- assemble (from artifacts only)
+def _peak_ctx(path):
+    """Largest recorded per-request context (input + cache read/write) in a session."""
+    return max((u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                + u.get("cache_creation_input_tokens", 0) for u in recorded_usage(path)),
+               default=0)
+
+
 def _cell_stats(cell):
     runs = cell["runs"] if cell else []
-    lens, rws = [], []
+    lens, rws, peaks = [], [], []
     for p, _ in runs:
         acts = actions(p)
         lens.append(len(acts))
         rws.append(rework_count(acts))
+        peaks.append(_peak_ctx(p))
     n = len(runs)
     attempted = cell["attempted"] if cell and cell["attempted"] else n
     return {
@@ -178,6 +192,7 @@ def _cell_stats(cell):
         # a trial that never finished is a failure on the solve axis, not missing data
         "solve": sum(r == "1" for _, r in runs),
         "length": band(lens), "rework": band(rws), "_lens": lens,
+        "peak_ctx": max(peaks, default=0),
     }
 
 
@@ -193,9 +208,11 @@ def build(args):
             continue
     incr = _load_incremental(root, arms)
     rows = []
+    gate = getattr(args, "ctx_gate", 50_000)
     for task in resolve_tasks(args.tasks):
         v = _cell_stats(idx.get(f"vanilla-{task}"))
-        row = {"task": task, "vanilla": v, "arms": {}}
+        row = {"task": task, "vanilla": v, "arms": {},
+               "sub_gate": bool(v["peak_ctx"]) and v["peak_ctx"] < gate}
         for arm in arms:
             a = _cell_stats(idx.get(f"{arm}-{task}"))
             enough = len(v["_lens"]) >= 2 and len(a["_lens"]) >= 2
@@ -284,7 +301,8 @@ def table(d):
 
     Each row is [(cell_text, ok_flag_or_None), ...]; ok drives ✓/✗ colouring in html.
     """
-    head = ["task", "arm", "solve v·arm", "length (v)", "length (arm)", "len", "rework"]
+    head = ["task", "arm", "solve v·arm", "ctx peak (v)", "length (v)", "length (arm)",
+            "len", "rework"]
     if d["has_milestone"]:
         head.append("milestone")
     if d["has_incr"]:
@@ -293,8 +311,11 @@ def table(d):
     for r in d["rows"]:
         for arm in d["arms"]:
             a = r["arms"][arm]
+            pk = r["vanilla"]["peak_ctx"]
+            pk_txt = "—" if not pk else f"{pk / 1000:.0f}k" + (" ⊘" if r["sub_gate"] else "")
             cells = [(r["task"], None), (arm, None),
                      (f"{_solve(r['vanilla'])} · {_solve(a)}", None),
+                     (pk_txt, None),
                      (_b(r["vanilla"]["length"]), None), (_b(a["length"]), None),
                      (_v(a["length_ok"]), a["length_ok"]),
                      (_v(a["rework_ok"]), a["rework_ok"])]
@@ -312,8 +333,12 @@ def table(d):
 
 SUB = ("vanilla = the noise floor; ✓ = the arm's band overlaps vanilla's, ✗ = disjoint "
        "(needs ≥2 finished runs/arm; ⚠ lost = attempted trials that never finished — counted "
-       "as unsolved). fid = per-step action agreement, read against the control column, "
-       "not against 100%. No model was called to produce this.")
+       "as unsolved). ⊘ = vanilla's peak context stayed below the compaction gate "
+       "(--ctx-gate, default 50k): condense's whole-conversation compaction cannot have "
+       "triggered and headroom only compresses individual tool outputs >200 tokens, so a "
+       "len ✗ on a ⊘ task is a BEHAVIORAL effect of the arm's wiring, not compaction damage. "
+       "fid = per-step action agreement, read against the control column, not against 100%. "
+       "No model was called to produce this.")
 
 
 def render_md(d):
@@ -355,6 +380,9 @@ def main():
                          "or omitted = 5 (must cover what generate.py ran)")
     ap.add_argument("--arms", default="condense,headroom-ccr")
     ap.add_argument("--agent", default="claude-code", choices=list(AGENT_SESSION_GLOB))
+    ap.add_argument("--ctx-gate", type=int, default=50_000,
+                    help="peak-context threshold below which compaction cannot have "
+                         "triggered (marks the task ⊘)")
     ap.add_argument("--format", default="html", choices=["html", "md"])
     ap.add_argument("--out", default=None)
     args = ap.parse_args()

@@ -219,3 +219,16 @@ def test_resolve_tasks_random_is_seeded_and_bounded():
     a = eng.resolve_tasks("random:4", seed=7)
     b = eng.resolve_tasks("random:4", seed=7)
     assert a == b and len(a) == 4 and all(t in eng.dataset_tasks() for t in a)
+
+
+def test_report_marks_sub_gate_tasks():
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "runs", "quality-sample")
+    if not os.path.isdir(root):
+        return
+    args = SimpleNamespace(arms="condense", tasks="kv-store-grpc", agent="claude-code",
+                           ctx_gate=50_000, **{"from": root})
+    d = report.build(args)
+    row = d["rows"][0]
+    assert row["vanilla"]["peak_ctx"] > 0
+    assert row["sub_gate"] is True  # kv-store peaks ~25-35k: compaction can't have fired

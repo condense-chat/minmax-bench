@@ -169,6 +169,31 @@ def patch_cwd(tmpl_body, template_path, new_cwd):
     return tmpl_body
 
 
+def recorded_usage(path):
+    """Per-decision-point usage as RECORDED in the session (one per assistant response).
+
+    Ordered by first occurrence of each requestId — matching parse_session's merged
+    assistant messages closely enough to anchor a backtest: "what did these turns
+    actually consume when the session ran", next to what the replays consumed.
+    """
+    seen, out = set(), []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("isSidechain") or rec.get("type") != "assistant":
+                continue
+            rid = rec.get("requestId")
+            u = rec.get("message", {}).get("usage") or {}
+            if not u or rid in seen:
+                continue  # a response split across records repeats the same usage
+            seen.add(rid)
+            out.append(u)
+    return out
+
+
 def parse_session(path):
     """Session JSONL -> API-shaped message list + decision point indices.
 

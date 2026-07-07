@@ -200,6 +200,19 @@ Per task, vanilla `k≈3` sets the floor; each method's runs are tested against 
 | **solve** | does it still pass the verifier? *(trials that crash or hit the wall timeout count as failures — `⚠ lost` in the table — not as missing data)* |
 | **fid** | teacher-forced per-step action agreement, shown next to the **control replay's** agreement (the noise floor) — only the gap below the floor is signal |
 
+**When does context-reduction actually trigger?** Both products are gated to act only where
+reduction pays off, and a small task structurally cannot exercise them: condense compacts the
+*whole conversation* only past an internal size threshold (its savings appear in the 100k+ bands),
+and headroom's token mode compresses *individual tool outputs* only when they exceed ~200 tokens
+(`min_tokens_to_crush`, v0.28 defaults) and score as stale/irrelevant. The report therefore shows
+vanilla's **peak context** per task and marks tasks **⊘** when it stays under the compaction gate
+(`--ctx-gate`, default 50k): on a ⊘ task no compaction/compression fired, so a length ✗ there
+measures the arm's *wiring and behavioral* side-effects, not compaction damage. (One such effect
+we measured: Claude Code composes a ~8-9k-token-larger request whenever `ANTHROPIC_BASE_URL` is
+non-default, a flat confound shared by every proxy arm — isolating it cleanly needs a passthrough
+vanilla-proxy control arm, which is on the roadmap.) Compaction *quality* claims must come from
+tasks whose vanilla runs clear the gate — the long half of the curated list.
+
 A verdict is **✓** if the method's band *overlaps* vanilla's, **✗** if disjoint — and needs
 **≥ 2 finished runs per arm** (a single run can't be told from a fluke; this kills the k=1 mirage
 where length and cost swing wildly). Read ✓ honestly: with k≈3, band overlap only detects *gross*
