@@ -50,13 +50,17 @@ and renders. Deterministic, no network.
 
 ## Files
 
+The code lives in `minmax_bench/quality/` (importable, unit-tested, still pure standard
+library); `scripts/generate.py` and `scripts/report.py` are thin wrappers so the commands
+below keep working on a bare `python3` from a fresh clone.
+
 | file | side | role |
 |---|---|---|
-| `generate.py` | generate | the one generation command (full + incremental + milestone judge) |
-| `incremental_engine.py` | generate | library: session I/O, request building, scoring, pricing — imported by `generate.py`, `report.py` (parser only) and `minmax-bench counterfactual` |
-| `report.py` | display | reads artifacts → html/md; never spends |
-| `../harbor_agents/headroom_ccr_claude_code.py` | generate | self-contained CCR wiring for the `headroom-ccr` arm (preserves base MCP servers) |
-| `../tests/test_quality.py` | — | unit tests for the metric code (`uv run pytest`) |
+| `minmax_bench/quality/generate.py` | generate | the one generation command (full + incremental + milestone judge) |
+| `minmax_bench/quality/engine.py` | generate | library: session I/O, request building, scoring, pricing — imported by generate, report (parser only) and `minmax-bench counterfactual` |
+| `minmax_bench/quality/report.py` | display | reads artifacts → html/md; never spends |
+| `harbor_agents/headroom_ccr_claude_code.py` | generate | self-contained CCR wiring for the `headroom-ccr` arm (preserves base MCP servers) |
+| `tests/test_quality.py` | — | unit tests for the metric code (`uv run pytest`) |
 
 ## Counterfactual replay of a local session
 

@@ -278,10 +278,11 @@ minmax_bench/
   cli.py           `minmax-bench` entrypoint
 runs/              committed reference runs (replayable, no spend)
 
-scripts/           quality / trajectory-preservation bench (see scripts/README.md)
-  generate.py             GENERATE data (spends): --mode full|incremental, --arms, --agent
-  incremental_engine.py   teacher-forced replay engine that generate.py imports
-  report.py               DISPLAY (pure, never spends): reads artifacts -> html/md
+minmax_bench/quality/   quality / trajectory-preservation bench (pure stdlib; see scripts/README.md)
+  generate.py      GENERATE data (spends): --mode full|incremental, --arms, --agent
+  engine.py        teacher-forced replay engine (session I/O, scoring, pricing)
+  report.py        DISPLAY (pure, never spends): reads artifacts -> html/md
+scripts/           thin `python3 scripts/{generate,report}.py` wrappers around the above
 harbor_agents/     custom Harbor agent (self-contained headroom-CCR wiring)
 results/sample/    tiny bundled recorded runs for the offline quality demo
 ```

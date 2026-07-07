@@ -1,17 +1,14 @@
-"""Tests for the quality / trajectory-preservation bench metric code (scripts/).
+"""Tests for the quality / trajectory-preservation bench metric code (minmax_bench/quality).
 
 These metrics produce the repo's public findings — they deserve the same test
-surface as the cost bench. scripts/ is imported via its own path (stdlib-only).
+surface as the cost bench.
 """
 import json
 import os
-import sys
 from types import SimpleNamespace
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "scripts"))
-import incremental_engine as eng  # noqa: E402
-import report  # noqa: E402
+from minmax_bench.quality import engine as eng
+from minmax_bench.quality import report
 
 
 def tool(name, **inp):

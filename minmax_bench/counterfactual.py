@@ -10,14 +10,13 @@ noise floor; an arm only "diverges" to the extent it falls below that floor.
 
 This module is glue + display: session discovery under ``~/.claude/projects``,
 cost preview, privacy notice, and a rich summary. All replay mechanics live in
-``scripts/incremental_engine.py`` (single source of truth).
+``minmax_bench/quality/engine.py`` (single source of truth).
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,21 +29,13 @@ from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
+from minmax_bench.quality import engine as eng
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CC_PROJECTS = Path.home() / ".claude" / "projects"
 # rough sizing for the preview only; real usage comes back from the API
 CHARS_PER_TOKEN = 4.0
 PREVIEW_OUTPUT_TOKENS = 300
-
-
-def load_engine():
-    """Import scripts/incremental_engine.py (the replay engine) from the repo checkout."""
-    path = REPO_ROOT / "scripts" / "incremental_engine.py"
-    spec = importlib.util.spec_from_file_location("incremental_engine", path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules.setdefault("incremental_engine", mod)
-    spec.loader.exec_module(mod)
-    return mod
 
 
 # --------------------------------------------------------------------------- discovery
@@ -182,8 +173,7 @@ def estimate_usd(msgs, points, price) -> tuple[float, float]:
 def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, every: int,
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,
            model: str | None = None) -> dict:
-    eng = load_engine()
-    env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(__import__("os").environ)}
+    env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
 
     if "control" in arms:
         console.print("[red]control is always replayed — pass only the arms to compare[/]")
