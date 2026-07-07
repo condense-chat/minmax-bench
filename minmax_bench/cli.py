@@ -247,6 +247,42 @@ def fetch_cmd(
     console.print(f"[green]cached[/] {len(sessions)} sessions -> {path} ({time.time() - t:.0f}s)")
 
 
+@app.command("counterfactual")
+def counterfactual_cmd(
+    session: str | None = typer.Argument(None, help="A Claude Code session .jsonl (default: pick interactively from ~/.claude/projects)."),
+    arms: str = typer.Option("condense", "--arms", help="Comma list of arms to replay besides control (condense, headroom)."),
+    budget_usd: float = typer.Option(2.0, "--budget-usd", help="Max spend per arm (control included)."),
+    limit: int = typer.Option(0, "--limit", "-n", help="Max decision points to replay (0 = all)."),
+    every: int = typer.Option(1, "--every", help="Replay every Nth decision point."),
+    max_tokens: int = typer.Option(6000, "--max-tokens", help="Replay output cap per step."),
+    model: str | None = typer.Option(None, "--model", help="Override the replay model (default: the session's own model)."),
+    out: str | None = typer.Option(None, "--out", help="Output dir (default results/counterfactual/<session>-<ts>)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+):
+    """Replay one of YOUR local Claude Code sessions through condense/headroom, step by step.
+
+    Teacher-forced counterfactual: at every decision point the recorded prefix is sent
+    through each arm and the next action is compared to what actually happened, next to
+    a control replay (the noise floor). Costs real money; shows an estimate first.
+    """
+    from .counterfactual import pick_session, render_summary, replay
+
+    sp = Path(session).expanduser() if session else pick_session(console)
+    if not sp.is_file():
+        raise typer.BadParameter(f"not a session file: {sp}")
+    arm_list = [a.strip() for a in arms.split(",") if a.strip()]
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    out_dir = Path(out) if out else Path("results/counterfactual") / f"{sp.stem[:8]}-{stamp}"
+    try:
+        summary = replay(sp, arm_list, budget_usd=budget_usd, limit=limit, every=every,
+                         max_tokens=max_tokens, out_dir=out_dir, console=console,
+                         assume_yes=yes, model=model)
+    except SystemExit as e:
+        raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
+    render_summary(summary, console)
+    console.print(f"[green]artifacts[/] {out_dir}/  (per-step jsonl + summary.json)")
+
+
 @app.command("strategies")
 def strategies_cmd():
     """List the strategy matrix (name, kind, config, and how it resolves)."""
