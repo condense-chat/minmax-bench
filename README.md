@@ -248,7 +248,11 @@ uv run minmax-bench counterfactual ~/.claude/projects/<proj>/<id>.jsonl --arms c
 ```
 
 Per arm you get: **same-action agreement** (did it still make the same next move? read it against
-the control floor, not against 100%), **avg context tokens** and **$ vs control**. Scriptable
+the control floor, not against 100%), **avg context tokens** and **$ vs control** — plus a
+**recorded** row showing what those turns *actually* consumed when the session ran, so the table
+is both a counterfactual and a backtest. For the cost-only backtest across many sessions, the
+`minmax-bench run` wizard's dataset step accepts a bare `claude-code` and opens the same picker
+(replays your sessions turn-by-turn through each strategy's proxy). Scriptable
 equivalent: `python3 scripts/generate.py --mode incremental --session <file> --task <name>`.
 Note the condense arm sends your session content to `api.condense.chat`.
 

@@ -146,6 +146,31 @@ def session_meta(path: Path) -> dict:
     return {"cwd": cwd, "model": model}
 
 
+def recorded_usage(path: Path) -> list[dict]:
+    """Per-decision-point usage as RECORDED in the session (one per assistant response).
+
+    Ordered by first occurrence of each requestId — matching parse_session's merged
+    assistant messages closely enough to anchor a backtest: "what did these turns
+    actually consume when the session ran", next to what the replays consumed.
+    """
+    seen, out = set(), []
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("isSidechain") or rec.get("type") != "assistant":
+                continue
+            rid = rec.get("requestId")
+            u = rec.get("message", {}).get("usage") or {}
+            if not u or rid in seen:
+                continue  # a response split across records repeats the same usage
+            seen.add(rid)
+            out.append(u)
+    return out
+
+
 def _prefix_chars(msgs: list[dict], points: list[int]) -> list[int]:
     """Cumulative JSON size (chars) of each decision point's prefix."""
     sizes, total, j = [], 0, 0
@@ -275,6 +300,19 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
             "avg_ctx_tokens": (ctx_total // n_ok) if n_ok else 0,
             "cost_usd": round(spent, 4), "file": str(path),
         }
+    # backtest anchor: what these same turns ACTUALLY consumed when the session ran
+    # (recorded usage, the session's own model + live caching) — replays above re-ran
+    # them fresh, so this row is the "you actually paid" reference point
+    rec = recorded_usage(session)
+    pos = {i: k for k, i in enumerate(points)}
+    ks = [pos[i] for i in sel if pos[i] < len(rec)]
+    if ks:
+        ctx = sum(rec[k].get("input_tokens", 0) + rec[k].get("cache_read_input_tokens", 0)
+                  + rec[k].get("cache_creation_input_tokens", 0) for k in ks)
+        summary["recorded"] = {
+            "steps": len(ks), "avg_ctx_tokens": ctx // len(ks),
+            "cost_usd": round(sum(eng.cost_usd(rec[k], meta["model"]) for k in ks), 4),
+        }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=1))
     return summary
 
@@ -289,6 +327,11 @@ def render_summary(summary: dict, console: Console) -> None:
     for col in ("arm", "steps", "same action", "exact", "avg ctx tokens",
                 "ctx vs control", "cost", "$ vs control"):
         t.add_column(col, justify="right" if col != "arm" else "left")
+    rec = summary.get("recorded")
+    if rec:
+        t.add_row("[dim]recorded*[/]", f"[dim]{rec['steps']}[/]", "[dim]—[/]", "[dim]—[/]",
+                  f"[dim]{rec['avg_ctx_tokens']:,}[/]", "[dim]—[/]",
+                  f"[dim]${rec['cost_usd']:.2f}[/]", "[dim]—[/]")
     for arm, a in summary["arms"].items():
         n = a["steps_ok"]
         agree = a["agree_action"] / n if n else None
@@ -306,6 +349,11 @@ def render_summary(summary: dict, console: Console) -> None:
             f"{costd:+.0%}" if costd is not None else "—",
         )
     console.print(t)
+    if rec:
+        console.print(
+            "[dim]* recorded = what these turns actually consumed when the session ran (its own "
+            "model + live caching); the replay rows re-ran the same turns fresh, so compare arms "
+            "to control for the counterfactual and to recorded for the backtest anchor.[/]")
     if floor is not None:
         console.print(
             f"[dim]control replay agrees with the original {floor:.0%} of the time — that is the "

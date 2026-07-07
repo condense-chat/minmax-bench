@@ -253,14 +253,45 @@ def _setup_step(console: Console, strategies: list[str]) -> list[str]:
     return _multiselect(console, "set up locally", opts)
 
 
+def _pick_local_sessions(console: Console) -> str:
+    """Interactive multi-pick over ~/.claude/projects -> a claude-code:<paths> spec.
+
+    This is the COST BACKTEST entry point: replay your own sessions turn-by-turn
+    through the selected strategies and see what they would have cost. For the
+    quality counterfactual (would it have made the same decisions), see
+    `minmax-bench counterfactual`.
+    """
+    from datetime import datetime
+
+    from .counterfactual import scan_sessions
+
+    found = scan_sessions(limit=20)
+    if not found:
+        console.print("[yellow]no local Claude Code sessions found — enter a path instead[/]")
+        return Prompt.ask("[cyan]dataset[/]", default="sample", console=console).strip()
+    opts = []
+    for s in found:
+        when = datetime.fromtimestamp(s.mtime).strftime("%m-%d %H:%M")
+        proj = ("…" + s.project[-30:]) if len(s.project) > 31 else s.project
+        label = f"{when}  {proj}  [dim]{s.prompt[:40] or '(no text prompt)'}[/]"
+        opts.append((str(s.path), label, True, False))
+    chosen = _multiselect(console, "your Claude Code sessions (backtest what they'd cost)", opts)
+    if not chosen:
+        chosen = [opts[0][0]]
+    return "claude-code:" + ",".join(chosen)
+
+
 def run_wizard(console: Console) -> WizardResult:
     _banner(console)
 
     # 1. dataset -> size every conversation, show them, filter by a turn range.
     dataset = Prompt.ask(
-        "[cyan]dataset[/] (sample | swe-chat:N | claude-code:/path/*.jsonl)",
+        "[cyan]dataset[/] (sample | swe-chat:N | claude-code = backtest YOUR sessions "
+        "| claude-code:/path/*.jsonl)",
         default="sample", console=console,
     ).strip()
+    if dataset == "claude-code":  # bare: pick from ~/.claude/projects interactively
+        dataset = _pick_local_sessions(console)
     sessions = _load_with_progress(console, dataset)
     rows = _sized(console, sessions, "o200k_base")
     _show_conversations(console, rows, kept=None)

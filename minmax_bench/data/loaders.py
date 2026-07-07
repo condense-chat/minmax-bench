@@ -76,9 +76,16 @@ def _load_swe_chat_cached(limit: int | None, force: bool = False) -> list[Sessio
 
 
 def _expand(arg: str) -> list[str]:
+    """Resolve a path argument: a file, a glob, or a comma-separated list of either.
+
+    The comma form is what the interactive session picker writes into the manifest
+    (`claude-code:/a.jsonl,/b.jsonl`), so a resumed run re-resolves identically.
+    """
     if not arg:
         raise ValueError("this dataset source needs a path, e.g. claude-code:/path/to/*.jsonl")
-    paths = sorted(glob.glob(arg)) if any(c in arg for c in "*?[") else [arg]
+    paths: list[str] = []
+    for part in (p.strip() for p in arg.split(",") if p.strip()):
+        paths += sorted(glob.glob(part)) if any(c in part for c in "*?[") else [part]
     if not paths:
         raise FileNotFoundError(f"no files matched {arg!r}")
     return paths

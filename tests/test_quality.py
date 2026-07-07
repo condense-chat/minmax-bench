@@ -161,3 +161,27 @@ def test_bundled_sample_still_reports(tmp_path):
     a = d["rows"][0]["arms"]["condense"]
     assert a["n"] == 2 and d["rows"][0]["vanilla"]["n"] == 2
     assert a["length_ok"] is False  # the documented headline: condense diverges on kv-store
+
+
+# ---------------------------------------------------------------- backtest plumbing
+def test_loader_expands_comma_separated_paths(tmp_path):
+    from minmax_bench.data.loaders import _expand
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    a.write_text("")
+    b.write_text("")
+    assert _expand(f"{a},{b}") == [str(a), str(b)]
+    assert _expand(str(tmp_path / "*.jsonl")) == [str(a), str(b)]
+
+
+def test_recorded_usage_reads_real_session():
+    import glob as g
+
+    from minmax_bench.counterfactual import recorded_usage
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "runs", "quality-sample")
+    sessions = g.glob(f"{root}/vanilla-*/**/agent/sessions/projects/-app/*.jsonl",
+                      recursive=True)
+    if not sessions:
+        return
+    usages = recorded_usage(__import__("pathlib").Path(sessions[0]))
+    assert usages and all("output_tokens" in u or "input_tokens" in u for u in usages)
