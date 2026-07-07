@@ -77,16 +77,40 @@ DEFAULT_TASKS = [
 ]
 
 
-def resolve_tasks(raw):
-    """--tasks: omitted -> first 5 curated; an integer N -> first N; else comma names."""
-    if not raw:
-        return DEFAULT_TASKS[:5]
-    if raw.strip().isdigit():
-        n = int(raw)
-        if n > len(DEFAULT_TASKS):
-            sys.exit(f"--tasks {n}: only {len(DEFAULT_TASKS)} curated defaults exist — "
-                     f"name additional tasks explicitly (see --list-tasks)")
-        return DEFAULT_TASKS[:n]
+def dataset_tasks(org="terminal-bench"):
+    """Every task id harbor has locally for a dataset org (sorted); curated ones first.
+
+    Harbor materializes task packages under ~/.cache/harbor/tasks/packages/<org>/;
+    `harbor datasets download <org>/<dataset>` fetches the full set.
+    """
+    cache = os.path.expanduser(f"~/.cache/harbor/tasks/packages/{org}")
+    local = sorted(d for d in (os.listdir(cache) if os.path.isdir(cache) else [])
+                   if os.path.isdir(os.path.join(cache, d)))
+    curated = DEFAULT_TASKS if org == "terminal-bench" else []
+    return curated + [t for t in local if t not in curated]
+
+
+def resolve_tasks(raw, org="terminal-bench", seed=None):
+    """--tasks forms: omitted -> first 5 recommended; N -> first N known (recommended
+    order first, then the rest alphabetically); random:N -> N sampled from everything
+    known locally (use --seed to reproduce); else comma-separated names."""
+    import random as _random
+    raw = (raw or "").strip()
+    rand_n = None
+    if raw.lower().startswith("random:"):
+        rand_n = raw.split(":", 1)[1]
+        if not rand_n.isdigit():
+            sys.exit(f"--tasks {raw}: expected random:<N>")
+    if not raw or raw.isdigit() or rand_n:
+        n = int(rand_n or raw or 5)
+        pool = dataset_tasks(org)
+        if n > len(pool):
+            sys.exit(f"--tasks {raw or n}: only {len(pool)} {org} tasks are known locally — "
+                     f"run `harbor datasets download <org>/<dataset>` to fetch the full "
+                     f"dataset, or name tasks explicitly")
+        if rand_n:
+            return sorted(_random.Random(seed).sample(pool, n))
+        return pool[:n]
     return [t for t in raw.split(",") if t.strip()]
 
 

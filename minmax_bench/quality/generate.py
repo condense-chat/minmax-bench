@@ -35,9 +35,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from minmax_bench.quality import engine as eng  # the teacher-forced replay engine
-from minmax_bench.quality.engine import DEFAULT_TASKS, resolve_tasks
+from minmax_bench.quality.engine import DEFAULT_TASKS, dataset_tasks, resolve_tasks
 
-DATASET = "terminal-bench/terminal-bench-2-1"
+DEFAULT_DATASET = "terminal-bench/terminal-bench-2-1"  # the only validated dataset so far
 DEFAULT_MODEL = "claude-sonnet-4-6"
 SUPPORTED_AGENTS = {"claude-code"}  # codex / opencode: TODO; harbor agent ids in _arm_wiring
 HRPORT = int(os.environ.get("HRPORT", "8787"))
@@ -120,7 +120,8 @@ def _validate_full(args, env):
 
 def full(args, env):
     arms = _validate_full(args, env)
-    tasks = resolve_tasks(args.tasks)
+    org = args.dataset.split("/", 1)[0]
+    tasks = resolve_tasks(args.tasks, org, args.seed)
     out = args.out
     os.makedirs(out, exist_ok=True)
     model = args.model or DEFAULT_MODEL
@@ -141,8 +142,8 @@ def full(args, env):
             base, allow, agent, extra = _arm_wiring(arm, env)
             for task in tasks:
                 cell = f"{out}/{arm}-{task}"
-                cmd = ["harbor", "run", "-d", DATASET, "-a", agent, "-m", model,
-                       "-i", f"terminal-bench/{task}", "-k", str(k),
+                cmd = ["harbor", "run", "-d", args.dataset, "-a", agent, "-m", model,
+                       "-i", f"{org}/{task}", "-k", str(k),
                        "-n", str(args.concurrency),
                        "-o", cell, "--ak", f"max_budget_usd={args.budget_usd}",
                        "--allow-agent-host", allow, *extra]
@@ -352,7 +353,7 @@ def judge_milestones(args, env):
         sys.exit("milestone judge needs an API key:\n  - " + "\n  - ".join(problems))
     arms = ["vanilla"] + [a for a in args.arms.split(",") if a]
     result, mpath = {}, f"{args.out}/milestones.json"
-    for task in resolve_tasks(args.tasks):
+    for task in resolve_tasks(args.tasks, args.dataset.split('/', 1)[0]):
         sess = {arm: _runs(args.out, arm, task) for arm in arms}  # glob once per (task, arm)
         ref = next((p for p, r in sess["vanilla"] if r == "1"), None)
         if not ref:
@@ -395,7 +396,13 @@ def main():
                     help="comma list of terminal-bench task ids, or a number N for the "
                          "first N curated defaults; omitted = 5 (see --list-tasks)")
     ap.add_argument("--list-tasks", action="store_true",
-                    help="print the curated default tasks and exit")
+                    help="print the locally known tasks (curated marked) and exit")
+    ap.add_argument("--dataset", default=DEFAULT_DATASET,
+                    help="harbor dataset (org/name-version); only the default is "
+                         "validated so far")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="seed for --tasks random:N (omit = fresh sample; the plan "
+                         "line always prints the chosen tasks for reproducibility)")
     ap.add_argument("--out", default="results/jobs/run")
     ap.add_argument("--model", default=None)
     # full
@@ -434,10 +441,12 @@ def main():
     args = ap.parse_args()
 
     if args.list_tasks:
-        for i, t in enumerate(DEFAULT_TASKS, 1):
-            print(f"{i}. {t}{'   <- default 5' if i == 5 else ''}")
-        print("any other terminal-bench-2-1 id also works: "
-              "https://hub.harborframework.com/datasets")
+        for i, t in enumerate(dataset_tasks(args.dataset.split("/", 1)[0]), 1):
+            mark = " *curated" if t in DEFAULT_TASKS else ""
+            print(f"{i}. {t}{mark}{'   <- default 5' if i == 5 else ''}")
+        print("(*curated = cost-ordered defaults; the rest is whatever harbor has cached "
+              "locally — `harbor datasets download terminal-bench/terminal-bench-2-1` "
+              "fetches the full dataset)")
         return
     if args.agent not in SUPPORTED_AGENTS:
         sys.exit(f"--agent {args.agent} is not implemented yet (TODO). "

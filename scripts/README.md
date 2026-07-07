@@ -20,7 +20,10 @@ generate.py --mode {full,incremental}     # full = end-to-end trajectory; increm
                                            #   headroom-ccr      = token mode + retrieve loop (full
                                            #                       CCR — headroom's intended config)
                                            #   headroom-kompress = token mode, no retrieval (ablation)
-            --tasks 5      # or a,b,c by name; omitted = 5 curated defaults (--list-tasks)
+            --tasks 5      # N = first N recommended; random:N = seeded sample of the
+                           # whole dataset (--seed); a,b,c by name; omitted = 5.
+                           # --list-tasks shows everything known locally.
+            --dataset terminal-bench/terminal-bench-2-1   # the only validated dataset so far
             --out results/jobs/run
 ```
 

@@ -1,0 +1,27 @@
+{
+  "uuid": "dbd99004-525f-4973-9e70-ca0c4c26329b",
+  "created_utc": "2026-07-07T17:52:53+00:00",
+  "dataset": "claude-code:results/jobs/e2e1/vanilla-kv-store-grpc/2026-07-07__17-51-57/kv-store-grpc__FEn7jVj/agent/sessions/projects/-app/c32fee98-79a3-4dcf-933c-080f8790d3b5.jsonl",
+  "strategies": [
+    "headroom"
+  ],
+  "models": [
+    "claude-haiku-4-5"
+  ],
+  "encoding": "o200k_base",
+  "count_mode": "local",
+  "max_tokens": 1,
+  "edges": [
+    4000,
+    16000,
+    64000
+  ],
+  "session_limit": null,
+  "point_limit": null,
+  "longest": null,
+  "token_limit": 50000,
+  "session_ids": null,
+  "session_test_uuids": {
+    "claude-haiku-4-5::c32fee98-79a3-4dcf-933c-080f8790d3b5": "c1ddefc9-5055-5393-a50d-a92472d5b35b"
+  }
+}

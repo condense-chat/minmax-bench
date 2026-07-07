@@ -1,0 +1,71 @@
+{
+  "meta": {
+    "run_uuid": "dbd99004-525f-4973-9e70-ca0c4c26329b",
+    "created_utc": "2026-07-07T17:52:53+00:00",
+    "dataset": "claude-code:results/jobs/e2e1/vanilla-kv-store-grpc/2026-07-07__17-51-57/kv-store-grpc__FEn7jVj/agent/sessions/projects/-app/c32fee98-79a3-4dcf-933c-080f8790d3b5.jsonl",
+    "strategies": [
+      "headroom"
+    ],
+    "models": [
+      "claude-haiku-4-5"
+    ],
+    "edges": [
+      4000,
+      16000,
+      64000
+    ],
+    "encoding": "o200k_base",
+    "count_mode": "local",
+    "max_tokens": 1,
+    "session_limit": null,
+    "point_limit": null,
+    "longest": null
+  },
+  "models": {
+    "claude-haiku-4-5": {
+      "headroom": [
+        {
+          "label": "0-4k",
+          "n": 6,
+          "avg_chain_tokens": 1247.0,
+          "tokens_saved_prompt": -2720,
+          "tokens_saved_total": -2720,
+          "cache_read_tokens_saved": 5290,
+          "cache_write_tokens_saved": 2192,
+          "pct_tokens_saved_prompt": -36.3539160652232,
+          "pct_tokens_saved_total": -30.276046304541406,
+          "pct_cache_read_tokens_saved": 100.0,
+          "pct_cache_write_tokens_saved": 100.0,
+          "base_price_usd": 0.010779000000000002,
+          "post_price_usd": 0.017712,
+          "cost_saved_usd": -0.0069329999999999965,
+          "pct_cost_saved_total": -64.31951015864176,
+          "pct_cost_saved_cache_read": 100.0,
+          "pct_cost_saved_cache_write": 100.0,
+          "pct_cost_saved_input": 0.0
+        },
+        {
+          "label": "ALL",
+          "n": 6,
+          "avg_chain_tokens": 1247.0,
+          "tokens_saved_prompt": -2720,
+          "tokens_saved_total": -2720,
+          "cache_read_tokens_saved": 5290,
+          "cache_write_tokens_saved": 2192,
+          "pct_tokens_saved_prompt": -36.3539160652232,
+          "pct_tokens_saved_total": -30.276046304541406,
+          "pct_cache_read_tokens_saved": 100.0,
+          "pct_cache_write_tokens_saved": 100.0,
+          "base_price_usd": 0.010779000000000002,
+          "post_price_usd": 0.017712,
+          "cost_saved_usd": -0.0069329999999999965,
+          "pct_cost_saved_total": -64.31951015864176,
+          "pct_cost_saved_cache_read": 100.0,
+          "pct_cost_saved_cache_write": 100.0,
+          "pct_cost_saved_input": 0.0
+        }
+      ]
+    }
+  },
+  "errors": []
+}

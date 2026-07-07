@@ -205,3 +205,17 @@ def test_score_bash_different_program_still_disagrees():
     b = tool("Bash", command="cat server.py")
     _, action, _ = eng.score(a, b)
     assert not action
+
+
+def test_resolve_tasks_forms():
+    assert eng.resolve_tasks(None) == eng.DEFAULT_TASKS[:5]
+    assert eng.resolve_tasks("2") == eng.DEFAULT_TASKS[:2]
+    assert eng.resolve_tasks("a,b") == ["a", "b"]
+    pool = eng.dataset_tasks()
+    assert pool[: len(eng.DEFAULT_TASKS)] == eng.DEFAULT_TASKS  # curated stay first
+
+
+def test_resolve_tasks_random_is_seeded_and_bounded():
+    a = eng.resolve_tasks("random:4", seed=7)
+    b = eng.resolve_tasks("random:4", seed=7)
+    assert a == b and len(a) == 4 and all(t in eng.dataset_tasks() for t in a)
