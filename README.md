@@ -227,9 +227,9 @@ python3 scripts/report.py --from runs/quality-sample --tasks kv-store-grpc --arm
 ```bash
 # generate (spends: runs the agent), then report (pure display)
 python3 scripts/generate.py --mode full --tasks "kv-store-grpc,fix-code-vulnerability" \
-  --arms condense,headroom --out results/jobs/run1 --milestones
+  --arms condense,headroom-ccr --out results/jobs/run1 --milestones
 python3 scripts/report.py --from results/jobs/run1 --tasks "kv-store-grpc,fix-code-vulnerability" \
-  --arms condense,headroom
+  --arms condense,headroom-ccr
 ```
 
 The quality bench is **pure standard library** — nothing to install to *analyze* runs; Docker + Harbor

@@ -351,7 +351,7 @@ def main():
         description="display the quality bench (reads generate.py's artifacts)")
     ap.add_argument("--from", default="results/jobs", help="results root produced by generate.py")
     ap.add_argument("--tasks", required=True)
-    ap.add_argument("--arms", default="condense,headroom")
+    ap.add_argument("--arms", default="condense,headroom-ccr")
     ap.add_argument("--agent", default="claude-code", choices=list(AGENT_SESSION_GLOB))
     ap.add_argument("--format", default="html", choices=["html", "md"])
     ap.add_argument("--out", default=None)

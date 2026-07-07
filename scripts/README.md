@@ -15,7 +15,7 @@ generate.py  ──▶  results/<out>/**            report.py  ──▶  report
 ```
 generate.py --mode {full,incremental}     # full = end-to-end trajectory; incremental = teacher-forced per-step
             --agent claude-code            # default; codex / opencode = TODO (errors, doesn't fake it)
-            --arms condense,headroom       # vanilla baseline always included (cost-bench names):
+            --arms condense,headroom-ccr   # DEFAULT; vanilla always included (cost-bench names):
                                            #   headroom          = cache-mode proxy
                                            #   headroom-ccr      = token mode + retrieve loop (full
                                            #                       CCR — headroom's intended config)
@@ -86,7 +86,7 @@ python3 scripts/report.py --from runs/quality-sample --tasks kv-store-grpc --arm
 # generate then display (needs Docker + harbor + .env keys)
 cp .env.dist .env      # ANTHROPIC_API_KEY, CONDENSE_API_KEY
 python3 scripts/generate.py --mode full --tasks kv-store-grpc,fix-code-vulnerability \
-  --arms condense,headroom --out results/jobs/run1 --milestones
+  --arms condense,headroom-ccr --out results/jobs/run1 --milestones
 python3 scripts/report.py --from results/jobs/run1 --tasks kv-store-grpc,fix-code-vulnerability \
-  --arms condense,headroom
+  --arms condense,headroom-ccr
 ```

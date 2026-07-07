@@ -9,7 +9,8 @@ Two ways to generate:
 
 Shared:
   --agent claude-code   default; codex / opencode = TODO (not implemented yet)
-  --arms condense,headroom   the methods to run (vanilla baseline is always included).
+  --arms condense,headroom-ccr   the methods to run (vanilla baseline is always included;
+                             this default pits condense against headroom's intended config).
                              headroom       = cache-mode proxy (cost bench's 'headroom')
                              headroom-ccr   = token-mode proxy + the mcp retrieve loop — the
                                               full Compress-Cache-Retrieve product, headroom's
@@ -328,7 +329,7 @@ def main():
                     help="full/incremental = generate trajectories; "
                          "judge = LLM milestone scoring of existing runs")
     ap.add_argument("--agent", default="claude-code")
-    ap.add_argument("--arms", default="condense,headroom")
+    ap.add_argument("--arms", default="condense,headroom-ccr")
     ap.add_argument("--tasks", help="comma list (full mode / milestone judge)")
     ap.add_argument("--out", default="results/jobs/run")
     ap.add_argument("--model", default=None)
