@@ -15,18 +15,14 @@ Caveat (report alongside solve-rate, not instead of it): this measures
 information preserved in context, not end-to-end outcome — agents recover from
 flipped actions, and per-step agreement doesn't capture compounding.
 
-Usage:
-  python3 scripts/fidelity_replay.py \
-    --session <trial>/agent/sessions/projects/-app/<id>.jsonl \
-    --template <captured req_00.json> \
-    --arm control --out results/fidelity/control.jsonl \
-    [--every 1] [--limit 0] [--max-tokens 6000] [--budget-usd 5] [--strip-thinking]
+This module is the LIBRARY: session I/O, request building, calling, scoring.
+The drivers are `scripts/generate.py --mode incremental` (batch, artifacts for
+report.py) and `minmax-bench counterfactual` (interactive, local sessions).
 
 Template = a real CC request captured via a local recording server (has the
 version-matched system prompt, tools, beta headers, thinking/context_management
-config). mcp__* tools are dropped (container runs had plain CC tools).
+config). mcp__* tools are dropped by default (container runs had plain CC tools).
 """
-import argparse
 import copy
 import difflib
 import json
@@ -35,13 +31,34 @@ import sys
 import time
 import urllib.error
 import urllib.request
-import uuid
-from datetime import datetime, timezone
 
-UTC = timezone.utc  # datetime.UTC alias is 3.11+; this repo's python3 is 3.10
+# where a Harbor claude-code trial stores its session transcript (cwd=/app slug);
+# shared by report.py and generate.py so the path convention lives in one place
+SESSION_GLOB = "agent/sessions/projects/-app/*.jsonl"
 
-# claude-sonnet-4-6 pricing, USD per Mtok
-PRICE = {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30}
+# USD per Mtok: input / output / cache_write (5-min TTL, 1.25x) / cache_read (0.1x).
+# Matched by model-id prefix, longest match wins; extend when replaying new models.
+PRICES = {
+    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
+    "claude-sonnet-5": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
+    "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_write": 1.25, "cache_read": 0.10},
+    "claude-opus-4": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.50},
+    "claude-fable-5": {"input": 10.0, "output": 50.0, "cache_write": 12.50, "cache_read": 1.00},
+}
+DEFAULT_PRICE_MODEL = "claude-sonnet-4-6"
+
+
+def rates_for(model):
+    """Longest-prefix price lookup; falls back to sonnet rates with a warning."""
+    best = ""
+    for prefix in PRICES:
+        if model and model.startswith(prefix) and len(prefix) > len(best):
+            best = prefix
+    if not best:
+        print(f"warn: no price entry for model {model!r}; using {DEFAULT_PRICE_MODEL} rates",
+              file=sys.stderr)
+        return PRICES[DEFAULT_PRICE_MODEL]
+    return PRICES[best]
 
 ARMS = {
     "control": {"base": "https://api.anthropic.com"},
@@ -59,6 +76,40 @@ def load_env(path=".env"):
                 k, v = line.split("=", 1)
                 env[k] = v.strip().strip('"').strip("'")
     return env
+
+
+def check_arms(arms, env):
+    """Fail-fast validation BEFORE any money is spent: known arms + required keys.
+
+    Returns a list of human-readable problems (empty = good to go). call_api
+    dereferences ARMS[arm] and the key env vars unconditionally, so skipping this
+    check crashes mid-run — typically after the control arm already spent budget.
+    """
+    problems = []
+    for arm in arms:
+        if arm not in ARMS:
+            problems.append(f"arm {arm!r} has no replay endpoint "
+                            f"(known: {', '.join(sorted(ARMS))})")
+    if not env.get("ANTHROPIC_API_KEY"):
+        problems.append("ANTHROPIC_API_KEY missing (.env or environment)")
+    if any(ARMS.get(a, {}).get("condense_auth") for a in arms) and not env.get("CONDENSE_API_KEY"):
+        problems.append("CONDENSE_API_KEY missing — needed for the condense arm")
+    return problems
+
+
+def patch_cwd(tmpl_body, template_path, new_cwd):
+    """Rewrite the capture machine's cwd in the template system prompt to new_cwd.
+
+    The template was captured from a live CC session whose cwd was <repo>/ccwork
+    (sibling of the template's data/ dir); replayed sessions ran elsewhere
+    (containers: /app, local sessions: their own project dir), and a mismatched
+    advertised cwd depresses action fidelity for every arm.
+    """
+    cap_dir = os.path.dirname(os.path.abspath(template_path))
+    cap_cwd = os.path.join(os.path.dirname(cap_dir), "ccwork")
+    tmpl_body["system"] = json.loads(
+        json.dumps(tmpl_body["system"]).replace(cap_cwd, new_cwd))
+    return tmpl_body
 
 
 def parse_session(path):
@@ -120,7 +171,7 @@ def load_swechat(path, idx):
     and have thinking signatures stripped (so we drop thinking). Real public Claude Code
     sessions on real repos — long, exploratory, no verifier reward.
     """
-    rec = [json.loads(l) for l in open(path)][idx]
+    rec = [json.loads(line) for line in open(path)][idx]
     used = set()
     msgs = []
     for m in rec["messages"]:
@@ -200,14 +251,16 @@ def score(orig, replay):
         return False, False, 0.0
     if orig["type"] == "text":
         sim = difflib.SequenceMatcher(None, orig["text"], replay["text"]).ratio()
-        return sim > 0.9, True, sim  # same decision: stop and answer
+        # both chose to stop and answer, but only count it as the same decision when
+        # the answers are in the same ballpark — a bail-out ("can't proceed") must not
+        # agree with a substantive final answer
+        return sim > 0.9, sim > 0.5, sim
     if orig["name"] != replay["name"]:
         return False, False, 0.0
     a, b = orig["input"], replay["input"]
-    sim = difflib.SequenceMatcher(
-        None, norm_ws(json.dumps(a, sort_keys=True)), norm_ws(json.dumps(b, sort_keys=True))
-    ).ratio()
-    exact = norm_ws(json.dumps(a, sort_keys=True)) == norm_ws(json.dumps(b, sort_keys=True))
+    na, nb = norm_ws(json.dumps(a, sort_keys=True)), norm_ws(json.dumps(b, sort_keys=True))
+    exact = na == nb
+    sim = 1.0 if exact else difflib.SequenceMatcher(None, na, nb).ratio()
     if orig["name"] == "Bash":
         action = norm_ws(a.get("command", "")) == norm_ws(b.get("command", ""))
     elif "file_path" in a or "file_path" in b:
@@ -218,19 +271,30 @@ def score(orig, replay):
 
 
 def build_request(tmpl_body, prefix, args, session_id):
+    # SWE-chat replays pre-build their tool list and target older models, so they keep
+    # all tools and drop the 4.6-era config keys; both knobs are also available on their
+    # own (counterfactual replay of local sessions keeps mcp__ tool stubs, and drops the
+    # beta config only when replaying on a model other than the template's).
+    keep_all_tools = getattr(args, "swechat", None) or getattr(args, "keep_all_tools", False)
+    drop_beta_config = getattr(args, "swechat", None) or getattr(args, "drop_beta_config", False)
+    # never mutate the caller's messages: per-message dict copies, and content lists are
+    # rebuilt wherever we change them (strip-thinking, cache breakpoint below) — callers
+    # replay the same msgs list once per step, so leaked mutations would compound
+    # (e.g. cache_control accumulating on interior blocks until the API rejects >4)
+    prefix = [dict(m) for m in prefix]
     req = {
         "model": tmpl_body["model"],
         "max_tokens": args.max_tokens,
         "system": tmpl_body["system"],
-        "tools": (tmpl_body["tools"] if getattr(args, "swechat", None)
-                  else [t for t in tmpl_body["tools"] if not t.get("name", "").startswith("mcp__")]),
+        "tools": (tmpl_body["tools"] if keep_all_tools else
+                  [t for t in tmpl_body["tools"] if not t.get("name", "").startswith("mcp__")]),
         "messages": prefix,
         "stream": True,  # condense's gateway 504s on long non-streaming requests; CC streams
         "metadata": {"user_id": json.dumps({"device_id": "tmb-fidelity-replay",
                                             "account_uuid": "", "session_id": session_id})},
     }
-    if not getattr(args, "swechat", None):  # these are 4.6-era; drop for SWE-chat (older
-        for k in ("thinking", "context_management", "output_config"):  # models 400; no thinking blocks anyway)
+    if not drop_beta_config:  # these are 4.6-era; older models 400 on them
+        for k in ("thinking", "context_management", "output_config"):
             if k in tmpl_body:
                 req[k] = tmpl_body[k]
     if args.strip_thinking:
@@ -239,9 +303,11 @@ def build_request(tmpl_body, prefix, args, session_id):
             m["content"] = [b for b in m["content"]
                             if b.get("type") not in ("thinking", "redacted_thinking")]
     # incremental prompt caching across sequential replays (prefixes are nested)
-    last = req["messages"][-1]["content"]
+    last_msg = req["messages"][-1]
+    last = last_msg["content"]
     if last and isinstance(last[-1], dict) and last[-1].get("type") in ("text", "tool_result"):
-        last[-1] = {**last[-1], "cache_control": {"type": "ephemeral"}}
+        patched = {**last[-1], "cache_control": {"type": "ephemeral"}}
+        req["messages"][-1] = {**last_msg, "content": list(last[:-1]) + [patched]}
     return req
 
 
@@ -320,104 +386,9 @@ def call_api(arm, req, tmpl_headers, env):
     return None, "unreachable"
 
 
-def cost_usd(usage):
-    return (usage.get("input_tokens", 0) * PRICE["input"]
-            + usage.get("output_tokens", 0) * PRICE["output"]
-            + usage.get("cache_creation_input_tokens", 0) * PRICE["cache_write"]
-            + usage.get("cache_read_input_tokens", 0) * PRICE["cache_read"]) / 1e6
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--session")
-    ap.add_argument("--swechat", help="SWE-chat jsonl (alternative to --session)")
-    ap.add_argument("--conv", type=int, default=0, help="conversation index within --swechat")
-    ap.add_argument("--template", default="data/cc_request_template.json",
-                    help="captured CC request template (regenerate via scripts/capture_cc_template.py)")
-    ap.add_argument("--arm", choices=sorted(ARMS), required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--every", type=int, default=1, help="replay every Nth decision point")
-    ap.add_argument("--limit", type=int, default=0, help="max decision points (0 = all)")
-    ap.add_argument("--max-tokens", type=int, default=6000)
-    ap.add_argument("--budget-usd", type=float, default=5.0)
-    ap.add_argument("--strip-thinking", action="store_true")
-    ap.add_argument("--cwd-patch", default="/app",
-                    help="rewrite the capture cwd in the system prompt to this")
-    args = ap.parse_args()
-
-    env = {**load_env(), **os.environ}
-    if not env.get("ANTHROPIC_API_KEY"):
-        sys.exit("ANTHROPIC_API_KEY missing (.env or env)")
-    if ARMS[args.arm].get("condense_auth") and not env.get("CONDENSE_API_KEY"):
-        sys.exit("CONDENSE_API_KEY missing (.env or env)")
-
-    cap = json.load(open(args.template))
-    tmpl_body, tmpl_headers = cap["body"], {k.lower(): v for k, v in cap["headers"].items()}
-    # patch the local capture cwd out of the system prompt so it matches the container run
-    cap_cwd = os.path.dirname(os.path.abspath(args.template))
-    tmpl_body["system"] = json.loads(
-        json.dumps(tmpl_body["system"]).replace(os.path.join(os.path.dirname(cap_cwd), "ccwork"),
-                                                args.cwd_patch))
-
-    if args.swechat:
-        msgs, points, model, used = load_swechat(args.swechat, args.conv)
-        tmpl_body["model"] = model
-        tmpl_body["tools"] = build_tools(used, tmpl_body["tools"])
-        print(f"[swechat #{args.conv}] model={model}, {len(used)} tools", file=sys.stderr)
-    else:
-        msgs, points = parse_session(args.session)
-    sel = points[:: args.every]
-    if args.limit:
-        sel = sel[: args.limit]
-    session_id = str(uuid.uuid4())
-    print(f"[{args.arm}] {len(msgs)} msgs, {len(points)} decision points, "
-          f"replaying {len(sel)} (every={args.every}), replay session {session_id}")
-
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    spent, n_exact, n_action, n_err = 0.0, 0, 0, 0
-    with open(args.out, "w") as out:
-        for step, i in enumerate(sel):
-            if spent >= args.budget_usd:
-                print(f"budget ${args.budget_usd} reached, stopping at step {step}")
-                break
-            orig = extract_action(msgs[i]["content"])
-            req = build_request(tmpl_body, copy.deepcopy(msgs[:i]), args, session_id)
-            ts_start = datetime.now(UTC).isoformat()
-            t0 = time.time()
-            resp, err = call_api(args.arm, req, tmpl_headers, env)
-            ts_end = datetime.now(UTC).isoformat()
-            rec = {"arm": args.arm, "step": step, "msg_index": i,
-                   "n_prefix_msgs": i, "orig": orig, "ts_start": ts_start, "ts_end": ts_end,
-                   "latency_s": round(time.time() - t0, 1)}
-            if err:
-                n_err += 1
-                rec["error"] = err
-                print(f"  step {step} (msg {i}): ERROR {err[:160]}")
-            else:
-                replay = extract_action(resp.get("content", []))
-                exact, action, sim = score(orig, replay)
-                usage = resp.get("usage", {})
-                c = cost_usd(usage)
-                spent += c
-                n_exact += exact
-                n_action += action
-                rec.update(replay=replay, agree_exact=exact, agree_action=action,
-                           sim=round(sim, 3), usage=usage, cost_usd=round(c, 4))
-                o = orig.get("name", "text")
-                r = replay.get("name", "text")
-                print(f"  step {step} (msg {i}): {o} vs {r} "
-                      f"exact={exact} action={action} sim={sim:.2f} "
-                      f"ctx={usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0) + usage.get('input_tokens', 0)} "
-                      f"${spent:.2f}")
-            out.write(json.dumps(rec) + "\n")
-            out.flush()
-
-    n_ok = len(sel) - n_err
-    if n_ok:
-        print(f"\n[{args.arm}] SUMMARY: exact {n_exact}/{n_ok} ({n_exact / n_ok:.0%}), "
-              f"action {n_action}/{n_ok} ({n_action / n_ok:.0%}), "
-              f"errors {n_err}, cost ${spent:.2f}")
-
-
-if __name__ == "__main__":
-    main()
+def cost_usd(usage, model=None):
+    price = rates_for(model or DEFAULT_PRICE_MODEL)
+    return (usage.get("input_tokens", 0) * price["input"]
+            + usage.get("output_tokens", 0) * price["output"]
+            + usage.get("cache_creation_input_tokens", 0) * price["cache_write"]
+            + usage.get("cache_read_input_tokens", 0) * price["cache_read"]) / 1e6

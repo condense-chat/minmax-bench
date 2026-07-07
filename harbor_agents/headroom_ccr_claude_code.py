@@ -60,19 +60,28 @@ class HeadroomCcrClaudeCode(ClaudeCode):
 
         Spawned through a shell that puts ~/.local/bin (pip --user) on PATH so `headroom`
         resolves. Its --proxy-url points back at the same host proxy that ANTHROPIC_BASE_URL uses.
+
+        Servers configured on the base agent (self.mcp_servers) are preserved — the base
+        method serializes them into the same file, so clobbering it would silently strip
+        tools the vanilla claude-code arm has and make the arms incomparable.
         """
         proxy = self._get_env("TMB_HEADROOM_PROXY_URL") or "http://host.docker.internal:8787"
-        cfg = {
-            "mcpServers": {
-                "headroom": {
-                    "type": "stdio",
-                    "command": "sh",
-                    "args": [
-                        "-lc",
-                        f'export PATH="$HOME/.local/bin:$PATH"; '
-                        f"exec headroom mcp serve --proxy-url {proxy}",
-                    ],
-                }
-            }
+        servers: dict = {}
+        for server in self.mcp_servers or []:  # mirror the base method's serialization
+            if server.transport == "stdio":
+                servers[server.name] = {"type": "stdio", "command": server.command,
+                                        "args": server.args}
+            else:
+                transport = "http" if server.transport == "streamable-http" else server.transport
+                servers[server.name] = {"type": transport, "url": server.url}
+        servers["headroom"] = {
+            "type": "stdio",
+            "command": "sh",
+            "args": [
+                "-lc",
+                f'export PATH="$HOME/.local/bin:$PATH"; '
+                f"exec headroom mcp serve --proxy-url {proxy}",
+            ],
         }
+        cfg = {"mcpServers": servers}
         return f"echo {shlex.quote(json.dumps(cfg))} > $CLAUDE_CONFIG_DIR/.claude.json"

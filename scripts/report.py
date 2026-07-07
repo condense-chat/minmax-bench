@@ -1,76 +1,40 @@
 #!/usr/bin/env python3
 """report.py — DISPLAY only. Reads what `generate.py` produced and renders it. Never spends.
 
-Mirrors the sibling cost bench's `report` ("recompute from stored data, verify without re-spending"):
+Mirrors the sibling cost bench's `report` ("recompute from stored data, verify without
+re-spending"):
 generation writes artifacts; this reads them and computes the offline, deterministic views.
 
 Reads from a results root (`--from`):
-  - full run dirs      <root>/*/<arm>-<task>/*/*/{verifier/reward.txt, agent/sessions/.../*.jsonl}
-  - milestones.json    <root>/milestones.json     (optional; produced by `generate --milestones`)
-  - incremental jsonl  <root>/incremental/<task>-<arm>.jsonl  (optional; `generate --mode incremental`)
+  - full run dirs      <root>/**/<arm>-<task>/*/*/{verifier/reward.txt, agent/sessions/.../*.jsonl}
+                       plus <arm>-<task>/attempted.json (trials REQUESTED — killed/crashed trials
+                       write no reward.txt; counting them as failures avoids survivorship bias)
+  - milestones.json    anywhere under <root> (merged; produced by `generate --milestones`)
+  - incremental jsonl  <root>/**/incremental/<task>-<arm>.jsonl  (`generate --mode incremental`)
 
 Offline axes (always, no model calls): length / rework / solve, each vs the vanilla noise floor
-(✓ overlap = indistinguishable, ✗ disjoint; needs ≥2 runs/arm). Milestone + incremental axes appear
-only if their artifacts exist.
+(OK = bands overlap, DIVERGES = disjoint; needs ≥2 runs/arm). Milestone + incremental axes appear
+only if their artifacts exist. Verdicts are deliberately coarse: with k≈3 runs, band overlap can
+only catch GROSS divergence — "OK" means "no detectable divergence at this k", not equivalence.
 
   python3 scripts/report.py --from results/sample --tasks kv-store-grpc
   python3 scripts/report.py --from results/jobs --tasks a,b --arms condense,headroom --format md
 """
 import argparse
-import copy
 import glob
 import json
 import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# one session parser for the spend side (generate/engine) and the display side — the
+# engine is pure stdlib, so importing it keeps the "nothing to install to analyze" rule
+from incremental_engine import SESSION_GLOB, extract_action, parse_session  # noqa: E402
+
 AGENT_SESSION_GLOB = {  # only claude-code is wired; others are TODO
-    "claude-code": "agent/sessions/projects/-app/*.jsonl",
+    "claude-code": SESSION_GLOB,
 }
-
-
-# ---------------------------------------------------------------- session parsing (folded, offline)
-def parse_session(path):
-    """CC session JSONL -> API-shaped messages + assistant decision-point indices."""
-    groups = []
-    for line in open(path):
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if rec.get("isSidechain") or rec.get("type") not in ("user", "assistant"):
-            continue
-        m = rec["message"]
-        content = m["content"]
-        if isinstance(content, str):
-            content = [{"type": "text", "text": content}]
-        content = copy.deepcopy(content)
-        req = rec.get("requestId") if rec["type"] == "assistant" else None
-        if groups and groups[-1]["role"] == m["role"] and (
-                rec["type"] == "user" or groups[-1]["req"] == req):
-            groups[-1]["content"].extend(content)
-        else:
-            groups.append({"role": m["role"], "content": content, "req": req,
-                           "stop": m.get("stop_reason")})
-        if rec["type"] == "assistant":
-            groups[-1]["stop"] = m.get("stop_reason") or groups[-1]["stop"]
-    msgs = []
-    for g in groups:
-        thinking_only = all(b.get("type") in ("thinking", "redacted_thinking") for b in g["content"])
-        if g["role"] == "assistant" and g["stop"] == "max_tokens" and thinking_only:
-            continue
-        if msgs and msgs[-1]["role"] == g["role"]:
-            msgs[-1]["content"].extend(g["content"])
-        else:
-            msgs.append({"role": g["role"], "content": g["content"]})
-    return msgs, [i for i, m in enumerate(msgs) if m["role"] == "assistant"]
-
-
-def extract_action(content):
-    for b in content:
-        if b.get("type") == "tool_use":
-            return {"type": "tool_use", "name": b["name"], "input": b.get("input", {})}
-    return {"type": "text"}
 
 
 def actions(path):
@@ -98,7 +62,12 @@ def _covered(spans, s, e):
 
 
 def rework_count(acts):
-    """Redundant re-fetches: re-read of an already-seen file span (range-aware), re-cat, re-run."""
+    """Redundant re-fetches: re-read of an already-seen file span (range-aware), re-cat, re-run.
+
+    A Write/Edit invalidates everything known about that file — re-reading, re-catting, or
+    re-running a read-only command that touches it afterwards is VERIFICATION, not rework.
+    Counting it would penalize verify-heavy behavior (which some compaction methods induce).
+    """
     CAT = re.compile(r"\b(cat|head|tail|less|more|bat|sed -n|nl)\b")
     RO = re.compile(r"^\s*(grep|rg|find|ls|cat|head|tail|nm|ldd|which|file|stat|wc)\b")
     read_spans, last_read, seen, hits = {}, {}, {}, 0
@@ -107,8 +76,11 @@ def rework_count(acts):
             continue
         name, inp = a.get("name"), a.get("input", {})
         if name in ("Write", "Edit"):
-            if inp.get("file_path"):
-                read_spans[inp["file_path"]] = []
+            fp = inp.get("file_path")
+            if fp:
+                read_spans[fp] = []
+                last_read.pop(fp, None)
+                seen = {c: 1 for c in seen if fp not in c}
         elif name == "Read":
             fp = inp.get("file_path")
             s, e = _read_span(inp)
@@ -138,63 +110,118 @@ def overlaps(a, b):
     return a[0] <= b[2] and b[0] <= a[2]
 
 
-def runs_for(root, arm, task, agent):
-    # match <arm>-<task> whether directly under root (a single generate --out) or one/more
-    # dirs deep (pooling several job dirs). ** matches zero-or-more path segments.
-    out, seen = [], set()
-    for rt in sorted(glob.glob(f"{root}/**/{arm}-{task}/*/*/verifier/reward.txt", recursive=True)):
-        inst = os.path.dirname(os.path.dirname(rt))
-        s = glob.glob(os.path.join(inst, AGENT_SESSION_GLOB[agent]), recursive=True)
-        if s and s[0] not in seen:
-            seen.add(s[0])
-            out.append((s[0], open(rt).read().strip()))
-    return out
+def _is_sidechain(path):
+    """A sub-agent transcript: its records carry isSidechain=true from the first lines."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for n, line in enumerate(fh):
+                if n >= 20:
+                    break
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("isSidechain"):
+                    return True
+                if rec.get("type") in ("user", "assistant"):
+                    return False
+    except OSError:
+        return True
+    return False
+
+
+def index_runs(root, agent):
+    """One walk of the results tree -> {'<arm>-<task>': {'runs': [...], 'attempted': n}}.
+
+    Keyed by the literal cell dir name (arm names can contain hyphens — headroom-kompress —
+    so the name is not splittable; build() looks up f"{arm}-{task}" directly).
+    Discovery anchors on verifier/reward.txt (a finished trial). attempted.json records
+    how many trials generate.py REQUESTED, so trials that crashed or were killed by the
+    wall timeout surface as missing instead of silently shrinking n.
+    """
+    idx = {}
+    for rt in sorted(glob.glob(f"{root}/**/verifier/reward.txt", recursive=True)):
+        inst = os.path.dirname(os.path.dirname(rt))                        # .../<trial>/<inst>
+        key = os.path.basename(os.path.dirname(os.path.dirname(inst)))    # <arm>-<task>
+        cands = [s for s in sorted(glob.glob(os.path.join(inst, AGENT_SESSION_GLOB[agent])))
+                 if not _is_sidechain(s)]
+        if not key or not cands:
+            continue
+        # >1 session file per trial (Task-tool sub-agents, resumes): the main trajectory
+        # is the largest remaining transcript, not glob order
+        s = max(cands, key=os.path.getsize)
+        cell = idx.setdefault(key, {"runs": [], "attempted": None, "seen": set()})
+        if s not in cell["seen"]:
+            cell["seen"].add(s)
+            cell["runs"].append((s, open(rt).read().strip()))
+    for ap in glob.glob(f"{root}/**/attempted.json", recursive=True):
+        key = os.path.basename(os.path.dirname(ap))
+        try:
+            k = int(json.load(open(ap)).get("k", 0))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        cell = idx.setdefault(key, {"runs": [], "attempted": None, "seen": set()})
+        cell["attempted"] = (cell["attempted"] or 0) + k
+    return idx
 
 
 # ---------------------------------------------------------------- assemble (from artifacts only)
+def _cell_stats(cell):
+    runs = cell["runs"] if cell else []
+    lens, rws = [], []
+    for p, _ in runs:
+        acts = actions(p)
+        lens.append(len(acts))
+        rws.append(rework_count(acts))
+    n = len(runs)
+    attempted = cell["attempted"] if cell and cell["attempted"] else n
+    return {
+        "n": n, "attempted": max(attempted, n), "lost": max(attempted, n) - n,
+        # a trial that never finished is a failure on the solve axis, not missing data
+        "solve": sum(r == "1" for _, r in runs),
+        "length": band(lens), "rework": band(rws), "_lens": lens,
+    }
+
+
 def build(args):
+    root = args.__dict__["from"]
     arms = [a for a in args.arms.split(",") if a]
+    idx = index_runs(root, args.agent)
     milestones = {}
-    mpath = os.path.join(args.__dict__["from"], "milestones.json")
-    if os.path.exists(mpath):
-        milestones = json.load(open(mpath))  # {task: {arm: [min,mean,max]}}
-    incr = _load_incremental(os.path.join(args.__dict__["from"], "incremental"), arms)
+    for mp in sorted(glob.glob(f"{root}/**/milestones.json", recursive=True)):
+        try:
+            milestones.update(json.load(open(mp)))  # {task: {arm: [min,mean,max]}}
+        except (OSError, json.JSONDecodeError):
+            continue
+    incr = _load_incremental(root, arms)
     rows = []
     for task in args.tasks.split(","):
-        van = runs_for(args.__dict__["from"], "vanilla", task, args.agent)
-        vlen, vrw = [], []
-        for p, _ in van:
-            acts = actions(p)
-            vlen.append(len(acts))
-            vrw.append(rework_count(acts))
-        row = {"task": task, "vanilla": {"n": len(van), "solve": sum(r == "1" for _, r in van),
-                                         "length": band(vlen), "rework": band(vrw)}, "arms": {}}
+        v = _cell_stats(idx.get(f"vanilla-{task}"))
+        row = {"task": task, "vanilla": v, "arms": {}}
         for arm in arms:
-            runs = runs_for(args.__dict__["from"], arm, task, args.agent)
-            alen, arw = [], []
-            for p, _ in runs:
-                acts = actions(p)
-                alen.append(len(acts))
-                arw.append(rework_count(acts))
-            enough = len(vlen) >= 2 and len(alen) >= 2
+            a = _cell_stats(idx.get(f"{arm}-{task}"))
+            enough = len(v["_lens"]) >= 2 and len(a["_lens"]) >= 2
             mv = (milestones.get(task, {}) or {}).get("vanilla")
             mc = (milestones.get(task, {}) or {}).get(arm)
-            row["arms"][arm] = {
-                "n": len(runs), "solve": sum(r == "1" for _, r in runs),
-                "length": band(alen), "rework": band(arw),
-                "length_ok": overlaps(band(vlen), band(alen)) if enough else None,
-                "rework_ok": overlaps(band(vrw), band(arw)) if enough else None,
-                "milestone": mc, "milestone_ok": (overlaps(mv, mc) if (mv and mc) else None),
-                "incr": incr.get((task, arm)),
-            }
+            a.update(
+                length_ok=overlaps(v["length"], a["length"]) if enough else None,
+                rework_ok=overlaps(v["rework"], a["rework"]) if enough else None,
+                milestone=mc, milestone_ok=(overlaps(mv, mc) if (mv and mc) else None),
+                incr=incr.get((task, arm)),
+            )
+            row["arms"][arm] = a
         rows.append(row)
     return {"arms": arms, "rows": rows, "has_milestone": bool(milestones), "has_incr": bool(incr)}
 
 
-def _load_incremental(dirpath, arms):
-    """Read generate --mode incremental jsonl -> per (task,arm) comp% / costΔ / fidelity vs control."""
-    if not os.path.isdir(dirpath):
-        return {}
+def _load_incremental(root, arms):
+    """generate --mode incremental jsonl -> per (task,arm) comp% / costΔ / fidelity VS CONTROL.
+
+    Everything is computed on the common step set (both arms answered, step > 0 — the
+    cold-cache first step is excluded consistently for tokens, cost AND fidelity), and
+    the arm's action-fidelity is reported next to control's: control replay is the noise
+    floor (sampling + reconstruction error); only the gap below it is signal.
+    """
     def rows(p):
         d = {}
         if not os.path.exists(p):
@@ -207,25 +234,32 @@ def _load_incremental(dirpath, arms):
             if "step" in r and "usage" in r:
                 d[r["step"]] = r
         return d
+
     def ctx(u):
-        return u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get(
-            "cache_creation_input_tokens", 0)
+        return (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                + u.get("cache_creation_input_tokens", 0))
+
     out = {}
-    for cf in glob.glob(f"{dirpath}/*-control.jsonl"):
-        task = os.path.basename(cf)[:-len("-control.jsonl")]
+    for cf in sorted(glob.glob(f"{root}/**/incremental/*-control.jsonl", recursive=True)):
+        task = os.path.basename(cf)[: -len("-control.jsonl")]
         C = rows(cf)
         for arm in arms:
-            A = rows(f"{dirpath}/{task}-{arm}.jsonl")
+            A = rows(os.path.join(os.path.dirname(cf), f"{task}-{arm}.jsonl"))
             if not A or not C:
                 continue
-            common = sorted(s for s in (set(A) & set(C)) if s > 0)  # exclude step 0 (cold cache)
+            common = sorted(s for s in (set(A) & set(C)) if s > 0)
+            if not common:
+                continue
             cc = sum(ctx(C[s]["usage"]) for s in common) or 1
             ac = sum(ctx(A[s]["usage"]) for s in common)
             oc = sum(C[s].get("cost_usd", 0) for s in common) or 1e-9
             zc = sum(A[s].get("cost_usd", 0) for s in common)
-            rfid = sum(bool(A[s].get("agree_action")) for s in A) / len(A) if A else None
-            out[(task, arm)] = {"comp": round(1 - ac / cc, 4), "costd": round(1 - zc / oc, 4),
-                                "rfid": rfid, "steps": len(A)}
+            out[(task, arm)] = {
+                "comp": round(1 - ac / cc, 4), "costd": round(1 - zc / oc, 4),
+                "fid": sum(bool(A[s].get("agree_action")) for s in common) / len(common),
+                "fid_ctrl": sum(bool(C[s].get("agree_action")) for s in common) / len(common),
+                "steps": len(common),
+            }
     return out
 
 
@@ -235,74 +269,88 @@ def _b(x):
 
 
 def _v(ok):
-    return "OK" if ok else ("DIVERGES" if ok is False else "—")
+    return "✓ OK" if ok else ("✗ DIVERGES" if ok is False else "—")
 
 
 def _pct(x):
     return "—" if x is None else f"{x * 100:+.0f}%"
 
 
-def render_md(d):
-    o = ["# Trajectory preservation\n",
-         "vanilla = the noise floor; a method is **✓** if its distribution overlaps vanilla's, "
-         "**✗** if disjoint (needs ≥2 runs/arm). No model was called to produce this.\n"]
-    for arm in d["arms"]:
-        o.append(f"\n## `{arm}` vs vanilla\n")
-        cols = ["task", "solve v·arm", "length (v)", "length (arm)", "len", "rework"]
-        if d["has_milestone"]:
-            cols.append("milestone")
-        if d["has_incr"]:
-            cols += ["comp", "$Δ"]
-        o.append("| " + " | ".join(cols) + " |")
-        o.append("|" + "---|" * len(cols))
-        for r in d["rows"]:
+def _solve(c):
+    s = f"{c['solve']}/{c['attempted']}"
+    return s + (f" (⚠{c['lost']} lost)" if c["lost"] else "")
+
+
+def table(d):
+    """One (header, rows) build shared by console, md and html renderers.
+
+    Each row is [(cell_text, ok_flag_or_None), ...]; ok drives ✓/✗ colouring in html.
+    """
+    head = ["task", "arm", "solve v·arm", "length (v)", "length (arm)", "len", "rework"]
+    if d["has_milestone"]:
+        head.append("milestone")
+    if d["has_incr"]:
+        head += ["fid (arm·ctrl)", "comp", "$Δ"]
+    rows = []
+    for r in d["rows"]:
+        for arm in d["arms"]:
             a = r["arms"][arm]
-            cells = [r["task"], f"{r['vanilla']['solve']}/{r['vanilla']['n']} · {a['solve']}/{a['n']}",
-                     _b(r["vanilla"]["length"]), _b(a["length"]), _v(a["length_ok"]), _v(a["rework_ok"])]
+            cells = [(r["task"], None), (arm, None),
+                     (f"{_solve(r['vanilla'])} · {_solve(a)}", None),
+                     (_b(r["vanilla"]["length"]), None), (_b(a["length"]), None),
+                     (_v(a["length_ok"]), a["length_ok"]),
+                     (_v(a["rework_ok"]), a["rework_ok"])]
             if d["has_milestone"]:
-                cells.append(_v(a["milestone_ok"]))
+                cells.append((_v(a["milestone_ok"]), a["milestone_ok"]))
             if d["has_incr"]:
                 inc = a.get("incr") or {}
-                cells += [_pct(inc.get("comp")), _pct(inc.get("costd"))]
-            o.append("| " + " | ".join(cells) + " |")
+                fid = ("—" if inc.get("fid") is None
+                       else f"{inc['fid']:.0%} · {inc['fid_ctrl']:.0%}")
+                cells += [(fid, None), (_pct(inc.get("comp")), None),
+                          (_pct(inc.get("costd")), None)]
+            rows.append(cells)
+    return head, rows
+
+
+SUB = ("vanilla = the noise floor; ✓ = the arm's band overlaps vanilla's, ✗ = disjoint "
+       "(needs ≥2 finished runs/arm; ⚠ lost = attempted trials that never finished — counted "
+       "as unsolved). fid = per-step action agreement, read against the control column, "
+       "not against 100%. No model was called to produce this.")
+
+
+def render_md(d):
+    head, rows = table(d)
+    o = ["# Trajectory preservation\n", SUB + "\n",
+         "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    o += ["| " + " | ".join(c for c, _ in row) + " |" for row in rows]
     return "\n".join(o) + "\n"
 
 
 def render_html(d):
     import html as H
-    head = ["task", "arm", "solve v·arm", "length (v)", "length (arm)", "len", "rework"]
-    if d["has_milestone"]:
-        head.append("milestone")
-    if d["has_incr"]:
-        head += ["comp", "$Δ"]
-    trs = []
-    for r in d["rows"]:
-        for arm in d["arms"]:
-            a = r["arms"][arm]
-            cls = lambda ok: "ok" if ok else ("bad" if ok is False else "")  # noqa: E731
-            tds = [H.escape(r["task"]), arm,
-                   f"{r['vanilla']['solve']}/{r['vanilla']['n']} · {a['solve']}/{a['n']}",
-                   _b(r["vanilla"]["length"]), _b(a["length"]),
-                   f"<span class='{cls(a['length_ok'])}'>{_v(a['length_ok'])}</span>",
-                   f"<span class='{cls(a['rework_ok'])}'>{_v(a['rework_ok'])}</span>"]
-            if d["has_milestone"]:
-                tds.append(f"<span class='{cls(a['milestone_ok'])}'>{_v(a['milestone_ok'])}</span>")
-            if d["has_incr"]:
-                inc = a.get("incr") or {}
-                tds += [_pct(inc.get("comp")), _pct(inc.get("costd"))]
-            trs.append("<tr>" + "".join(f"<td>{c}</td>" for c in tds) + "</tr>")
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Trajectory preservation</title>
-<style>body{{font:13px/1.5 -apple-system,Segoe UI,sans-serif;margin:24px;background:#0f1117;color:#d8dce6}}
-h1{{font-size:19px}}.sub{{color:#8b93a3;margin-bottom:14px;max-width:900px}}
-table{{border-collapse:collapse}} th,td{{border:1px solid #232838;padding:6px 10px;text-align:center;font-size:12px}}
-th{{background:#161a22;color:#9aa4b5}} .ok{{color:#3fb950;font-weight:700}}.bad{{color:#e5534b;font-weight:700}}</style>
-</head><body><h1>Trajectory preservation</h1>
-<div class="sub">vanilla = noise floor · ✓ overlaps vanilla · ✗ disjoint (≥2 runs/arm). Display only — no model called.</div>
-<table><tr>{''.join(f'<th>{h}</th>' for h in head)}</tr>{''.join(trs)}</table></body></html>"""
+    head, rows = table(d)
+    cls = {True: "ok", False: "bad", None: ""}
+    trs = ["<tr>" + "".join(
+        f"<td><span class='{cls[ok]}'>{H.escape(c)}</span></td>" if ok is not None
+        else f"<td>{H.escape(c)}</td>" for c, ok in row) + "</tr>" for row in rows]
+    style = ("body{font:13px/1.5 -apple-system,Segoe UI,sans-serif;margin:24px;"
+             "background:#0f1117;color:#d8dce6} h1{font-size:19px}"
+             ".sub{color:#8b93a3;margin-bottom:14px;max-width:900px}"
+             "table{border-collapse:collapse} th,td{border:1px solid #232838;"
+             "padding:6px 10px;text-align:center;font-size:12px}"
+             "th{background:#161a22;color:#9aa4b5} .ok{color:#3fb950;font-weight:700}"
+             ".bad{color:#e5534b;font-weight:700}")
+    ths = "".join(f"<th>{H.escape(h)}</th>" for h in head)
+    return ("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+            "<title>Trajectory preservation</title>"
+            f"<style>{style}</style></head><body><h1>Trajectory preservation</h1>"
+            f"<div class=\"sub\">{H.escape(SUB)}</div>"
+            f"<table><tr>{ths}</tr>{''.join(trs)}</table></body></html>")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="display the quality bench (reads generate.py's artifacts)")
+    ap = argparse.ArgumentParser(
+        description="display the quality bench (reads generate.py's artifacts)")
     ap.add_argument("--from", default="results/jobs", help="results root produced by generate.py")
     ap.add_argument("--tasks", required=True)
     ap.add_argument("--arms", default="condense,headroom")
@@ -311,11 +359,12 @@ def main():
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     d = build(args)
-    for r in d["rows"]:
-        for arm in d["arms"]:
-            a = r["arms"][arm]
-            print(f"{r['task']:22} {arm:9} len v={_b(r['vanilla']['length'])} "
-                  f"arm={_b(a['length'])} {_v(a['length_ok'])}")
+    head, rows = table(d)
+    widths = [max(len(h), *(len(r[i][0]) for r in rows)) if rows else len(h)
+              for i, h in enumerate(head)]
+    print("  ".join(h.ljust(w) for h, w in zip(head, widths, strict=False)))
+    for row in rows:
+        print("  ".join(c.ljust(w) for (c, _), w in zip(row, widths, strict=False)))
     out = args.out or f"report.{args.format}"
     open(out, "w").write(render_md(d) if args.format == "md" else render_html(d))
     print(f"wrote {out}")
