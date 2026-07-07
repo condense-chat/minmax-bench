@@ -237,7 +237,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     for arm in all_arms:
         path = out_dir / f"{arm}.jsonl"
         spent, n_ok, n_action, n_exact, ctx_total = 0.0, 0, 0, 0, 0
-        ctx_series = []
+        n_err, first_err, ctx_series = 0, None, []
         with path.open("w") as f, Progress(
             TextColumn(f"[cyan]{arm:9}[/]"), BarColumn(),
             TextColumn("{task.completed}/{task.total} [dim]{task.fields[stat]}[/]"),
@@ -254,6 +254,8 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                 rec = {"arm": arm, "step": step, "msg_index": i, "orig": orig}
                 if err:
                     rec["error"] = err
+                    n_err += 1
+                    first_err = first_err or err
                 else:
                     rep = eng.extract_action(resp.get("content", []))
                     exact, action, sim = eng.score(orig, rep)
@@ -276,6 +278,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                             stat=f"agree {n_action}/{n_ok or 1} ${spent:.2f}")
         summary["arms"][arm] = {
             "steps_ok": n_ok, "agree_action": n_action, "agree_exact": n_exact,
+            "errors": n_err, "first_error": (first_err or "")[:300],
             "avg_ctx_tokens": (ctx_total // n_ok) if n_ok else 0,
             "ctx_series": ctx_series,
             "cost_usd": round(spent, 4), "file": str(path),
@@ -304,13 +307,13 @@ def render_summary(summary: dict, console: Console) -> None:
     floor = ca / cn if cn else None
     t = Table(title=f"[bold]counterfactual — {Path(summary['session']).name} "
                     f"({summary['model']}, {summary['steps']} decision points)")
-    for col in ("arm", "steps", "same action", "exact", "avg ctx tokens",
+    for col in ("arm", "steps", "errors", "same action", "exact", "avg ctx tokens",
                 "ctx vs control", "cost", "$ vs control"):
         t.add_column(col, justify="right" if col != "arm" else "left")
     rec = summary.get("recorded")
     if rec:
         t.add_row("[dim]recorded*[/]", f"[dim]{rec['steps']}[/]", "[dim]—[/]", "[dim]—[/]",
-                  f"[dim]{rec['avg_ctx_tokens']:,}[/]", "[dim]—[/]",
+                  "[dim]—[/]", f"[dim]{rec['avg_ctx_tokens']:,}[/]", "[dim]—[/]",
                   f"[dim]${rec['cost_usd']:.2f}[/]", "[dim]—[/]")
     for arm, a in summary["arms"].items():
         n = a["steps_ok"]
@@ -319,8 +322,9 @@ def render_summary(summary: dict, console: Console) -> None:
                 if arm != "control" and ctrl.get("avg_ctx_tokens") else None)
         costd = (1 - a["cost_usd"] / ctrl["cost_usd"]
                  if arm != "control" and ctrl.get("cost_usd") else None)
+        errs = a.get("errors", 0)
         t.add_row(
-            arm, str(n),
+            arm, str(n), f"[red]{errs}[/]" if errs else "0",
             f"{agree:.0%}" if agree is not None else "—",
             f"{a['agree_exact'] / n:.0%}" if n else "—",
             f"{a['avg_ctx_tokens']:,}",
@@ -331,7 +335,13 @@ def render_summary(summary: dict, console: Console) -> None:
     console.print(t)
     ctrl_series = ctrl.get("ctx_series") or []
     for arm, a in summary["arms"].items():
-        if arm == "control" or not ctrl_series:
+        if arm == "control":
+            continue
+        if not a.get("steps_ok"):
+            console.print(f"[red]{arm} FAILED every step ({a.get('errors', 0)} errors)[/] — "
+                          f"no verdict is possible. First error: {a.get('first_error', '?')}")
+            continue
+        if not ctrl_series:
             continue
         series = a.get("ctx_series") or []
         pairs = list(zip(series, ctrl_series, strict=False))
