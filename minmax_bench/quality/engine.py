@@ -27,6 +27,7 @@ import copy
 import difflib
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -248,7 +249,33 @@ def norm_ws(s):
     return " ".join(str(s).split())
 
 
-def score(orig, replay):
+_CD_PREFIX = re.compile(r"(?:^|(?<=&&)|(?<=;))\s*cd\s+\S+\s*&&\s*")
+_SEG_SPLIT = re.compile(r"&&|\|\||;|\n|\|")
+
+
+def _norm_cmd(cmd, cwd="/app"):
+    """Strip replay cwd artifacts: `cd <dir> && ` prefixes and absolute-cwd paths.
+
+    A replayed model that is unsure of its cwd defensively writes `cd /app && python x`
+    or `-I/app` where the original wrote `python x` / `-I.` — same action, different
+    phrasing. Normalizing both sides keeps the comparison about the decision.
+    """
+    c = _CD_PREFIX.sub("", str(cmd))
+    c = c.replace(cwd.rstrip("/") + "/", "").replace(cwd.rstrip("/"), ".")
+    return norm_ws(c)
+
+
+def _programs(cmd):
+    """The sequence of programs a shell command invokes (first token per segment)."""
+    progs = []
+    for seg in _SEG_SPLIT.split(cmd):
+        toks = [t for t in seg.split() if "=" not in t]  # skip leading VAR=… assignments
+        if toks and not toks[0].startswith("#"):
+            progs.append(toks[0])
+    return progs
+
+
+def score(orig, replay, cwd="/app"):
     """-> (agree_exact, agree_action, sim). agree_action = same tool + same target."""
     if orig["type"] != replay["type"]:
         return False, False, 0.0
@@ -265,7 +292,11 @@ def score(orig, replay):
     exact = na == nb
     sim = 1.0 if exact else difflib.SequenceMatcher(None, na, nb).ratio()
     if orig["name"] == "Bash":
-        action = norm_ws(a.get("command", "")) == norm_ws(b.get("command", ""))
+        ca, cb = _norm_cmd(a.get("command", ""), cwd), _norm_cmd(b.get("command", ""), cwd)
+        # same action = same command modulo cwd artifacts, or the same program
+        # sequence with near-identical text (path spelling, ls target, flag order)
+        action = ca == cb or (_programs(ca) == _programs(cb)
+                              and difflib.SequenceMatcher(None, ca, cb).ratio() > 0.7)
     elif "file_path" in a or "file_path" in b:
         action = a.get("file_path") == b.get("file_path")
     else:

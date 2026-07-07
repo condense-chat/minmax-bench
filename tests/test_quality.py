@@ -185,3 +185,23 @@ def test_recorded_usage_reads_real_session():
         return
     usages = recorded_usage(__import__("pathlib").Path(sessions[0]))
     assert usages and all("output_tokens" in u or "input_tokens" in u for u in usages)
+
+
+def test_score_bash_cwd_artifacts_are_same_action():
+    # real pair from a replay: cd-prefix + absolute-path spelling, same decision
+    a = tool("Bash", command="python server.py &\nsleep 2\nps aux | grep server.py")
+    b = tool("Bash", command="cd /app && python server.py &\nsleep 2\nps aux | grep server.py")
+    exact, action, _ = eng.score(a, b)
+    assert action and not exact
+    c = tool("Bash", command="python -m grpc_tools.protoc -I. --python_out=. kv.proto && ls *pb2*")
+    d = tool("Bash", command="python -m grpc_tools.protoc -I/app --python_out=/app "
+                             "/app/kv.proto && ls /app/")
+    _, action, _ = eng.score(c, d)
+    assert action
+
+
+def test_score_bash_different_program_still_disagrees():
+    a = tool("Bash", command="python server.py")
+    b = tool("Bash", command="cat server.py")
+    _, action, _ = eng.score(a, b)
+    assert not action
