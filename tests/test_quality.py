@@ -152,7 +152,7 @@ def test_check_arms_catches_unknown_arm_and_missing_keys():
 # ---------------------------------------------------------------- offline demo end-to-end
 def test_bundled_sample_still_reports(tmp_path):
     root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "results", "sample")
+                        "runs", "quality-sample")
     if not os.path.isdir(root):
         return  # sample not present in this checkout
     args = SimpleNamespace(arms="condense", tasks="kv-store-grpc", agent="claude-code",

@@ -13,12 +13,10 @@ out/
 data/cache/
 .DS_Store
 
-# Quality bench: generated Harbor runs & reports (large; embed task transcripts).
-# The tiny results/sample/ demo is kept; committed runs/ (cost bench) is untouched.
-results/jobs/
-results/fidelity/
-results/*.jsonl
-results/sample/*.html
+# Quality bench: results/ is purely generated output (Harbor runs, replays, reports —
+# large; embed task transcripts). The committed offline demo lives in runs/quality-sample/
+# next to the cost bench's committed reference runs.
+results/
 .headroom/
 .playwright-mcp/
 scratchpad/

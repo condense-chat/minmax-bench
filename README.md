@@ -209,10 +209,10 @@ Arm names match the cost bench's strategy matrix (`headroom` = cache mode,
 Full tooling + reproduction: [`scripts/README.md`](scripts/README.md).
 
 **Offline demo — no keys, no Docker (~30 s)** — a tiny sample of real recorded runs ships in
-`results/sample/`:
+`runs/quality-sample/`:
 
 ```bash
-python3 scripts/report.py --from results/sample --tasks kv-store-grpc --arms condense
+python3 scripts/report.py --from runs/quality-sample --tasks kv-store-grpc --arms condense
 ```
 
 → `kv-store-grpc  condense  2/2 · 2/2  6[5-6]  12[11-14]  ✗ DIVERGES  ✓ OK` — on this task condense
@@ -284,7 +284,7 @@ minmax_bench/quality/   quality / trajectory-preservation bench (pure stdlib; se
   report.py        DISPLAY (pure, never spends): reads artifacts -> html/md
 scripts/           thin `python3 scripts/{generate,report}.py` wrappers around the above
 harbor_agents/     custom Harbor agent (self-contained headroom-CCR wiring)
-results/sample/    tiny bundled recorded runs for the offline quality demo
+runs/quality-sample/  tiny bundled recorded runs for the offline quality demo
 ```
 
 ## Status / caveats

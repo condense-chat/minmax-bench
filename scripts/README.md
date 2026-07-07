@@ -76,7 +76,7 @@ uv run minmax-bench counterfactual        # wraps this engine; see minmax_bench/
 
 ```bash
 # offline demo (bundled sample) — no keys, no Docker
-python3 scripts/report.py --from results/sample --tasks kv-store-grpc --arms condense
+python3 scripts/report.py --from runs/quality-sample --tasks kv-store-grpc --arms condense
 
 # generate then display (needs Docker + harbor + .env keys)
 cp .env.dist .env      # ANTHROPIC_API_KEY, CONDENSE_API_KEY
