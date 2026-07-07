@@ -200,7 +200,7 @@ k=1 mirage where length and cost swing wildly). Full tooling + reproduction: [`s
 `results/sample/`:
 
 ```bash
-python3 scripts/report.py --mode full --tasks kv-store-grpc --root results/sample
+python3 scripts/report.py --from results/sample --tasks kv-store-grpc --arms condense
 ```
 
 → `kv-store-grpc   length  vanilla 5[5-6]   condense 12[11-14]   ✗ DIVERGES` — on this task condense
@@ -209,8 +209,11 @@ python3 scripts/report.py --mode full --tasks kv-store-grpc --root results/sampl
 **Generate your own** (Docker + `uv tool install harbor` + `.env` keys):
 
 ```bash
-OUT=results/jobs/run1 bash scripts/run_cc_matrix.sh "kv-store-grpc,fix-code-vulnerability" 3 vanilla,condense
-python3 scripts/report.py --mode full --tasks "kv-store-grpc,fix-code-vulnerability" --root results/jobs --milestones
+# generate (spends: runs the agent), then report (pure display)
+python3 scripts/generate.py --mode full --tasks "kv-store-grpc,fix-code-vulnerability" \
+  --arms condense,headroom --out results/jobs/run1 --milestones
+python3 scripts/report.py --from results/jobs/run1 --tasks "kv-store-grpc,fix-code-vulnerability" \
+  --arms condense,headroom
 ```
 
 The quality bench is **pure standard library** — nothing to install to *analyze* runs; Docker + Harbor
@@ -247,10 +250,9 @@ minmax_bench/
 runs/              committed reference runs (replayable, no spend)
 
 scripts/           quality / trajectory-preservation bench (see scripts/README.md)
-  report.py               the one report command: --mode full|replay, --arms, --format  ← main entry
-  fidelity_replay.py      shared session I/O + teacher-forced replay engine (report.py imports it)
-  run_cc_matrix.sh        drive Harbor to generate runs per arm (vanilla/condense/headroom/ccr)
-  capture_cc_template.py  (utility) re-capture the request template for replay
+  generate.py             GENERATE data (spends): --mode full|incremental, --arms, --agent
+  incremental_engine.py   teacher-forced replay engine that generate.py imports
+  report.py               DISPLAY (pure, never spends): reads artifacts -> html/md
 harbor_agents/     custom Harbor agent (self-contained headroom-CCR wiring)
 results/sample/    tiny bundled recorded runs for the offline quality demo
 ```

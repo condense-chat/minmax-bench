@@ -1,52 +1,61 @@
 # Quality / trajectory-preservation bench
 
-One command — [`report.py`](report.py) — for the
-[trajectory-preservation bench](../README.md#quality--trajectory-preservation-bench): does a
-context-reduction method **preserve the agent's trajectory**, or change what it does?
-
-**Pure standard library.** Analyzing recorded runs needs no pip install. Harbor + Docker are only
-needed to *generate* new runs (`run_cc_matrix.sh`).
-
-## `report.py` — the one report command
+Does a context-reduction method **preserve the agent's trajectory**, or change what it does?
+Two clearly separated phases — the same split the cost bench uses (`run` → store → `report`):
 
 ```
-report.py --mode {full,replay}      # full = preservation vs vanilla floor; replay = teacher-forced per-step
-          --arms condense[,headroom] # which methods to test against the floor
-          --agent {cc,codex}         # session format (default cc; codex = replay only for now)
-          --format {html,md}         # default html
-          --tasks t1,t2,...          # full mode
-          --out report.html          # default
+generate.py  ──▶  results/<out>/**            report.py  ──▶  report.html | report.md
+ (SPENDS: run agents / replay)   (artifacts)   (PURE DISPLAY: reads artifacts, never spends)
 ```
 
-- **`--mode full`** (offline, free): pools vanilla/method runs from `--root`, builds per-task
-  distributions for **length / rework / milestone / solve**, and renders a per-axis
-  **✓ overlap / ✗ disjoint** verdict (a verdict needs ≥2 runs/arm; `--milestones` adds the
-  LLM-judged subgoal axis, which calls the model). All the trajectory/rework/milestone logic is
-  folded into `report.py`.
-- **`--mode replay`** (online, costs money): teacher-forced replay of one `--session` through
-  control + each arm — per-step action agreement + cache-aware compaction, paired (no turn-count
-  noise). Uses the `fidelity_replay.py` engine.
+**`report.py` never calls a model.** Everything that spends lives in `generate.py`.
+
+## `generate.py` — produce data (spends)
+
+```
+generate.py --mode {full,incremental}     # full = end-to-end trajectory; incremental = teacher-forced per-step
+            --agent claude-code            # default; codex / opencode = TODO (errors, doesn't fake it)
+            --arms condense,headroom       # both (vanilla baseline always included)
+            --tasks a,b,c  --out results/jobs/run
+```
+
+- **`--mode full`** — runs the agent end-to-end through [Harbor](https://github.com/laude-institute/terminal-bench)
+  (Docker) for `vanilla` + each arm, `--k` repeats → `results/<out>/<arm>-<task>/**`. Needs Docker +
+  `uv tool install harbor` + `.env` keys. `--dry-run` prints the Harbor commands without running.
+- **`--mode incremental`** — teacher-forces one `--session` step-by-step through control + each arm →
+  `results/<out>/incremental/<task>-<arm>.jsonl` (paired, cache-aware, no turn-count noise). Uses
+  `incremental_engine.py`.
+- **`--milestones`** (full) — runs an LLM judge over the runs → `results/<out>/milestones.json`.
+
+## `report.py` — display (pure, offline, free)
+
+```
+report.py --from results/jobs/run --tasks a,b,c --arms condense,headroom --format {html,md}
+```
+
+Reads whatever `generate.py` wrote — full run dirs (**length / rework / solve**, each vs the vanilla
+noise floor: **✓ overlap / ✗ disjoint**, ≥2 runs/arm) plus `milestones.json` and `incremental/*.jsonl`
+if present — and renders. Deterministic, no network.
 
 ## Files
 
-| file | role |
-|---|---|
-| **`report.py`** | the one command (full + replay modes, both formats) |
-| `fidelity_replay.py` | shared session I/O + the teacher-forced replay engine `report.py` imports |
-| `run_cc_matrix.sh` | drive Harbor to **generate** runs per arm (`vanilla`, `condense`, `headroom`, `headroom-ccr`) |
-| `capture_cc_template.py` | (utility) re-capture the version-matched request template for replay; a sanitized one ships in `data/cc_request_template.json` |
-| `../harbor_agents/headroom_ccr_claude_code.py` | self-contained CCR wiring for the `headroom-ccr` arm (no user/global config mutation) |
+| file | side | role |
+|---|---|---|
+| `generate.py` | generate | the one generation command (full + incremental + milestone judge) |
+| `incremental_engine.py` | generate | session I/O + teacher-forced replay engine `generate` imports |
+| `report.py` | display | reads artifacts → html/md; never spends |
+| `../harbor_agents/headroom_ccr_claude_code.py` | generate | self-contained CCR wiring for the `headroom-ccr` arm |
 
-## Reproduce
+## End to end
 
 ```bash
-# offline preservation report — no keys, no Docker
-python3 scripts/report.py --mode full --tasks kv-store-grpc --root results/sample
+# offline demo (bundled sample) — no keys, no Docker
+python3 scripts/report.py --from results/sample --tasks kv-store-grpc --arms condense
 
-# generate your own, then report (needs Docker + `uv tool install harbor` + .env keys)
+# generate then display (needs Docker + harbor + .env keys)
 cp .env.dist .env      # ANTHROPIC_API_KEY, CONDENSE_API_KEY
-TASKS="kv-store-grpc,fix-code-vulnerability"
-OUT=results/jobs/run1 WALL_TIMEOUT=2400 AGENT_TIMEOUT_MULT=3 \
-  bash scripts/run_cc_matrix.sh "$TASKS" 3 vanilla,condense
-python3 scripts/report.py --mode full --tasks "$TASKS" --root results/jobs --milestones
+python3 scripts/generate.py --mode full --tasks kv-store-grpc,fix-code-vulnerability \
+  --arms condense,headroom --out results/jobs/run1 --milestones
+python3 scripts/report.py --from results/jobs/run1 --tasks kv-store-grpc,fix-code-vulnerability \
+  --arms condense,headroom
 ```
