@@ -60,6 +60,9 @@ def rates_for(model):
         return PRICES[DEFAULT_PRICE_MODEL]
     return PRICES[best]
 
+# NOTE: teacher-forced replay executes no tools, so headroom's CCR retrieve loop cannot
+# engage here — the 'headroom' arm below measures the proxy only (cache or token mode,
+# per the driver's --headroom-mode). CCR is only measurable in generate.py --mode full.
 ARMS = {
     "control": {"base": "https://api.anthropic.com"},
     "condense": {"base": "https://api.condense.chat/anthropic", "condense_auth": True},

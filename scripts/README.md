@@ -15,8 +15,11 @@ generate.py  ──▶  results/<out>/**            report.py  ──▶  report
 ```
 generate.py --mode {full,incremental}     # full = end-to-end trajectory; incremental = teacher-forced per-step
             --agent claude-code            # default; codex / opencode = TODO (errors, doesn't fake it)
-            --arms condense,headroom       # vanilla baseline always included; headroom = cache mode,
-                                           # headroom-kompress = token mode (cost-bench names)
+            --arms condense,headroom       # vanilla baseline always included (cost-bench names):
+                                           #   headroom          = cache-mode proxy
+                                           #   headroom-ccr      = token mode + retrieve loop (full
+                                           #                       CCR — headroom's intended config)
+                                           #   headroom-kompress = token mode, no retrieval (ablation)
             --tasks a,b,c  --out results/jobs/run
 ```
 
@@ -30,7 +33,9 @@ generate.py --mode {full,incremental}     # full = end-to-end trajectory; increm
   step-by-step through control + each arm, arms in parallel →
   `results/<out>/incremental/<task>-<arm>.jsonl` (paired, cache-aware, no turn-count noise).
   `--task` is required and must match the name you pass `report.py --tasks`. Starts the headroom
-  proxy if needed (`--headroom-mode cache|token`).
+  proxy if needed (`--headroom-mode cache|token`). Teacher-forced replay executes no tools, so
+  CCR's retrieve loop can't engage here — token-mode headroom quality belongs to `--mode full`
+  with the `headroom-ccr` arm.
 - **`--milestones`** (full) — runs an LLM judge (temperature 0, arm-blind) over the runs →
   `results/<out>/milestones.json`. Milestones are grounded in a solved vanilla run, which is then
   excluded from vanilla's own coverage scoring.

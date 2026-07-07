@@ -10,9 +10,12 @@ Two ways to generate:
 Shared:
   --agent claude-code   default; codex / opencode = TODO (not implemented yet)
   --arms condense,headroom   the methods to run (vanilla baseline is always included).
-                             headroom = cache mode; headroom-kompress = token mode — the same
-                             names and modes as the cost bench's strategy matrix, so results
-                             from the two benches can be joined by arm name.
+                             headroom       = cache-mode proxy (cost bench's 'headroom')
+                             headroom-ccr   = token-mode proxy + the mcp retrieve loop — the
+                                              full Compress-Cache-Retrieve product, headroom's
+                                              intended token-mode deployment
+                             headroom-kompress = token mode WITHOUT retrieval (ablation only;
+                                              matches the cost-bench strategy of that name)
 Optional (full): --milestones runs an LLM judge over the runs → results/<out>/milestones.json.
 
 Nothing here is read by report.py except the files it writes. Keep generation and display separate.
@@ -38,7 +41,10 @@ HRPORT = int(os.environ.get("HRPORT", "8787"))
 UTC = timezone.utc  # noqa: UP017  (scripts run on system python3, may be 3.10)
 
 # arm -> headroom proxy mode. 'headroom' MUST stay cache mode: it is the cost bench's
-# 'headroom' strategy (matrix.py); token mode is the separate 'headroom-kompress' strategy.
+# 'headroom' strategy (matrix.py). For token mode, headroom's intended deployment is CCR
+# (Compress-Cache-Retrieve): proxy compression PLUS the mcp retrieve loop -> 'headroom-ccr'
+# is the canonical token-mode arm. 'headroom-kompress' (compression with NO retrieval,
+# the cost bench's strategy of that name) is kept as an ABLATION, not a headline arm.
 HEADROOM_MODES = {"headroom": "cache", "headroom-kompress": "token", "headroom-ccr": "token"}
 
 
@@ -121,6 +127,10 @@ def full(args, env):
                     cmd += ["--agent-timeout-multiplier", str(args.agent_timeout_mult)]
                 renv = {**os.environ, "ANTHROPIC_BASE_URL": base,
                         "PYTHONPATH": os.getcwd() + os.pathsep + os.environ.get("PYTHONPATH", "")}
+                if arm == "headroom-kompress":
+                    print("[note] headroom-kompress = token-mode compression WITHOUT the CCR "
+                          "retrieve loop (ablation); headroom's intended token-mode config "
+                          "is the headroom-ccr arm")
                 print(f"### {arm} / {task} (k={args.k}, base={base}) ###")
                 if args.dry_run:
                     print("   " + " ".join(cmd))

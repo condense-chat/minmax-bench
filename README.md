@@ -204,8 +204,12 @@ A verdict is **✓** if the method's band *overlaps* vanilla's, **✗** if disjo
 **≥ 2 finished runs per arm** (a single run can't be told from a fluke; this kills the k=1 mirage
 where length and cost swing wildly). Read ✓ honestly: with k≈3, band overlap only detects *gross*
 divergence — it means "no detectable divergence at this k", not statistical equivalence.
-Arm names match the cost bench's strategy matrix (`headroom` = cache mode,
-`headroom-kompress` = token mode) so quality verdicts and cost numbers join by name.
+Arm names match the cost bench's strategy matrix so quality verdicts and cost numbers join
+by name: `headroom` = cache-mode proxy; **`headroom-ccr`** = token-mode proxy *plus* the MCP
+retrieve loop — the full Compress-Cache-Retrieve product, which is headroom's intended
+token-mode deployment and therefore the fair token-mode arm; `headroom-kompress` = token-mode
+compression *without* retrieval, kept only as an ablation (it matches the cost-bench strategy
+of the same name, but judging headroom's quality by it would be a strawman).
 Full tooling + reproduction: [`scripts/README.md`](scripts/README.md).
 
 **Offline demo — no keys, no Docker (~30 s)** — a tiny sample of real recorded runs ships in
