@@ -183,18 +183,30 @@ bench tests it by running the **full agent** (not a replay) under each method on
 **vanilla-vs-vanilla noise floor**. The bar is not "identical to control" (two vanilla runs already
 differ) — it's **"within the vanilla-vs-vanilla spread."**
 
+The two modes test **two different claims** and are deliberately complementary:
+**full** runs catch *behavioral* changes (turn-count inflation, induced planning, solve rate) but
+can't attribute them; **incremental** (teacher-forced) runs catch *informational* loss (does
+compressing this exact history change the next decision?) but are structurally blind to behavioral
+effects on short sessions where threshold-gated compaction never fires. A method can pass one and
+fail the other — both outcomes are informative.
+
 Per task, vanilla `k≈3` sets the floor; each method's runs are tested against it, axis by axis:
 
 | axis | question |
 |---|---|
 | **length** | does compaction change the # of steps? *(the load-bearing axis)* |
-| **rework** | does it re-fetch info it already had? *(compaction amnesia; range-aware)* |
-| **milestone** | does it accomplish the same subgoals? *(approach-agnostic, LLM-judged)* |
-| **solve** | does it still pass the verifier? |
+| **rework** | does it re-fetch info it already had? *(compaction amnesia; range-aware — post-edit re-inspection counts as verification, not rework)* |
+| **milestone** | does it accomplish the same subgoals? *(approach-agnostic, LLM-judged, arm-blind; the reference run is excluded from vanilla's own coverage)* |
+| **solve** | does it still pass the verifier? *(trials that crash or hit the wall timeout count as failures — `⚠ lost` in the table — not as missing data)* |
+| **fid** | teacher-forced per-step action agreement, shown next to the **control replay's** agreement (the noise floor) — only the gap below the floor is signal |
 
-A verdict is **✓** if the method's distribution *overlaps* vanilla's (indistinguishable), **✗** if
-disjoint — and needs **≥ 2 runs per arm** (a single run can't be told from a fluke; this kills the
-k=1 mirage where length and cost swing wildly). Full tooling + reproduction: [`scripts/README.md`](scripts/README.md).
+A verdict is **✓** if the method's band *overlaps* vanilla's, **✗** if disjoint — and needs
+**≥ 2 finished runs per arm** (a single run can't be told from a fluke; this kills the k=1 mirage
+where length and cost swing wildly). Read ✓ honestly: with k≈3, band overlap only detects *gross*
+divergence — it means "no detectable divergence at this k", not statistical equivalence.
+Arm names match the cost bench's strategy matrix (`headroom` = cache mode,
+`headroom-kompress` = token mode) so quality verdicts and cost numbers join by name.
+Full tooling + reproduction: [`scripts/README.md`](scripts/README.md).
 
 **Offline demo — no keys, no Docker (~30 s)** — a tiny sample of real recorded runs ships in
 `results/sample/`:
@@ -203,7 +215,7 @@ k=1 mirage where length and cost swing wildly). Full tooling + reproduction: [`s
 python3 scripts/report.py --from results/sample --tasks kv-store-grpc --arms condense
 ```
 
-→ `kv-store-grpc   length  vanilla 5[5-6]   condense 12[11-14]   ✗ DIVERGES` — on this task condense
+→ `kv-store-grpc  condense  2/2 · 2/2  6[5-6]  12[11-14]  ✗ DIVERGES  ✓ OK` — on this task condense
 ~doubles the trajectory (both still solve). That's the whole point, visible from a fresh clone.
 
 **Generate your own** (Docker + `uv tool install harbor` + `.env` keys):
@@ -219,13 +231,30 @@ python3 scripts/report.py --from results/jobs/run1 --tasks "kv-store-grpc,fix-co
 The quality bench is **pure standard library** — nothing to install to *analyze* runs; Docker + Harbor
 are only needed to *generate* them.
 
+### Counterfactual: replay *your own* Claude Code session
+
+How would one of your real sessions have played out under condense? Pick any session from
+`~/.claude/projects` and teacher-force it step-by-step through each arm, next to a control replay
+(the noise floor). No Docker, no Harbor — just API keys. It shows a cost estimate and asks before
+spending:
+
+```bash
+uv run minmax-bench counterfactual                       # interactive picker + confirm
+uv run minmax-bench counterfactual ~/.claude/projects/<proj>/<id>.jsonl --arms condense -n 30
+```
+
+Per arm you get: **same-action agreement** (did it still make the same next move? read it against
+the control floor, not against 100%), **avg context tokens** and **$ vs control**. Scriptable
+equivalent: `python3 scripts/generate.py --mode incremental --session <file> --task <name>`.
+Note the condense arm sends your session content to `api.condense.chat`.
+
 ### Quality findings (so far)
 
 Reported impartially, including results unfavorable to condense.
 
 - **Preservation mostly holds** — on 8/9 tasks with enough runs, condense's trajectory length is
-  statistically indistinguishable from vanilla, redundant re-work is zero, and the same subgoals are
-  reached. A per-turn cost claim is sound *where both arms solve reliably.*
+  within the vanilla-vs-vanilla spread (no detectable divergence at k≈3), redundant re-work is zero,
+  and the same subgoals are reached. A per-turn cost claim is sound *where both arms solve reliably.*
 - **One real exception — short tasks (`kv-store`):** condense consistently ~doubles the trajectory
   (5 → 12 steps) by **inducing todo-tool planning + verification** — behavioral, *not* amnesia. This
   *explains* that task's large full-run cost gap (which looked like noise at k=1).
