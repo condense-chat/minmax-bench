@@ -318,6 +318,7 @@ runs/quality-sample/  tiny bundled recorded runs for the offline quality demo
 
 - Offline token counts use `tiktoken` (an approximation for Claude); the proxy
   executor supplies exact provider numbers when you need them.
-- Trajectory / quality evaluation — proving the compressed sessions stay correct —
-  is future work, not in this repo yet. This benchmark answers "how much does it
-  save," not "does it still work."
+- The cost tables answer "how much does it save"; "does it still work" is the
+  [quality / trajectory-preservation bench](#quality--trajectory-preservation-bench)
+  above — read cost savings only where the quality bench confirms preservation
+  (and where the task actually cleared the compaction gate, ⊘).
