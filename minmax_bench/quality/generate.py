@@ -110,8 +110,24 @@ def _stop_proxy(p):
             log.close()
 
 
+def _agent_auth_env(env):
+    """Harbor --ae args so the container's Claude Code authenticates. Prefer an API
+    key if configured; otherwise forward the user's Claude Code SUBSCRIPTION token
+    (so a full run needs no API key — same default as the replay paths). Harbor
+    forwards ANTHROPIC_API_KEY from the host env on its own; the OAuth token must be
+    passed explicitly."""
+    if env.get("ANTHROPIC_API_KEY"):
+        return []
+    tok = eng.cc_oauth_token()
+    return ["--ae", f"CLAUDE_CODE_OAUTH_TOKEN={tok}"] if tok else []
+
+
 def _validate_full(args, env):
     arms = ["vanilla"] + [a for a in args.arms.split(",") if a]
+    if not eng.auth_mode(env) and not args.dry_run:
+        sys.exit("no Anthropic auth — set ANTHROPIC_API_KEY, or log in to Claude Code "
+                 "(run `claude setup-token` + `export CLAUDE_CODE_OAUTH_TOKEN=…`); the "
+                 "container's agent needs it to run.")
     if "condense" in arms and not env.get("CONDENSE_API_KEY") and not args.dry_run:
         sys.exit("CONDENSE_API_KEY missing — the condense arm would run with an EMPTY auth "
                  "token and silently produce garbage. Set it in .env or drop the arm.")
@@ -119,6 +135,12 @@ def _validate_full(args, env):
 
 
 def full(args, env):
+    # --auth subscription forces the Claude Code login even if an API key is
+    # configured — drop the key so both the auth check and the container agent use
+    # the subscription token. 'auto' (default) prefers a key if present.
+    if getattr(args, "auth", "auto") == "subscription":
+        env = {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"}
+        os.environ.pop("ANTHROPIC_API_KEY", None)  # so harbor doesn't forward it either
     arms = _validate_full(args, env)
     org = args.dataset.split("/", 1)[0]
     tasks = resolve_tasks(args.tasks, org, args.seed)
@@ -146,7 +168,7 @@ def full(args, env):
                        "-i", f"{org}/{task}", "-k", str(k),
                        "-n", str(args.concurrency),
                        "-o", cell, "--ak", f"max_budget_usd={args.budget_usd}",
-                       "--allow-agent-host", allow, *extra]
+                       "--allow-agent-host", allow, *_agent_auth_env(env), *extra]
                 # the CCR agent installs python3 + headroom-ai + the mcp SDK per container;
                 # harbor's default 360s agent-setup timeout is not enough on a cold image
                 mult = args.agent_timeout_mult or (3 if arm == "headroom-ccr" else None)
@@ -427,6 +449,9 @@ def main(argv=None):
                     help="harbor -n: parallel trials per cell (parallel containers can add "
                          "resource-contention noise to trajectories; 1 = cleanest)")
     ap.add_argument("--agent-timeout-mult", type=int, default=None)
+    ap.add_argument("--auth", default="auto", choices=["auto", "api-key", "subscription"],
+                    help="auto = API key if set, else Claude Code login; subscription = force "
+                         "the Claude Code login (container agent gets CLAUDE_CODE_OAUTH_TOKEN)")
     ap.add_argument("--milestones", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the Harbor commands without running")

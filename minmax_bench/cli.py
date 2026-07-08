@@ -65,6 +65,7 @@ def quality_run(
     agent_timeout_mult: int | None = typer.Option(None, "--agent-timeout-mult", help="Harbor agent-setup timeout multiplier."),
     list_tasks: bool = typer.Option(False, "--list-tasks", help="Print the known tasks and exit."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the Harbor commands without running."),
+    auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force Claude Code login; no API key needed)."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the guided wizard; use flags/defaults."),
 ):
     """Run the agents end-to-end via Harbor and compare trajectories (SPENDS).
@@ -100,6 +101,8 @@ def quality_run(
     _flag(argv, "--k-vanilla", k_vanilla)
     _flag(argv, "--seed", seed)
     _flag(argv, "--agent-timeout-mult", agent_timeout_mult)
+    if auth != "auto":
+        argv += ["--auth", auth]
     if milestones:
         argv.append("--milestones")
     if dry_run:
