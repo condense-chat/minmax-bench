@@ -28,6 +28,7 @@ import difflib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -135,20 +136,79 @@ def load_env(path=".env"):
     return env
 
 
+_CC_TOKEN_CACHE = ["unset"]  # one keychain read per process, not per request
+
+
+def cc_oauth_token():
+    """The user's own Claude Code subscription credential, read locally.
+
+    Most Claude Code users have no API key — their auth is the OAuth token the
+    Claude Code login stores. The bench replays THEIR sessions in Claude Code's
+    own request shape, so when no API key is configured we authenticate the same
+    way Claude Code does. The token stays in-process and is only ever sent where
+    the arm points (api.anthropic.com or the user's chosen gateway).
+
+    Sources, in order: CLAUDE_CODE_OAUTH_TOKEN env var, ~/.claude/.credentials.json,
+    the macOS keychain item Claude Code maintains. Returns None when absent/expired.
+    """
+    if _CC_TOKEN_CACHE[0] != "unset":
+        return _CC_TOKEN_CACHE[0]
+
+    def parse(raw):
+        try:
+            oauth = json.loads(raw).get("claudeAiOauth") or {}
+        except (json.JSONDecodeError, AttributeError):
+            return None
+        exp = oauth.get("expiresAt") or 0
+        if exp and exp / 1000 < time.time():
+            print("warn: Claude Code OAuth token is expired — open `claude` once to "
+                  "refresh it, or set ANTHROPIC_API_KEY", file=sys.stderr)
+            return None
+        return oauth.get("accessToken")
+
+    tok = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or None
+    if not tok:
+        cred = os.path.expanduser("~/.claude/.credentials.json")
+        if os.path.exists(cred):
+            tok = parse(open(cred).read())
+    if not tok and sys.platform == "darwin":
+        try:
+            r = subprocess.run(["security", "find-generic-password",
+                                "-s", "Claude Code-credentials", "-w"],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                tok = parse(r.stdout.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            tok = None
+    _CC_TOKEN_CACHE[0] = tok
+    return tok
+
+
+def auth_mode(env):
+    """'api-key' | 'subscription' | None — how upstream calls will authenticate."""
+    if env.get("ANTHROPIC_API_KEY"):
+        return "api-key"
+    if cc_oauth_token():
+        return "subscription"
+    return None
+
+
 def check_arms(arms, env):
     """Fail-fast validation BEFORE any money is spent: known arms + required keys.
 
     Returns a list of human-readable problems (empty = good to go). call_api
-    dereferences ARMS[arm] and the key env vars unconditionally, so skipping this
-    check crashes mid-run — typically after the control arm already spent budget.
+    dereferences ARMS[arm] unconditionally, so skipping this check crashes
+    mid-run — typically after the control arm already spent budget.
     """
     problems = []
     for arm in arms:
         if arm not in ARMS:
             problems.append(f"arm {arm!r} has no replay endpoint "
                             f"(known: {', '.join(sorted(ARMS))})")
-    if not env.get("ANTHROPIC_API_KEY"):
-        problems.append("ANTHROPIC_API_KEY missing (.env or environment)")
+    if not auth_mode(env):
+        problems.append("no auth found — set ANTHROPIC_API_KEY (API billing) or be "
+                        "logged in to Claude Code (subscription auth is used "
+                        "automatically)")
     if any(ARMS.get(a, {}).get("condense_auth") for a in arms) and not env.get("CONDENSE_API_KEY"):
         problems.append("CONDENSE_API_KEY missing — needed for the condense arm")
     return problems
@@ -470,10 +530,16 @@ def call_api(arm, req, tmpl_headers, env):
         "content-type": "application/json",
         "anthropic-version": tmpl_headers.get("anthropic-version", "2023-06-01"),
         "user-agent": tmpl_headers.get("user-agent", "tmb-fidelity-replay"),
-        "x-api-key": env["ANTHROPIC_API_KEY"],
     }
     if tmpl_headers.get("anthropic-beta"):
         headers["anthropic-beta"] = tmpl_headers["anthropic-beta"]
+    if env.get("ANTHROPIC_API_KEY"):
+        headers["x-api-key"] = env["ANTHROPIC_API_KEY"]
+    else:  # Claude Code subscription auth (validated up front by check_arms)
+        headers["Authorization"] = f"Bearer {cc_oauth_token()}"
+        beta = headers.get("anthropic-beta", "")
+        if "oauth-2025-04-20" not in beta:
+            headers["anthropic-beta"] = (beta + "," if beta else "") + "oauth-2025-04-20"
     if ARMS[arm].get("condense_auth"):
         headers["X-Condense-Auth-Token"] = env["CONDENSE_API_KEY"]
     data = json.dumps(req).encode()

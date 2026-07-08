@@ -232,3 +232,15 @@ def test_report_marks_sub_gate_tasks():
     row = d["rows"][0]
     assert row["vanilla"]["peak_ctx"] > 0
     assert row["sub_gate"] is True  # kv-store peaks ~25-35k: compaction can't have fired
+
+
+def test_auth_mode_resolution(monkeypatch):
+    import minmax_bench.quality.engine as e
+    monkeypatch.setattr(e, "_CC_TOKEN_CACHE", ["unset"])
+    monkeypatch.setattr(e, "cc_oauth_token", lambda: None)
+    assert e.auth_mode({"ANTHROPIC_API_KEY": "k"}) == "api-key"
+    assert e.auth_mode({}) is None
+    monkeypatch.setattr(e, "cc_oauth_token", lambda: "tok")
+    assert e.auth_mode({}) == "subscription"
+    problems = e.check_arms(["control"], {})
+    assert not problems  # subscription satisfies auth

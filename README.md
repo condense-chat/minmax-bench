@@ -61,6 +61,24 @@ uv sync --extra hf      # + HuggingFace loaders for the SWE-chat dataset
 cp .env.dist .env       # then fill in only the keys for what you run
 ```
 
+### What you need, per feature
+
+| feature | credentials |
+|---|---|
+| `report` / `replay` reference runs, offline demo, `run --dataset sample` | **none** |
+| your sessions' *recorded* cost (the counterfactual `recorded` row) | **none** |
+| replays: counterfactual, incremental, cost-bench proxy runs | `ANTHROPIC_API_KEY`, **or a Claude Code login** (see below) |
+| the condense arm | + `CONDENSE_API_KEY` |
+| `--mode full` (Harbor) | Docker + `uv tool install harbor` + the above |
+
+**No API key? Your Claude Code subscription works.** When `ANTHROPIC_API_KEY` is unset, the
+bench authenticates the way Claude Code itself does, using your own login: it checks
+`CLAUDE_CODE_OAUTH_TOKEN` (mint one with `claude setup-token`), then
+`~/.claude/.credentials.json`, then the macOS keychain entry Claude Code maintains. Replays
+are Claude Code-shaped requests over your own sessions; usage draws on your plan, the token
+never leaves your machine except toward the endpoint an arm points at, and the run banner
+says `auth: Claude Code subscription` so it's never implicit.
+
 ## Quick start (offline, no keys)
 
 The richest no-spend demo is re-scoring and replaying the committed reference runs

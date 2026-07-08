@@ -184,6 +184,10 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         for p in problems:
             console.print(f"[red]{p}[/]")
         raise SystemExit(1)
+    mode = eng.auth_mode(env)
+    if mode == "subscription":
+        console.print("[dim]auth: Claude Code subscription (no API key configured — "
+                      "replay usage draws on your plan)[/]")
 
     template_path = REPO_ROOT / "data" / "cc_request_template.json"
     cap = json.load(open(template_path))
