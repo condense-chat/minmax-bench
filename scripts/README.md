@@ -15,10 +15,9 @@ generate.py  ──▶  results/<out>/**            report.py  ──▶  report
 ```
 generate.py --mode {full,incremental}     # full = end-to-end trajectory; incremental = teacher-forced per-step
             --agent claude-code            # default; codex / opencode = TODO (errors, doesn't fake it)
-            --arms condense,headroom-ccr   # DEFAULT; vanilla always included (cost-bench names):
-                                           #   headroom          = cache-mode proxy
-                                           #   headroom-ccr      = token mode + retrieve loop (full
-                                           #                       CCR — headroom's intended config)
+            --arms condense,headroom       # DEFAULT; vanilla always included (cost-bench names):
+                                           #   headroom          = the REGULAR/full product —
+                                           #                       token proxy + retrieve loop (CCR)
                                            #   headroom-kompress = token mode, no retrieval (ablation)
             --tasks 5      # N = first N recommended; random:N = seeded sample of the
                            # whole dataset (--seed); a,b,c by name; omitted = 5.
@@ -37,9 +36,9 @@ generate.py --mode {full,incremental}     # full = end-to-end trajectory; increm
   step-by-step through control + each arm, arms in parallel →
   `results/<out>/incremental/<task>-<arm>.jsonl` (paired, cache-aware, no turn-count noise).
   `--task` is required and must match the name you pass `report.py --tasks`. Starts the headroom
-  proxy if needed (`--headroom-mode cache|token`). Teacher-forced replay executes no tools, so
-  CCR's retrieve loop can't engage here — token-mode headroom quality belongs to `--mode full`
-  with the `headroom-ccr` arm.
+  proxy if needed (`--headroom-mode cache|token`) and stops it on exit. Teacher-forced replay
+  executes no tools, so CCR's retrieve loop can't engage here — the full headroom product (with
+  CCR) belongs to `--mode full` with the `headroom` arm.
 - **`--milestones`** (full) — runs an LLM judge (temperature 0, arm-blind) over the runs →
   `results/<out>/milestones.json`. Milestones are grounded in a solved vanilla run, which is then
   excluded from vanilla's own coverage scoring.
@@ -68,7 +67,7 @@ below keep working on a bare `python3` from a fresh clone.
 | `minmax_bench/quality/generate.py` | generate | the one generation command (full + incremental + milestone judge) |
 | `minmax_bench/quality/engine.py` | generate | library: session I/O, request building, scoring, pricing — imported by generate, report (parser only) and `quality incremental` |
 | `minmax_bench/quality/report.py` | display | reads artifacts → html/md; never spends |
-| `harbor_agents/headroom_ccr_claude_code.py` | generate | self-contained CCR wiring for the `headroom-ccr` arm (preserves base MCP servers) |
+| `harbor_agents/headroom_ccr_claude_code.py` | generate | self-contained CCR wiring for the `headroom` arm (preserves base MCP servers) |
 | `tests/test_quality.py` | — | unit tests for the metric code (`uv run pytest`) |
 
 ## Counterfactual replay of a local session

@@ -384,7 +384,7 @@ def main(argv=None):
     ap.add_argument("--tasks", default=None,
                     help="comma list, a number N for the first N curated defaults, "
                          "or omitted = 5 (must cover what generate.py ran)")
-    ap.add_argument("--arms", default="condense,headroom-ccr")
+    ap.add_argument("--arms", default="condense,headroom")
     ap.add_argument("--agent", default="claude-code", choices=list(AGENT_SESSION_GLOB))
     ap.add_argument("--ctx-gate", type=int, default=50_000,
                     help="peak-context threshold below which compaction cannot have "

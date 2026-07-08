@@ -434,23 +434,26 @@ def _pick_model(console: Console) -> str:
 
 
 def _quality_preflight(console: Console, arms: list[str], *, need_docker: bool) -> None:
-    """Auth + arm-specific keys (+ Docker/harbor for full runs). Blocks only on
-    the truly-fatal; warns otherwise."""
+    """Dependency preflight, the rich preview of the same checks the full driver
+    gates on. Full runs reuse generate._preflight_full (Docker/harbor/auth/keys/port
+    — single source of truth); incremental replays need only auth + arm keys."""
     import os
 
     from .quality.engine import auth_mode, load_env
     env = {**load_env(), **os.environ}
-    rows = []
     if need_docker:
-        rows += [("Docker", bool(shutil.which("docker")), "runs the agent containers"),
-                 ("harbor CLI", bool(shutil.which("harbor")), "uv tool install harbor")]
-    rows.append(("Anthropic auth", bool(auth_mode(env)),
-                 auth_mode(env) or "ANTHROPIC_API_KEY or Claude Code login"))
-    if "condense" in arms:
-        rows.append(("CONDENSE_API_KEY", bool(env.get("CONDENSE_API_KEY")), "the condense arm"))
-    if any(a.startswith("headroom") for a in arms):
-        rows.append(("headroom / uvx", bool(shutil.which("headroom") or shutil.which("uvx")),
-                     "the headroom proxy"))
+        from .quality.generate import _preflight_full
+        rows = [(n, ok, d) for n, ok, d, _fatal in _preflight_full(arms, env)]
+        fatal_names = {n for n, ok, _d, fatal in _preflight_full(arms, env) if fatal}
+    else:
+        rows = [("Anthropic auth", bool(auth_mode(env)),
+                 auth_mode(env) or "ANTHROPIC_API_KEY or Claude Code login")]
+        if "condense" in arms:
+            rows.append(("CONDENSE_API_KEY", bool(env.get("CONDENSE_API_KEY")), "the condense arm"))
+        if any(a.startswith("headroom") for a in arms):
+            rows.append(("headroom / uvx", bool(shutil.which("headroom") or shutil.which("uvx")),
+                         "the headroom proxy"))
+        fatal_names = {"Anthropic auth"}
     t = Table(title="[bold]dependency preflight")
     t.add_column("dependency")
     t.add_column("status")
@@ -458,7 +461,7 @@ def _quality_preflight(console: Console, arms: list[str], *, need_docker: bool) 
     for name, ok, detail in rows:
         t.add_row(name, "[green]ok[/]" if ok else "[red]missing[/]", str(detail))
     console.print(t)
-    fatal = [n for n, ok, _ in rows if not ok and n in ("Docker", "harbor CLI", "Anthropic auth")]
+    fatal = [n for n, ok, _ in rows if not ok and n in fatal_names]
     if fatal:
         console.print(f"[red]can't run without: {', '.join(fatal)}[/]")
         if not Confirm.ask("[cyan]continue anyway?[/]", default=False, console=console):
@@ -490,9 +493,9 @@ def _full_wizard(console: Console) -> QualityWizardResult:
     ])
     arms = _multiselect(console, "arms to compare (vanilla baseline always included)", [
         ("condense", "condense — compaction proxy", True, True),
-        ("headroom-ccr", "headroom-ccr — token mode + retrieve (full product)", True, True),
-        ("headroom", "headroom — cache-mode proxy", True, False),
-        ("headroom-kompress", "headroom-kompress — token mode, no retrieval", True, False),
+        ("headroom", "headroom — the full product: token proxy + retrieve loop (CCR)", True, True),
+        ("headroom-kompress", "headroom-kompress — token compression, no retrieval (ablation)",
+         True, False),
     ])
     t = Table(title="[bold]recommended tasks (short → long)", show_header=False, box=None)
     for i, name in enumerate(DEFAULT_TASKS, 1):

@@ -9,14 +9,13 @@ Two ways to generate:
 
 Shared:
   --agent claude-code   default; codex / opencode = TODO (not implemented yet)
-  --arms condense,headroom-ccr   the methods to run (vanilla baseline is always included;
-                             this default pits condense against headroom's intended config).
-                             headroom       = cache-mode proxy (cost bench's 'headroom')
-                             headroom-ccr   = token-mode proxy + the mcp retrieve loop — the
-                                              full Compress-Cache-Retrieve product, headroom's
-                                              intended token-mode deployment
-                             headroom-kompress = token mode WITHOUT retrieval (ablation only;
-                                              matches the cost-bench strategy of that name)
+  --arms condense,headroom   the methods to run (vanilla baseline is always included;
+                             this default pits condense against headroom's full product).
+                             Two headroom arms, mirroring the cost bench's names:
+                             headroom          = the REGULAR/full product — token-mode proxy
+                                              + the mcp retrieve loop (Compress-Cache-Retrieve)
+                             headroom-kompress = token-mode compression WITHOUT retrieval
+                                              (ablation only)
 Optional (full): --milestones runs an LLM judge over the runs → results/<out>/milestones.json.
 
 Nothing here is read by report.py except the files it writes. Keep generation and display separate.
@@ -43,12 +42,11 @@ SUPPORTED_AGENTS = {"claude-code"}  # codex / opencode: TODO; harbor agent ids i
 HRPORT = int(os.environ.get("HRPORT", "8787"))
 UTC = timezone.utc  # noqa: UP017  (scripts run on system python3, may be 3.10)
 
-# arm -> headroom proxy mode. 'headroom' MUST stay cache mode: it is the cost bench's
-# 'headroom' strategy (matrix.py). For token mode, headroom's intended deployment is CCR
-# (Compress-Cache-Retrieve): proxy compression PLUS the mcp retrieve loop -> 'headroom-ccr'
-# is the canonical token-mode arm. 'headroom-kompress' (compression with NO retrieval,
-# the cost bench's strategy of that name) is kept as an ABLATION, not a headline arm.
-HEADROOM_MODES = {"headroom": "cache", "headroom-kompress": "token", "headroom-ccr": "token"}
+# arm -> headroom proxy mode. Two arms, mirroring the cost bench's headroom names:
+# 'headroom' is the REGULAR/full product (token-mode proxy + the mcp retrieve loop,
+# i.e. Compress-Cache-Retrieve — the CCR agent); 'headroom-kompress' is the ABLATION
+# (token-mode compression with NO retrieval). Both need a token-mode proxy.
+HEADROOM_MODES = {"headroom": "token", "headroom-kompress": "token"}
 
 # ------------------------------------------------------------------ FULL: drive Harbor per arm/task
 def _arm_wiring(arm, env):
@@ -59,12 +57,15 @@ def _arm_wiring(arm, env):
         tok = env.get("CONDENSE_API_KEY", "")
         return ("https://api.condense.chat/anthropic", "api.condense.chat", "claude-code",
                 ["--ae", f"ANTHROPIC_CUSTOM_HEADERS=X-Condense-Auth-Token: {tok}"])
-    if arm in ("headroom", "headroom-kompress"):
-        return (f"http://host.docker.internal:{HRPORT}", "host.docker.internal", "claude-code", [])
-    if arm == "headroom-ccr":
+    if arm == "headroom":
+        # regular headroom = the full product: token-mode proxy + the MCP retrieve
+        # loop (Compress-Cache-Retrieve), via the CCR agent
         return (f"http://host.docker.internal:{HRPORT}", "host.docker.internal",
                 "harbor_agents.headroom_ccr_claude_code:HeadroomCcrClaudeCode",
                 ["--ae", f"TMB_HEADROOM_PROXY_URL=http://host.docker.internal:{HRPORT}"])
+    if arm == "headroom-kompress":
+        # ablation: token-mode compression WITHOUT the retrieve loop (plain agent)
+        return (f"http://host.docker.internal:{HRPORT}", "host.docker.internal", "claude-code", [])
     sys.exit(f"unknown arm: {arm}")
 
 
@@ -149,6 +150,34 @@ def _validate_full(args, env):
     return arms
 
 
+def _preflight_full(arms, env):
+    """Dependency preflight before spending (like the cost bench's run preflight):
+    every dependency each requested arm needs, as (name, ok, detail, fatal). Docker
+    and harbor run the containers; auth runs the agent; per-arm: the condense key and
+    the headroom proxy/port. Printed as a table; a fatal miss aborts before any spend."""
+    rows = [
+        ("Docker", bool(shutil.which("docker")), "runs the agent containers", True),
+        ("harbor CLI", bool(shutil.which("harbor")), "uv tool install harbor", True),
+        ("Anthropic auth", bool(eng.auth_mode(env)),
+         eng.auth_mode(env) or "ANTHROPIC_API_KEY or `claude setup-token`", True),
+    ]
+    if "condense" in arms:
+        rows.append(("CONDENSE_API_KEY", bool(env.get("CONDENSE_API_KEY")),
+                     "the condense arm", True))
+    if any(a in HEADROOM_MODES for a in arms):
+        rows.append(("headroom / uvx", bool(shutil.which("headroom") or shutil.which("uvx")),
+                     "the headroom proxy", True))
+        # the port must be free OR already serving the token mode the headroom arms need
+        # (this is exactly the mid-run failure the preflight is here to catch up front)
+        pm = _proxy_mode() if _proxy_up() else None
+        ok = (not _proxy_up()) or pm == "token"
+        detail = ("free" if not _proxy_up() else
+                  "reusable token-mode proxy up" if pm == "token" else
+                  f"busy with a {pm or 'unknown'}-mode proxy — `kill $(lsof -ti :{HRPORT})`")
+        rows.append((f"port {HRPORT}", ok, detail, True))
+    return rows
+
+
 def full(args, env):
     # --auth subscription forces the Claude Code login even if an API key is
     # configured — drop the key so both the auth check and the container agent use
@@ -157,6 +186,15 @@ def full(args, env):
         env = {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"}
         os.environ.pop("ANTHROPIC_API_KEY", None)  # so harbor doesn't forward it either
     arms = _validate_full(args, env)
+    if not args.dry_run:
+        rows = _preflight_full(arms, env)
+        print("[preflight]")
+        for name, ok, detail, _fatal in rows:
+            print(f"   {'ok  ' if ok else 'MISS'}  {name:16} {detail}")
+        missing = [n for n, ok, _d, fatal in rows if not ok and fatal]
+        if missing:
+            sys.exit(f"[preflight] blocked by: {', '.join(missing)} — fix and re-run "
+                     f"(nothing spent).")
     org = args.dataset.split("/", 1)[0]
     tasks = resolve_tasks(args.tasks, org, args.seed)
     out = args.out
@@ -186,15 +224,14 @@ def full(args, env):
                        "--allow-agent-host", allow, *_agent_auth_env(env), *extra]
                 # the CCR agent installs python3 + headroom-ai + the mcp SDK per container;
                 # harbor's default 360s agent-setup timeout is not enough on a cold image
-                mult = args.agent_timeout_mult or (3 if arm == "headroom-ccr" else None)
+                mult = args.agent_timeout_mult or (3 if arm == "headroom" else None)
                 if mult:
                     cmd += ["--agent-timeout-multiplier", str(mult)]
                 renv = {**os.environ, "ANTHROPIC_BASE_URL": base,
                         "PYTHONPATH": os.getcwd() + os.pathsep + os.environ.get("PYTHONPATH", "")}
                 if arm == "headroom-kompress":
-                    print("[note] headroom-kompress = token-mode compression WITHOUT the CCR "
-                          "retrieve loop (ablation); headroom's intended token-mode config "
-                          "is the headroom-ccr arm")
+                    print("[note] headroom-kompress = token-mode compression WITHOUT the retrieve "
+                          "loop (ablation); the full product is the 'headroom' arm (with CCR)")
                 print(f"### {arm} / {task} (k={k}, base={base}) ###")
                 if args.dry_run:
                     print("   " + " ".join(cmd))
@@ -448,7 +485,7 @@ def main(argv=None):
                     help="full/incremental = generate trajectories; "
                          "judge = LLM milestone scoring of existing runs")
     ap.add_argument("--agent", default="claude-code")
-    ap.add_argument("--arms", default="condense,headroom-ccr")
+    ap.add_argument("--arms", default="condense,headroom")
     ap.add_argument("--tasks", default=None,
                     help="comma list of terminal-bench task ids, or a number N for the "
                          "first N curated defaults; omitted = 5 (see --list-tasks)")

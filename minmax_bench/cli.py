@@ -52,7 +52,7 @@ def _flag(argv: list[str], name: str, value, default=None) -> None:
 @quality_app.command("run")
 def quality_run(
     tasks: str | None = typer.Option(None, "--tasks", help="N = first N recommended | random:N (with --seed) | a,b,c | omitted = 5. See --list-tasks."),
-    arms: str = typer.Option("condense,headroom-ccr", "--arms", help="Methods to run; vanilla baseline always included."),
+    arms: str = typer.Option("condense,headroom", "--arms", help="Methods to run; vanilla baseline always included."),
     model: str | None = typer.Option(None, "--model", "-m", help="Model id (default claude-sonnet-4-6)."),
     dataset: str = typer.Option(_Q_DATASET, "--dataset", "-d", help="Harbor dataset (only the default is validated)."),
     k: int = typer.Option(4, "--k", help="Trials per arm/task."),
@@ -80,7 +80,7 @@ def quality_run(
     # bare + interactive → guided wizard (like the cost bench's `run`). The wizard
     # can pick EITHER full or incremental trajectories and its own source.
     if (sys.stdin.isatty() and not yes and not dry_run and tasks is None and model is None
-            and arms == "condense,headroom-ccr" and dataset == _Q_DATASET):
+            and arms == "condense,headroom" and dataset == _Q_DATASET):
         from .interactive import run_quality_wizard
         try:
             w = run_quality_wizard(console)
@@ -114,7 +114,7 @@ def quality_run(
 def quality_report(
     from_: str = typer.Option("results/jobs", "--from", help="Results root produced by `quality run`."),
     tasks: str | None = typer.Option(None, "--tasks", help="N | a,b,c | omitted = 5 (must cover what was run)."),
-    arms: str = typer.Option("condense,headroom-ccr", "--arms", help="Arms to display."),
+    arms: str = typer.Option("condense,headroom", "--arms", help="Arms to display."),
     fmt: str = typer.Option("html", "--format", help="html | md."),
     out: str | None = typer.Option(None, "--out", help="Output path (default report.<format>)."),
     ctx_gate: int = typer.Option(50_000, "--ctx-gate", help="Peak-ctx threshold below which compaction can't fire (⊘)."),

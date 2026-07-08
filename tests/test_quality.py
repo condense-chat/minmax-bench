@@ -142,9 +142,10 @@ def test_load_incremental_joins_and_reports_fidelity_vs_control(tmp_path):
 
 
 def test_check_arms_catches_unknown_arm_and_missing_keys():
-    problems = eng.check_arms(["control", "headroom-ccr", "condense"], {})
+    # headroom-kompress is a full-mode-only arm — not a valid teacher-forced replay arm
+    problems = eng.check_arms(["control", "headroom-kompress", "condense"], {})
     text = "\n".join(problems)
-    assert "headroom-ccr" in text
+    assert "headroom-kompress" in text
     assert "ANTHROPIC_API_KEY" in text and "CONDENSE_API_KEY" in text
     assert not eng.check_arms(["control"], {"ANTHROPIC_API_KEY": "k"})
 
