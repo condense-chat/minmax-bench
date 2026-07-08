@@ -546,12 +546,30 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
             raise KeyboardInterrupt
         session = str(p)
         task = p.stem[:12]
+    # show the session's own model so the inherit default is meaningful
+    from .counterfactual import session_meta
+    own = session_meta(Path(session)).get("model")
     # CCR can't engage without tool execution — incremental arms are proxy-only
     arms = _multiselect(console, "arms (vanilla control always included; CCR needs full runs)", [
         ("condense", "condense — compaction proxy", True, True),
         ("headroom", "headroom — proxy only (cache/token via --headroom-mode)", True, False),
     ])
-    model = _pick_model(console)
+    # inherit the session's OWN model by default — replaying it faithfully is the point;
+    # an arm that can't serve it auto-falls-back at run time (only override deliberately)
+    mt = Table(title="[bold]replay model", show_header=False, box=None)
+    mt.add_row(f"[dim] 0[/] [green]inherit from session[/] "
+               f"[dim]({own or 'unknown'})[/]   [green]← default[/]")
+    for i, (mid, label, _d) in enumerate(QUALITY_MODELS, 1):
+        mt.add_row(f"[dim]{i:>2}[/] override → {label} [dim]({mid})[/]")
+    console.print(mt)
+    raw = Prompt.ask("[cyan]model[/] (0 = inherit, or a number/id to override)",
+                     default="0", console=console).strip()
+    if raw in ("", "0"):
+        model = None  # inherit → replay() auto-detects + falls back
+    elif raw.isdigit() and 1 <= int(raw) <= len(QUALITY_MODELS):
+        model = QUALITY_MODELS[int(raw) - 1][0]
+    else:
+        model = raw
     every = int(Prompt.ask("[cyan]sample every Nth decision point[/]", default="1",
                            console=console) or 1)
     limit = int(Prompt.ask("[cyan]max decision points[/] (0 = all)", default="0",
@@ -559,8 +577,9 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     budget = float(Prompt.ask("[cyan]per-arm $ cap[/]", default="2", console=console) or 2)
     out = Prompt.ask("[cyan]output dir[/]", default="results/jobs/run", console=console).strip()
     _quality_preflight(console, arms, need_docker=False)
+    model_lbl = f"inherit ({own})" if model is None else model
     console.print(Panel.fit(
-        f"[bold]incremental trajectory[/]   [bold]model[/] {model}\n"
+        f"[bold]incremental trajectory[/]   [bold]model[/] {model_lbl}\n"
         f"[bold]session[/] {Path(session).name}\n"
         f"[bold]arms[/] control + {', '.join(arms)}   [bold]every[/] {every}   "
         f"[bold]limit[/] {limit or 'all'}\n"
