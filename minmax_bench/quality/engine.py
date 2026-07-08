@@ -593,3 +593,44 @@ def cost_usd(usage, model=None):
             + usage.get("output_tokens", 0) * price["output"]
             + usage.get("cache_creation_input_tokens", 0) * price["cache_write"]
             + usage.get("cache_read_input_tokens", 0) * price["cache_read"]) / 1e6
+
+
+JUDGE_MODEL = "claude-haiku-4-5"  # cheap; the equivalence call is easy
+_JUDGE_PROMPT = (
+    "You are judging whether two candidate NEXT ACTIONS of a coding agent are FUNCTIONALLY "
+    "EQUIVALENT decisions. The agent is mid-task; both were proposed from the same history.\n"
+    "TASK (truncated):\n{task}\n"
+    "ACTION A (what the agent originally did):\n{a}\n"
+    "ACTION B (replayed under compaction):\n{b}\n"
+    "Equivalent = same kind of step toward the task with the same target and intent (e.g. grep "
+    "vs rg for the same pattern, the same file read a different way, the same command with "
+    "reordered flags). NOT equivalent = different target/file, different approach, running vs "
+    "answering, testing vs editing, or a step that sends the trajectory elsewhere.\n"
+    'Return ONLY JSON {{"equivalent": true|false}}.')
+
+
+def _action_text(a):
+    if a.get("type") == "text":
+        return f"(final answer) {a.get('text', '')[:280]}"
+    inp = a.get("input", {})
+    tgt = (inp.get("command") or inp.get("file_path") or inp.get("pattern")
+           or json.dumps(inp, sort_keys=True))
+    return f"{a.get('name', '?')}: {' '.join(str(tgt).split())[:280]}"
+
+
+def judge_equivalent(orig, replay, env, task_hint=""):
+    """LLM adjudication: are these two next-actions functionally equivalent? Returns
+    True/False (None on error). Meant for structural NEAR-MISSES — it upgrades a
+    replay that chose an equivalent-but-differently-spelled action to 'agrees'."""
+    prompt = _JUDGE_PROMPT.format(task=(task_hint or "")[:400],
+                                  a=_action_text(orig), b=_action_text(replay))
+    req = {"model": JUDGE_MODEL, "max_tokens": 60, "temperature": 0,
+           "messages": [{"role": "user", "content": prompt}]}
+    resp, err = call_api("control", req, {"anthropic-version": "2023-06-01"}, env)
+    if err:
+        return None
+    t = "".join(b.get("text", "") for b in resp.get("content", [])).strip()
+    try:
+        return bool(json.loads(t[t.index("{"): t.rindex("}") + 1]).get("equivalent"))
+    except (ValueError, json.JSONDecodeError):
+        return None

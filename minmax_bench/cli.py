@@ -126,11 +126,12 @@ def quality_report(
 
 def _run_incremental(*, session: str | None, arms: str, model: str | None, every: int,
                      limit: int, budget_usd: float, max_tokens: int, out: str, task: str,
-                     auth: str, assume_yes: bool) -> None:
+                     auth: str, assume_yes: bool, judge: bool = False, steps: bool = True) -> None:
     """Rich teacher-forced replay of one session — picker when no --session, model
-    auto-fallback, cost preview, per-arm progress, and a summary table with the
-    recorded backtest anchor. Writes <out>/incremental/<task>-<arm>.jsonl for report."""
-    from .counterfactual import pick_session, render_summary, replay
+    auto-fallback, cost preview, per-arm progress, a summary table with the recorded
+    backtest anchor, and a per-step good/semi/bad/redundant readout. Writes
+    <out>/incremental/<task>-<arm>.jsonl for report."""
+    from .counterfactual import pick_session, render_steps, render_summary, replay
     sp = Path(session).expanduser() if session else pick_session(console)
     if not sp.is_file():
         raise typer.BadParameter(f"not a session file: {sp}")
@@ -138,10 +139,12 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None, every
     try:
         summary = replay(sp, arm_list, budget_usd=budget_usd, limit=limit, every=every,
                          max_tokens=max_tokens, out_dir=Path(out), console=console,
-                         assume_yes=assume_yes, model=model, auth=auth, task=task)
+                         assume_yes=assume_yes, model=model, auth=auth, task=task, judge=judge)
     except SystemExit as e:
         raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
     render_summary(summary, console)
+    if steps:
+        render_steps(summary, console)
     console.print(f"[green]artifacts[/] {out}/incremental/  ([dim]report:[/] "
                   f"minmax-bench quality report --from {out} --tasks {task} --arms {arms})")
 
@@ -158,6 +161,8 @@ def quality_incremental(
     out: str | None = typer.Option(None, "--out", help="Output dir (default results/incremental/<session>-<ts>)."),
     task: str = typer.Option("session", "--task", help="Task label for the report join."),
     auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force the Claude Code login)."),
+    judge: bool = typer.Option(False, "--judge", help="LLM-adjudicate structural near-misses (grep vs rg etc.) as equivalent."),
+    steps: bool = typer.Option(True, "--steps/--no-steps", help="Show the per-step good/semi/bad/redundant readout."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
 ):
     """Incremental (teacher-forced per-step) trajectories — the paired counterpart
@@ -172,7 +177,7 @@ def quality_incremental(
     out_dir = out or str(Path("results/incremental") / f"{stem}-{stamp}")
     _run_incremental(session=session, arms=arms, model=model, every=every, limit=limit,
                      budget_usd=budget_usd, max_tokens=max_tokens, out=out_dir, task=task,
-                     auth=auth, assume_yes=yes)
+                     auth=auth, assume_yes=yes, judge=judge, steps=steps)
 
 
 # judge takes niche flags; pass through to the driver (which owns its --help)

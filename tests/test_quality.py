@@ -281,3 +281,30 @@ def test_peek_reports_peak_context(tmp_path):
     sess.write_text("\n".join(json.dumps(x) for x in lines))
     prompt, cwd, has_assistant, peak, capped = _peek(sess)
     assert has_assistant and peak == 40020 and not capped  # peak, not last, not first
+
+
+def test_step_verdict_and_redundancy():
+    from minmax_bench import counterfactual as cf
+    good = {"step": 0, "orig": tool("Read", file_path="/a"), "replay": tool("Read", file_path="/a"),
+            "agree_action": True}
+    semi = {"step": 1, "orig": tool("Read", file_path="/a", offset=1),
+            "replay": tool("Read", file_path="/a", offset=99), "agree_action": False, "sim": 0.6}
+    bad = {"step": 2, "orig": tool("Write", file_path="/a"), "replay": tool("Bash", command="ls"),
+           "agree_action": False, "sim": 0.0}
+    assert cf._step_verdict(good) == "good"
+    assert cf._step_verdict(semi) == "semi"
+    assert cf._step_verdict(bad) == "bad"
+    # redundancy: a Read of a file an earlier step already touched
+    files, cmds = {"/a"}, set()
+    assert cf._is_refetch(tool("Read", file_path="/a"), files, cmds)
+    assert not cf._is_refetch(tool("Read", file_path="/b"), files, cmds)
+
+
+def test_judge_equivalent_parses_json(monkeypatch):
+    import minmax_bench.quality.engine as e
+    monkeypatch.setattr(e, "call_api",
+                        lambda *a, **k: ({"content": [{"text": '{"equivalent": true}'}]}, None))
+    assert e.judge_equivalent(tool("Bash", command="grep x f"),
+                              tool("Bash", command="rg x f"), {"ANTHROPIC_API_KEY": "k"}) is True
+    monkeypatch.setattr(e, "call_api", lambda *a, **k: (None, "HTTP 500"))
+    assert e.judge_equivalent({}, {}, {}) is None  # error -> None, not a crash

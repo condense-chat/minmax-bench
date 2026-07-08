@@ -203,7 +203,8 @@ def estimate_usd(msgs, points, price) -> tuple[float, float]:
 # --------------------------------------------------------------------------- replay
 def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, every: int,
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,
-           model: str | None = None, auth: str = "auto", task: str = "session") -> dict:
+           model: str | None = None, auth: str = "auto", task: str = "session",
+           judge: bool = False) -> dict:
     env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
     if auth == "subscription":
         # force the Claude Code login path even when an API key is configured
@@ -313,7 +314,11 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     inc_dir = out_dir / "incremental"
     inc_dir.mkdir(parents=True, exist_ok=True)
     sid = str(uuid.uuid4())
-    summary: dict = {"session": str(session), "model": replay_model, "steps": len(sel), "arms": {}}
+    # the session's first user text — task context for the equivalence judge
+    task_hint = next((b.get("text", "") for b in msgs[0]["content"]
+                      if isinstance(b, dict) and b.get("type") == "text"), "") if msgs else ""
+    summary: dict = {"session": str(session), "model": replay_model, "steps": len(sel),
+                     "judged": judge, "arms": {}}
     for arm in all_arms:
         path = inc_dir / f"{task}-{arm}.jsonl"
         spent, n_ok, n_action, n_exact, ctx_total = 0.0, 0, 0, 0, 0
@@ -345,6 +350,13 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                     consec_err = 0
                     rep = eng.extract_action(resp.get("content", []))
                     exact, action, sim = eng.score(orig, rep)
+                    # semantic agreement: an LLM upgrades a structural near-miss that is
+                    # a functionally-equivalent decision (grep vs rg, a differently-spelled
+                    # same command). Only judge the disagreements — matches are already yes.
+                    agree_sem = action
+                    if judge and not action:
+                        eq = eng.judge_equivalent(orig, rep, env, task_hint)
+                        agree_sem = bool(eq)
                     usage = resp.get("usage", {})
                     c = eng.cost_usd(usage, replay_model)
                     spent += c
@@ -357,7 +369,8 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                     ctx_total += step_ctx
                     ctx_series.append(step_ctx)
                     rec.update(replay=rep, agree_exact=exact, agree_action=action,
-                               sim=round(sim, 3), usage=usage, cost_usd=round(c, 4))
+                               agree_semantic=agree_sem, sim=round(sim, 3),
+                               usage=usage, cost_usd=round(c, 4))
                 f.write(json.dumps(rec) + "\n")
                 f.flush()
                 prog.update(tid, advance=1,
@@ -467,3 +480,103 @@ def render_summary(summary: dict, console: Console) -> None:
             f"[dim]control replay agrees with the original {floor:.0%} of the time — that is the "
             f"noise floor (sampling + replay error), not 100%. An arm is only drifting to the "
             f"extent it falls meaningfully below it; a few points on <30 steps is noise.[/]")
+
+
+# --------------------------------------------------------------------------- per-step view
+_CAT_STYLE = {"good": ("green", "✓ good"), "semi": ("yellow", "◐ semi"),
+              "bad": ("red", "✗ bad"), "err": ("dim", "· err")}
+_REDUND_RE = __import__("re").compile(r"\b(cat|head|tail|less|more|bat|sed -n|nl|grep|rg)\b")
+
+
+def _digest(a):
+    """Compact one-line label for an action."""
+    if not a or a.get("type") == "text":
+        return "answer: " + " ".join((a or {}).get("text", "").split())[:46]
+    inp = a.get("input", {})
+    tgt = inp.get("file_path") or inp.get("command") or inp.get("pattern") or ""
+    tgt = " ".join(str(tgt).split())
+    return f"{a.get('name', '?')}({tgt})"[:52]
+
+
+def _mark_seen(a, files, cmds):
+    if not a or a.get("type") != "tool_use":
+        return
+    inp = a.get("input", {})
+    if inp.get("file_path"):
+        files.add(inp["file_path"])
+    if a.get("name") == "Bash" and inp.get("command"):
+        cmds.add(" ".join(inp["command"].split()))
+
+
+def _is_refetch(a, files, cmds):
+    """Does this replayed action re-fetch info an earlier ORIGINAL step already had?
+    (compaction amnesia — the ↻ marker from the old trajectory viz)."""
+    if not a or a.get("type") != "tool_use":
+        return False
+    inp = a.get("input", {})
+    if a.get("name") == "Read" and inp.get("file_path") in files:
+        return True
+    if a.get("name") == "Bash":
+        cmd = " ".join(inp.get("command", "").split())
+        if cmd in cmds:
+            return True
+        if _REDUND_RE.search(cmd) and any(f and f in cmd for f in files):
+            return True
+    return False
+
+
+def _step_verdict(rec):
+    if "error" in rec or not rec.get("replay"):
+        return "err"
+    if rec.get("agree_semantic") or rec.get("agree_exact") or rec.get("agree_action"):
+        return "good"
+    o, p = rec.get("orig", {}), rec["replay"]
+    same_tool = o.get("type") == p.get("type") and o.get("name") == p.get("name")
+    return "semi" if (same_tool and rec.get("sim", 0) >= 0.5) else "bad"
+
+
+def render_steps(summary: dict, console: Console, max_rows: int = 60) -> None:
+    """Per-step readout for each non-control arm: good / semi / bad / ↻ redundant,
+    the terminal version of the trajectory viz. Reads the arm's stored jsonl."""
+    for arm, meta in summary["arms"].items():
+        if arm == "control":
+            continue
+        try:
+            recs = [json.loads(line) for line in open(meta["file"])]
+        except OSError:
+            continue
+        files, cmds, cats = set(), set(), {"good": 0, "semi": 0, "bad": 0, "err": 0}
+        rows, redund = [], 0
+        for r in recs:
+            cat = _step_verdict(r)
+            cats[cat] = cats.get(cat, 0) + 1
+            rd = _is_refetch(r.get("replay"), files, cmds)
+            redund += rd
+            rows.append((r["step"], r.get("orig", {}), r.get("replay"), cat, rd))
+            _mark_seen(r.get("orig"), files, cmds)  # the real history the arm should recall
+
+        judged = summary.get("judged")
+        title = (f"[bold]{arm} — per step[/] (vs original; "
+                 f"{'LLM-judged equivalence' if judged else 'structural match'})")
+        if len(rows) <= max_rows:
+            t = Table(title=title)
+            t.add_column("step", justify="right", style="dim")
+            t.add_column("original", max_width=52)
+            t.add_column("replayed", max_width=52)
+            t.add_column("verdict")
+            for step, o, p, cat, rd in rows:
+                style, label = _CAT_STYLE[cat]
+                mark = "  [magenta]↻ redundant[/]" if rd else ""
+                pdig = "[dim]—[/]" if cat == "err" else _digest(p)
+                t.add_row(str(step), _digest(o), pdig,
+                          f"[{style}]{label}[/]{mark}")
+            console.print(t)
+        else:  # compact glyph strip for long sessions
+            strip = "".join(f"[{_CAT_STYLE[c][0]}]" + ("↻" if rd else _CAT_STYLE[c][1][0])
+                            + "[/]" for _s, _o, _p, c, rd in rows)
+            console.print(f"{title}\n{strip}")
+        ok = cats["good"] + cats["semi"] + cats["bad"]
+        pct = f" ({cats['good'] / ok:.0%} good)" if ok else ""
+        console.print(f"[dim]{arm}:[/] [green]{cats['good']} good[/] · "
+                      f"[yellow]{cats['semi']} semi[/] · [red]{cats['bad']} bad[/] · "
+                      f"[magenta]{redund} ↻ redundant[/]{pct}")
