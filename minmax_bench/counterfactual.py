@@ -219,6 +219,21 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     lo, hi = estimate_usd(msgs, [i for i in sel], eng.rates_for(replay_model))
     all_arms = ["control"] + arms
 
+    # preflight every arm with a ~30-token probe BEFORE any real spend: a broken arm
+    # (bad key, gateway incompatibility with the replay model, dead proxy) must abort
+    # here, not after the control arm has already burned the budget
+    probe = {"model": replay_model, "max_tokens": 16, "stream": True,
+             "messages": [{"role": "user", "content": "Say ok."}]}
+    for arm in all_arms:
+        _, err = eng.call_api(arm, probe, tmpl_headers, env)
+        if err:
+            console.print(f"[red]{arm} failed preflight on {replay_model}[/] — aborting "
+                          f"before any replay spend.\n[dim]{err[:300]}[/]\n"
+                          f"[dim]hint: if the arm's gateway rejects this model, retry with "
+                          f"--model <model it supports>[/]")
+            raise SystemExit(1)
+    console.print(f"[dim]preflight ok: {', '.join(all_arms)} respond on {replay_model}[/]")
+
     console.print(Panel.fit(
         f"[bold]session[/] {session.name}   [bold]decision points[/] {len(sel)}/{len(points)}"
         f"   [bold]model[/] {replay_model}"
@@ -244,9 +259,13 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
             TimeElapsedColumn(), console=console,
         ) as prog:
             tid = prog.add_task("", total=len(sel), stat="")
+            consec_err = 0
             for step, i in enumerate(sel):
                 if spent >= budget_usd:
                     prog.update(tid, stat=f"budget ${budget_usd} reached")
+                    break
+                if consec_err >= 5:
+                    prog.update(tid, stat=f"aborted: {consec_err} consecutive errors")
                     break
                 orig = eng.extract_action(msgs[i]["content"])
                 req = eng.build_request(tmpl_body, msgs[:i], args, sid)
@@ -255,8 +274,10 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                 if err:
                     rec["error"] = err
                     n_err += 1
+                    consec_err += 1
                     first_err = first_err or err
                 else:
+                    consec_err = 0
                     rep = eng.extract_action(resp.get("content", []))
                     exact, action, sim = eng.score(orig, rep)
                     usage = resp.get("usage", {})

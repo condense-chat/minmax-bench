@@ -190,10 +190,11 @@ def full(args, env):
 def _replay_arm(arm, msgs, sel, tmpl_body, tmpl_headers, args, env, sid, path):
     """Teacher-force one arm over the selected decision points; returns a summary line."""
     spent, n_ok, n_action, n_err = 0.0, 0, 0, 0
+    consec_err = 0
     model = tmpl_body["model"]
     with open(path, "w") as f:
         for step, i in enumerate(sel):
-            if spent >= args.budget_usd:
+            if spent >= args.budget_usd or consec_err >= 5:
                 break
             orig = eng.extract_action(msgs[i]["content"])
             req = eng.build_request(tmpl_body, msgs[:i], args, sid)
@@ -203,8 +204,10 @@ def _replay_arm(arm, msgs, sel, tmpl_body, tmpl_headers, args, env, sid, path):
                    "latency_s": round(time.time() - t0, 1)}
             if err:
                 n_err += 1
+                consec_err += 1
                 rec["error"] = err
             else:
+                consec_err = 0
                 rep = eng.extract_action(resp.get("content", []))
                 exact, agree, sim = eng.score(orig, rep)
                 usage = resp.get("usage", {})
