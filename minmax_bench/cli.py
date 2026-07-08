@@ -76,7 +76,8 @@ def quality_run(
     if list_tasks:
         main(["--list-tasks", "--dataset", dataset])
         return
-    # bare + interactive → guided wizard (like the cost bench's `run`)
+    # bare + interactive → guided wizard (like the cost bench's `run`). The wizard
+    # can pick EITHER full or incremental trajectories and its own source.
     if (sys.stdin.isatty() and not yes and not dry_run and tasks is None and model is None
             and arms == "condense,headroom-ccr" and dataset == _Q_DATASET):
         from .interactive import run_quality_wizard
@@ -85,6 +86,14 @@ def quality_run(
         except (KeyboardInterrupt, EOFError):
             console.print("[yellow]aborted.[/]")
             raise typer.Exit(1) from None
+        from minmax_bench.quality.generate import main
+        if w.mode == "incremental":
+            iargv = ["--mode", "incremental", "--arms", w.arms, "--session", w.session,
+                     "--task", w.task, "--out", w.out, "--budget-usd", str(w.budget_usd),
+                     "--every", str(w.every), "--limit", str(w.limit)]
+            _flag(iargv, "--model", w.model)
+            main(iargv)
+            return
         arms, tasks, model, k, budget_usd, milestones, out = (
             w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out)
     argv = ["--mode", "full", "--arms", arms, "--dataset", dataset, "--out", out,

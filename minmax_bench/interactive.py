@@ -372,6 +372,11 @@ def run_wizard(console: Console) -> WizardResult:
 # ============================================================================
 # Quality / trajectory-preservation bench wizard (minmax-bench quality run)
 # ============================================================================
+
+
+# ============================================================================
+# Quality / trajectory-preservation bench wizard (minmax-bench quality run)
+# ============================================================================
 QUALITY_MODELS = [
     ("claude-sonnet-4-6", "Sonnet 4.6 — the validated default", True),
     ("claude-haiku-4-5", "Haiku 4.5 — cheapest", False),
@@ -382,28 +387,65 @@ QUALITY_MODELS = [
 
 @dataclass
 class QualityWizardResult:
+    mode: str                       # "full" | "incremental"
     arms: str
-    tasks: str
     model: str | None
-    k: int
-    budget_usd: float
-    milestones: bool
     out: str
+    # full
+    tasks: str = "5"
+    k: int = 4
+    budget_usd: float = 5.0
+    milestones: bool = True
+    # incremental
+    source: str = ""                # "own" | "file" | "swechat"
+    session: str | None = None
+    swechat: str | None = None
+    conv: int = 0
+    task: str = "session"
+    every: int = 1
+    limit: int = 0
 
 
-def _quality_preflight(console: Console, arms: list[str]) -> None:
-    """Docker + harbor + auth + arm-specific keys. Warns; blocks only on the
-    truly-fatal (no Docker/harbor/auth)."""
+def _select_one(console: Console, title: str, options: list[tuple[str, str, bool]],
+                default_idx: int = 1) -> str:
+    """Single-select: options are (key, label, enabled). Returns the chosen key."""
+    t = Table(title=f"[bold]{title}", show_header=False, box=None)
+    for i, (_k, label, enabled) in enumerate(options, 1):
+        t.add_row(f"[dim]{i:>2}[/] {label}" if enabled
+                  else f"[dim]{i:>2}    {label}  (coming soon)[/]")
+    console.print(t)
+    while True:
+        raw = Prompt.ask("[cyan]select[/] (number)", default=str(default_idx),
+                         console=console).strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(options) and options[int(raw) - 1][2]:
+            return options[int(raw) - 1][0]
+        console.print("[yellow]pick an available option[/]")
+
+
+def _pick_model(console: Console) -> str:
+    mt = Table(title="[bold]model", show_header=False, box=None)
+    for i, (mid, label, _d) in enumerate(QUALITY_MODELS, 1):
+        mt.add_row(f"[dim]{i:>2}[/] {label} [dim]({mid})[/]")
+    console.print(mt)
+    raw = Prompt.ask("[cyan]model[/] (number, or an id)", default="1", console=console).strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(QUALITY_MODELS):
+        return QUALITY_MODELS[int(raw) - 1][0]
+    return raw or QUALITY_MODELS[0][0]
+
+
+def _quality_preflight(console: Console, arms: list[str], *, need_docker: bool) -> None:
+    """Auth + arm-specific keys (+ Docker/harbor for full runs). Blocks only on
+    the truly-fatal; warns otherwise."""
     import os
 
     from .quality.engine import auth_mode, load_env
     env = {**load_env(), **os.environ}
-    rows = [
-        ("Docker", bool(shutil.which("docker")), "runs the agent containers"),
-        ("harbor CLI", bool(shutil.which("harbor")), "uv tool install harbor"),
-        ("Anthropic auth", bool(auth_mode(env)),
-         auth_mode(env) or "ANTHROPIC_API_KEY or Claude Code login"),
-    ]
+    rows = []
+    if need_docker:
+        rows += [("Docker", bool(shutil.which("docker")), "runs the agent containers"),
+                 ("harbor CLI", bool(shutil.which("harbor")), "uv tool install harbor")]
+    rows.append(("Anthropic auth", bool(auth_mode(env)),
+                 auth_mode(env) or "ANTHROPIC_API_KEY or Claude Code login"))
     if "condense" in arms:
         rows.append(("CONDENSE_API_KEY", bool(env.get("CONDENSE_API_KEY")), "the condense arm"))
     if any(a.startswith("headroom") for a in arms):
@@ -416,74 +458,116 @@ def _quality_preflight(console: Console, arms: list[str]) -> None:
     for name, ok, detail in rows:
         t.add_row(name, "[green]ok[/]" if ok else "[red]missing[/]", str(detail))
     console.print(t)
-    fatal = [n for n, ok, _ in rows[:3] if not ok]
+    fatal = [n for n, ok, _ in rows if not ok and n in ("Docker", "harbor CLI", "Anthropic auth")]
     if fatal:
         console.print(f"[red]can't run without: {', '.join(fatal)}[/]")
-        if not Confirm.ask("[cyan]continue anyway (e.g. to --dry-run)?[/]",
-                           default=False, console=console):
+        if not Confirm.ask("[cyan]continue anyway?[/]", default=False, console=console):
             raise KeyboardInterrupt
 
 
 def run_quality_wizard(console: Console) -> QualityWizardResult:
-    """Guided setup for a full-trajectory quality run — the quality analog of
-    the cost bench's run_wizard."""
-    from .quality.engine import DEFAULT_TASKS, resolve_tasks
-
+    """Guided setup for a quality run — pick full vs incremental trajectories and a
+    source, then walk the knobs. The quality analog of the cost bench's run_wizard."""
     console.print(Panel.fit(
         Text.assemble(("minmax-bench · quality\n", "bold magenta"),
                       ("does compaction preserve the agent's trajectory?", "dim")),
         border_style="magenta"))
+    mode = _select_one(console, "trajectory type", [
+        ("full", "full trajectories — run the agent end-to-end on tasks "
+                 "(behavior, rework, solve, milestones)", True),
+        ("incremental", "incremental — teacher-forced per-step replay of a recorded "
+                        "session (paired A/B, cheap, no turn noise)", True),
+    ])
+    return (_full_wizard if mode == "full" else _incremental_wizard)(console)
 
-    # 1. arms (vanilla baseline is always included)
-    arm_opts = [
+
+def _full_wizard(console: Console) -> QualityWizardResult:
+    from .quality.engine import DEFAULT_TASKS, resolve_tasks
+    _select_one(console, "dataset", [
+        ("terminal-bench", "terminal-bench-2-1 — curated coding tasks WITH verifiers", True),
+        ("swe-chat", "SWE-chat — real recorded sessions (no verifiers; incremental only)", False),
+        ("custom", "another Harbor dataset", False),
+    ])
+    arms = _multiselect(console, "arms to compare (vanilla baseline always included)", [
         ("condense", "condense — compaction proxy", True, True),
         ("headroom-ccr", "headroom-ccr — token mode + retrieve (full product)", True, True),
         ("headroom", "headroom — cache-mode proxy", True, False),
         ("headroom-kompress", "headroom-kompress — token mode, no retrieval", True, False),
-    ]
-    arms = _multiselect(console, "arms to compare (vanilla baseline always included)", arm_opts)
-
-    # 2. tasks — show the recommended, cost-ordered list, then pick
+    ])
     t = Table(title="[bold]recommended tasks (short → long)", show_header=False, box=None)
     for i, name in enumerate(DEFAULT_TASKS, 1):
         t.add_row(f"[dim]{i:>2}[/] {name}{'   [green]← default 5[/]' if i == 5 else ''}")
     console.print(t)
-    tasks = Prompt.ask(
-        "[cyan]tasks[/] (a number N = first N, random:N, comma names, blank = 5)",
-        default="5", console=console).strip() or "5"
-
-    # 3. model (single)
-    mt = Table(title="[bold]model", show_header=False, box=None)
-    for i, (mid, label, _d) in enumerate(QUALITY_MODELS, 1):
-        mt.add_row(f"[dim]{i:>2}[/] {label} [dim]({mid})[/]")
-    console.print(mt)
-    raw = Prompt.ask("[cyan]model[/] (number, or an id)", default="1", console=console).strip()
-    if raw.isdigit() and 1 <= int(raw) <= len(QUALITY_MODELS):
-        model = QUALITY_MODELS[int(raw) - 1][0]
-    else:
-        model = raw or QUALITY_MODELS[0][0]
-
-    # 4. knobs
+    tasks = Prompt.ask("[cyan]tasks[/] (a number N = first N, random:N, comma names, blank = 5)",
+                       default="5", console=console).strip() or "5"
+    model = _pick_model(console)
     k = int(Prompt.ask("[cyan]trials per arm[/] (k — ≥2 for a verdict; 4 recommended)",
                        default="4", console=console) or 4)
     budget = float(Prompt.ask("[cyan]per-trial $ cap[/]", default="5", console=console) or 5)
-    milestones = Confirm.ask("[cyan]also run the LLM milestone judge?[/]",
-                             default=True, console=console)
+    milestones = Confirm.ask("[cyan]also run the LLM milestone judge?[/]", default=True,
+                             console=console)
     out = Prompt.ask("[cyan]output dir[/]", default="results/jobs/run", console=console).strip()
-
-    # 5. preflight + ready panel with the plan / cost ceiling
-    _quality_preflight(console, arms)
+    _quality_preflight(console, arms, need_docker=True)
     ntasks = len(resolve_tasks(tasks, "terminal-bench"))
-    kv = k + 1
-    trials = ntasks * (kv + k * len(arms))
+    kv, trials = k + 1, len(resolve_tasks(tasks, "terminal-bench")) * ((k + 1) + k * len(arms))
     console.print(Panel.fit(
-        f"[bold]model[/] {model}   [bold]tasks[/] {ntasks}   [bold]k[/] {k} (vanilla {kv})\n"
-        f"[bold]arms[/] vanilla + {', '.join(arms)}\n"
+        f"[bold]full trajectories[/]   [bold]model[/] {model}   [bold]tasks[/] {ntasks}   "
+        f"[bold]k[/] {k} (vanilla {kv})\n[bold]arms[/] vanilla + {', '.join(arms)}\n"
         f"[bold]milestones[/] {'yes' if milestones else 'no'}   [bold]out[/] {out}\n"
         f"[bold]{trials} trials[/], cost ceiling ~[bold]${trials * budget:.0f}[/] "
-        f"(${budget:g}/trial cap)",
-        title="ready", border_style="green"))
+        f"(${budget:g}/trial cap)", title="ready", border_style="green"))
     if not Confirm.ask("[cyan]run it?[/]", default=False, console=console):
         raise KeyboardInterrupt
-    return QualityWizardResult(arms=",".join(arms), tasks=tasks, model=model, k=k,
-                               budget_usd=budget, milestones=milestones, out=out)
+    return QualityWizardResult(mode="full", arms=",".join(arms), tasks=tasks, model=model,
+                               k=k, budget_usd=budget, milestones=milestones, out=out)
+
+
+def _incremental_wizard(console: Console) -> QualityWizardResult:
+    from pathlib import Path
+
+    src = _select_one(console, "source session", [
+        ("own", "your own Claude Code sessions (~/.claude/projects) — pick from a list", True),
+        ("file", "a session .jsonl path", True),
+        ("swechat", "SWE-chat cached conversations (coming soon here)", False),
+    ])
+    session = swechat = None
+    conv = 0
+    task = "session"
+    if src == "own":
+        from .counterfactual import pick_session
+        p = pick_session(console)  # the peak-ctx picker
+        session = str(p)
+        task = p.stem[:12]
+    else:  # file
+        raw = Prompt.ask("[cyan]session .jsonl path[/]", console=console).strip()
+        p = Path(raw).expanduser()
+        if not p.is_file():
+            console.print(f"[red]not a file:[/] {p}")
+            raise KeyboardInterrupt
+        session = str(p)
+        task = p.stem[:12]
+    # CCR can't engage without tool execution — incremental arms are proxy-only
+    arms = _multiselect(console, "arms (vanilla control always included; CCR needs full runs)", [
+        ("condense", "condense — compaction proxy", True, True),
+        ("headroom", "headroom — proxy only (cache/token via --headroom-mode)", True, False),
+    ])
+    model = _pick_model(console)
+    every = int(Prompt.ask("[cyan]sample every Nth decision point[/]", default="1",
+                           console=console) or 1)
+    limit = int(Prompt.ask("[cyan]max decision points[/] (0 = all)", default="0",
+                           console=console) or 0)
+    budget = float(Prompt.ask("[cyan]per-arm $ cap[/]", default="2", console=console) or 2)
+    out = Prompt.ask("[cyan]output dir[/]", default="results/jobs/run", console=console).strip()
+    _quality_preflight(console, arms, need_docker=False)
+    console.print(Panel.fit(
+        f"[bold]incremental trajectory[/]   [bold]model[/] {model}\n"
+        f"[bold]session[/] {Path(session).name}\n"
+        f"[bold]arms[/] control + {', '.join(arms)}   [bold]every[/] {every}   "
+        f"[bold]limit[/] {limit or 'all'}\n"
+        f"[bold]per-arm cap[/] ${budget:g}   [bold]out[/] {out}",
+        title="ready", border_style="green"))
+    if not Confirm.ask("[cyan]replay it?[/]", default=False, console=console):
+        raise KeyboardInterrupt
+    return QualityWizardResult(mode="incremental", source=src, session=session, swechat=swechat,
+                               conv=conv, task=task, arms=",".join(arms), model=model,
+                               every=every, limit=limit, budget_usd=budget, out=out)
