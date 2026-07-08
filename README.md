@@ -261,7 +261,7 @@ python3 scripts/report.py --from runs/quality-sample --tasks kv-store-grpc --arm
 # (--list-tasks shows everything; --tasks 2, --tasks random:8 --seed 42, or --tasks a,b).
 uv run minmax-bench quality run    --out results/jobs/run1 --milestones   # spends: runs agents
 uv run minmax-bench quality report --from results/jobs/run1 --tasks 5     # pure display
-# also: `quality replay --session <f> --task <t>` (teacher-forced), `quality judge`.
+# also: `quality incremental --session <f> --task <t>` (teacher-forced per-step), `quality judge`.
 # The scripts/ wrappers (`python3 scripts/generate.py …`) still work identically.
 ```
 

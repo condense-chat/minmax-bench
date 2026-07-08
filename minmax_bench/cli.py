@@ -33,28 +33,89 @@ console = Console()
 # ---- quality / trajectory-preservation bench ---------------------------------
 # The cost bench (`run`, `report`, `replay`, …) measures how much a proxy SAVES.
 # The quality bench measures whether the compressed session still does the same
-# work. It lives in minmax_bench.quality; these thin passthrough commands surface
-# it under one entrypoint. Flags pass straight through to the underlying drivers
-# (which own all defaults/validation) — `minmax-bench quality run --help` shows them.
-_PASS = {"allow_extra_args": True, "ignore_unknown_options": True, "help_option_names": []}
+# work. It lives in minmax_bench.quality; these commands surface it under one
+# entrypoint. `run`/`report` are first-class (typed options, like the cost bench);
+# they translate to the driver's argv so defaults/validation stay in one place.
 quality_app = typer.Typer(add_completion=False, help="Quality / trajectory-preservation bench.")
 app.add_typer(quality_app, name="quality")
 
+# defaults mirror minmax_bench.quality.generate's argparse — kept in sync there
+_Q_DATASET = "terminal-bench/terminal-bench-2-1"
 
-@quality_app.command("run", context_settings=_PASS)
-def quality_run(ctx: typer.Context):
+
+def _flag(argv: list[str], name: str, value, default=None) -> None:
+    """Append `--name value` to argv unless value is the driver's default/None."""
+    if value is not None and value != default:
+        argv += [name, str(value)]
+
+
+@quality_app.command("run")
+def quality_run(
+    tasks: str | None = typer.Option(None, "--tasks", help="N = first N recommended | random:N (with --seed) | a,b,c | omitted = 5. See --list-tasks."),
+    arms: str = typer.Option("condense,headroom-ccr", "--arms", help="Methods to run; vanilla baseline always included."),
+    model: str | None = typer.Option(None, "--model", "-m", help="Model id (default claude-sonnet-4-6)."),
+    dataset: str = typer.Option(_Q_DATASET, "--dataset", "-d", help="Harbor dataset (only the default is validated)."),
+    k: int = typer.Option(4, "--k", help="Trials per arm/task."),
+    k_vanilla: int | None = typer.Option(None, "--k-vanilla", help="Trials for the vanilla baseline (default k+1)."),
+    budget_usd: float = typer.Option(5.0, "--budget-usd", help="Per-trial spend cap (Harbor max_budget_usd)."),
+    concurrency: int = typer.Option(1, "--concurrency", help="Parallel trials per cell (harbor -n)."),
+    milestones: bool = typer.Option(False, "--milestones", help="Also run the LLM milestone judge."),
+    out: str = typer.Option("results/jobs/run", "--out", help="Results root."),
+    seed: int | None = typer.Option(None, "--seed", help="Seed for --tasks random:N."),
+    agent_timeout_mult: int | None = typer.Option(None, "--agent-timeout-mult", help="Harbor agent-setup timeout multiplier."),
+    list_tasks: bool = typer.Option(False, "--list-tasks", help="Print the known tasks and exit."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the Harbor commands without running."),
+):
     """Run the agents end-to-end via Harbor and compare trajectories (SPENDS).
 
-    The quality analog of `minmax-bench run`. e.g. `minmax-bench quality run
-    --tasks 5 --arms condense,headroom-ccr --milestones`.
+    The quality analog of `minmax-bench run`: choose model/dataset/tasks/k/arms,
+    e.g. `minmax-bench quality run -m claude-haiku-4-5 --tasks 5 --milestones`.
     """
     from minmax_bench.quality.generate import main
-    main(["--mode", "full", *ctx.args])
+    if list_tasks:
+        main(["--list-tasks", "--dataset", dataset])
+        return
+    argv = ["--mode", "full", "--arms", arms, "--dataset", dataset, "--out", out,
+            "--k", str(k), "--budget-usd", str(budget_usd), "--concurrency", str(concurrency)]
+    _flag(argv, "--tasks", tasks)
+    _flag(argv, "--model", model)
+    _flag(argv, "--k-vanilla", k_vanilla)
+    _flag(argv, "--seed", seed)
+    _flag(argv, "--agent-timeout-mult", agent_timeout_mult)
+    if milestones:
+        argv.append("--milestones")
+    if dry_run:
+        argv.append("--dry-run")
+    main(argv)
 
 
-@quality_app.command("replay", context_settings=_PASS)
-def quality_replay(ctx: typer.Context):
-    """Teacher-force one --session step-by-step through each arm (SPENDS, paired)."""
+@quality_app.command("report")
+def quality_report(
+    from_: str = typer.Option("results/jobs", "--from", help="Results root produced by `quality run`."),
+    tasks: str | None = typer.Option(None, "--tasks", help="N | a,b,c | omitted = 5 (must cover what was run)."),
+    arms: str = typer.Option("condense,headroom-ccr", "--arms", help="Arms to display."),
+    fmt: str = typer.Option("html", "--format", help="html | md."),
+    out: str | None = typer.Option(None, "--out", help="Output path (default report.<format>)."),
+    ctx_gate: int = typer.Option(50_000, "--ctx-gate", help="Peak-ctx threshold below which compaction can't fire (⊘)."),
+):
+    """Render the quality bench from stored artifacts — never spends."""
+    from minmax_bench.quality.report import main
+    argv = ["--from", from_, "--arms", arms, "--format", fmt, "--ctx-gate", str(ctx_gate)]
+    _flag(argv, "--tasks", tasks)
+    _flag(argv, "--out", out)
+    main(argv)
+
+
+# `incremental` (teacher-forced per-step) is the paired counterpart to `run`'s full
+# trajectories; it and `judge` take many niche flags, so pass through to the driver,
+# which owns their help. `minmax-bench quality incremental --help` shows them.
+_PASS = {"allow_extra_args": True, "ignore_unknown_options": True, "help_option_names": []}
+
+
+@quality_app.command("incremental", context_settings=_PASS)
+def quality_incremental(ctx: typer.Context):
+    """Incremental (teacher-forced per-step) trajectories — the paired counterpart
+    to `run`'s full trajectories. Replays one --session through each arm (SPENDS)."""
     from minmax_bench.quality.generate import main
     main(["--mode", "incremental", *ctx.args])
 
@@ -64,13 +125,6 @@ def quality_judge(ctx: typer.Context):
     """Run the LLM milestone judge over existing full-mode runs (SPENDS)."""
     from minmax_bench.quality.generate import main
     main(["--mode", "judge", *ctx.args])
-
-
-@quality_app.command("report", context_settings=_PASS)
-def quality_report(ctx: typer.Context):
-    """Render the quality bench from stored artifacts — never spends."""
-    from minmax_bench.quality.report import main
-    main(list(ctx.args))
 
 
 def _meta(m) -> dict:
