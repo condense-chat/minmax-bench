@@ -258,6 +258,9 @@ def counterfactual_cmd(
     model: str | None = typer.Option(None, "--model", help="Override the replay model (default: the session's own model)."),
     out: str | None = typer.Option(None, "--out", help="Output dir (default results/counterfactual/<session>-<ts>)."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    auth: str = typer.Option("auto", "--auth",
+                             help="auto (api key if configured, else Claude Code login) | "
+                                  "api-key | subscription (force the Claude Code login path)"),
 ):
     """Replay one of YOUR local Claude Code sessions through condense/headroom, step by step.
 
@@ -276,7 +279,7 @@ def counterfactual_cmd(
     try:
         summary = replay(sp, arm_list, budget_usd=budget_usd, limit=limit, every=every,
                          max_tokens=max_tokens, out_dir=out_dir, console=console,
-                         assume_yes=yes, model=model)
+                         assume_yes=yes, model=model, auth=auth)
     except SystemExit as e:
         raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
     render_summary(summary, console)

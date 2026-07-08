@@ -173,8 +173,15 @@ def estimate_usd(msgs, points, price) -> tuple[float, float]:
 # --------------------------------------------------------------------------- replay
 def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, every: int,
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,
-           model: str | None = None) -> dict:
+           model: str | None = None, auth: str = "auto") -> dict:
     env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
+    if auth == "subscription":
+        # force the Claude Code login path even when an API key is configured
+        # (.env or environment) — this is how you TEST the no-API-key experience
+        env.pop("ANTHROPIC_API_KEY", None)
+    elif auth == "api-key" and not env.get("ANTHROPIC_API_KEY"):
+        console.print("[red]--auth api-key but no ANTHROPIC_API_KEY configured[/]")
+        raise SystemExit(1)
 
     if "control" in arms:
         console.print("[red]control is always replayed — pass only the arms to compare[/]")
