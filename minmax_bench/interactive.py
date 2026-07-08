@@ -367,3 +367,123 @@ def run_wizard(console: Console) -> WizardResult:
         dataset=dataset, models=models, strategies=strategies, edges=edges,
         session_ids=session_ids, token_limit=token_limit, setup=setup,
     )
+
+
+# ============================================================================
+# Quality / trajectory-preservation bench wizard (minmax-bench quality run)
+# ============================================================================
+QUALITY_MODELS = [
+    ("claude-sonnet-4-6", "Sonnet 4.6 — the validated default", True),
+    ("claude-haiku-4-5", "Haiku 4.5 — cheapest", False),
+    ("claude-sonnet-5", "Sonnet 5", False),
+    ("claude-opus-4-8", "Opus 4.8 — most capable", False),
+]
+
+
+@dataclass
+class QualityWizardResult:
+    arms: str
+    tasks: str
+    model: str | None
+    k: int
+    budget_usd: float
+    milestones: bool
+    out: str
+
+
+def _quality_preflight(console: Console, arms: list[str]) -> None:
+    """Docker + harbor + auth + arm-specific keys. Warns; blocks only on the
+    truly-fatal (no Docker/harbor/auth)."""
+    import os
+
+    from .quality.engine import auth_mode, load_env
+    env = {**load_env(), **os.environ}
+    rows = [
+        ("Docker", bool(shutil.which("docker")), "runs the agent containers"),
+        ("harbor CLI", bool(shutil.which("harbor")), "uv tool install harbor"),
+        ("Anthropic auth", bool(auth_mode(env)),
+         auth_mode(env) or "ANTHROPIC_API_KEY or Claude Code login"),
+    ]
+    if "condense" in arms:
+        rows.append(("CONDENSE_API_KEY", bool(env.get("CONDENSE_API_KEY")), "the condense arm"))
+    if any(a.startswith("headroom") for a in arms):
+        rows.append(("headroom / uvx", bool(shutil.which("headroom") or shutil.which("uvx")),
+                     "the headroom proxy"))
+    t = Table(title="[bold]dependency preflight")
+    t.add_column("dependency")
+    t.add_column("status")
+    t.add_column("detail", style="dim")
+    for name, ok, detail in rows:
+        t.add_row(name, "[green]ok[/]" if ok else "[red]missing[/]", str(detail))
+    console.print(t)
+    fatal = [n for n, ok, _ in rows[:3] if not ok]
+    if fatal:
+        console.print(f"[red]can't run without: {', '.join(fatal)}[/]")
+        if not Confirm.ask("[cyan]continue anyway (e.g. to --dry-run)?[/]",
+                           default=False, console=console):
+            raise KeyboardInterrupt
+
+
+def run_quality_wizard(console: Console) -> QualityWizardResult:
+    """Guided setup for a full-trajectory quality run — the quality analog of
+    the cost bench's run_wizard."""
+    from .quality.engine import DEFAULT_TASKS, resolve_tasks
+
+    console.print(Panel.fit(
+        Text.assemble(("minmax-bench · quality\n", "bold magenta"),
+                      ("does compaction preserve the agent's trajectory?", "dim")),
+        border_style="magenta"))
+
+    # 1. arms (vanilla baseline is always included)
+    arm_opts = [
+        ("condense", "condense — compaction proxy", True, True),
+        ("headroom-ccr", "headroom-ccr — token mode + retrieve (full product)", True, True),
+        ("headroom", "headroom — cache-mode proxy", True, False),
+        ("headroom-kompress", "headroom-kompress — token mode, no retrieval", True, False),
+    ]
+    arms = _multiselect(console, "arms to compare (vanilla baseline always included)", arm_opts)
+
+    # 2. tasks — show the recommended, cost-ordered list, then pick
+    t = Table(title="[bold]recommended tasks (short → long)", show_header=False, box=None)
+    for i, name in enumerate(DEFAULT_TASKS, 1):
+        t.add_row(f"[dim]{i:>2}[/] {name}{'   [green]← default 5[/]' if i == 5 else ''}")
+    console.print(t)
+    tasks = Prompt.ask(
+        "[cyan]tasks[/] (a number N = first N, random:N, comma names, blank = 5)",
+        default="5", console=console).strip() or "5"
+
+    # 3. model (single)
+    mt = Table(title="[bold]model", show_header=False, box=None)
+    for i, (mid, label, _d) in enumerate(QUALITY_MODELS, 1):
+        mt.add_row(f"[dim]{i:>2}[/] {label} [dim]({mid})[/]")
+    console.print(mt)
+    raw = Prompt.ask("[cyan]model[/] (number, or an id)", default="1", console=console).strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(QUALITY_MODELS):
+        model = QUALITY_MODELS[int(raw) - 1][0]
+    else:
+        model = raw or QUALITY_MODELS[0][0]
+
+    # 4. knobs
+    k = int(Prompt.ask("[cyan]trials per arm[/] (k — ≥2 for a verdict; 4 recommended)",
+                       default="4", console=console) or 4)
+    budget = float(Prompt.ask("[cyan]per-trial $ cap[/]", default="5", console=console) or 5)
+    milestones = Confirm.ask("[cyan]also run the LLM milestone judge?[/]",
+                             default=True, console=console)
+    out = Prompt.ask("[cyan]output dir[/]", default="results/jobs/run", console=console).strip()
+
+    # 5. preflight + ready panel with the plan / cost ceiling
+    _quality_preflight(console, arms)
+    ntasks = len(resolve_tasks(tasks, "terminal-bench"))
+    kv = k + 1
+    trials = ntasks * (kv + k * len(arms))
+    console.print(Panel.fit(
+        f"[bold]model[/] {model}   [bold]tasks[/] {ntasks}   [bold]k[/] {k} (vanilla {kv})\n"
+        f"[bold]arms[/] vanilla + {', '.join(arms)}\n"
+        f"[bold]milestones[/] {'yes' if milestones else 'no'}   [bold]out[/] {out}\n"
+        f"[bold]{trials} trials[/], cost ceiling ~[bold]${trials * budget:.0f}[/] "
+        f"(${budget:g}/trial cap)",
+        title="ready", border_style="green"))
+    if not Confirm.ask("[cyan]run it?[/]", default=False, console=console):
+        raise KeyboardInterrupt
+    return QualityWizardResult(arms=",".join(arms), tasks=tasks, model=model, k=k,
+                               budget_usd=budget, milestones=milestones, out=out)

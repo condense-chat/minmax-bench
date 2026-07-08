@@ -65,16 +65,28 @@ def quality_run(
     agent_timeout_mult: int | None = typer.Option(None, "--agent-timeout-mult", help="Harbor agent-setup timeout multiplier."),
     list_tasks: bool = typer.Option(False, "--list-tasks", help="Print the known tasks and exit."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the Harbor commands without running."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the guided wizard; use flags/defaults."),
 ):
     """Run the agents end-to-end via Harbor and compare trajectories (SPENDS).
 
-    The quality analog of `minmax-bench run`: choose model/dataset/tasks/k/arms,
-    e.g. `minmax-bench quality run -m claude-haiku-4-5 --tasks 5 --milestones`.
+    The quality analog of `minmax-bench run`: bare `quality run` launches a guided
+    wizard; or drive it with flags, e.g. `-m claude-haiku-4-5 --tasks 5 --milestones`.
     """
     from minmax_bench.quality.generate import main
     if list_tasks:
         main(["--list-tasks", "--dataset", dataset])
         return
+    # bare + interactive → guided wizard (like the cost bench's `run`)
+    if (sys.stdin.isatty() and not yes and not dry_run and tasks is None and model is None
+            and arms == "condense,headroom-ccr" and dataset == _Q_DATASET):
+        from .interactive import run_quality_wizard
+        try:
+            w = run_quality_wizard(console)
+        except (KeyboardInterrupt, EOFError):
+            console.print("[yellow]aborted.[/]")
+            raise typer.Exit(1) from None
+        arms, tasks, model, k, budget_usd, milestones, out = (
+            w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out)
     argv = ["--mode", "full", "--arms", arms, "--dataset", dataset, "--out", out,
             "--k", str(k), "--budget-usd", str(budget_usd), "--concurrency", str(concurrency)]
     _flag(argv, "--tasks", tasks)

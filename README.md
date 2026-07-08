@@ -256,11 +256,13 @@ python3 scripts/report.py --from runs/quality-sample --tasks kv-store-grpc --arm
 **Generate your own** (Docker + `uv tool install harbor` + `.env` keys):
 
 ```bash
-# Reachable from the same CLI as the cost bench — `quality run` is the analog of `run`.
-# No task names needed: the default is the first 5 recommended terminal-bench tasks
-# (--list-tasks shows everything; --tasks 2, --tasks random:8 --seed 42, or --tasks a,b).
-uv run minmax-bench quality run    --out results/jobs/run1 --milestones   # spends: runs agents
-uv run minmax-bench quality report --from results/jobs/run1 --tasks 5     # pure display
+# `quality run` is the analog of the cost bench's `run` — bare, it launches a
+# guided wizard (arms, tasks, model, k, budget, preflight, cost ceiling → confirm):
+uv run minmax-bench quality run
+# or drive it with flags (skips the wizard); the default is the first 5 recommended
+# tasks (--list-tasks shows all; --tasks 2, --tasks random:8 --seed 42, or a,b):
+uv run minmax-bench quality run -m claude-haiku-4-5 --tasks 5 --milestones --out results/jobs/run1
+uv run minmax-bench quality report --from results/jobs/run1 --tasks 5     # pure display, free
 # also: `quality incremental --session <f> --task <t>` (teacher-forced per-step), `quality judge`.
 # The scripts/ wrappers (`python3 scripts/generate.py …`) still work identically.
 ```
