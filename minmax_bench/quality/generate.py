@@ -392,7 +392,7 @@ def judge_milestones(args, env):
     print(f"[milestones] wrote {mpath}")
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(
         description="generate trajectory data (spends); report.py displays it")
     ap.add_argument("--mode", choices=["full", "incremental", "judge"], default="full",
@@ -446,7 +446,7 @@ def main():
                     help="proxy mode for the incremental 'headroom' arm")
     ap.add_argument("--swechat", default=None, help="SWE-chat jsonl (alternative to --session)")
     ap.add_argument("--conv", type=int, default=0, help="conversation index within --swechat")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.list_tasks:
         for i, t in enumerate(dataset_tasks(args.dataset.split("/", 1)[0]), 1):

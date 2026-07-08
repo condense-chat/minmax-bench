@@ -377,7 +377,7 @@ def render_html(d):
             f"<table><tr>{ths}</tr>{''.join(trs)}</table></body></html>")
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(
         description="display the quality bench (reads generate.py's artifacts)")
     ap.add_argument("--from", default="results/jobs", help="results root produced by generate.py")
@@ -391,7 +391,7 @@ def main():
                          "triggered (marks the task ⊘)")
     ap.add_argument("--format", default="html", choices=["html", "md"])
     ap.add_argument("--out", default=None)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     d = build(args)
     head, rows = table(d)
     widths = [max(len(h), *(len(r[i][0]) for r in rows)) if rows else len(h)

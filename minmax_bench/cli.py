@@ -30,6 +30,48 @@ from .strategies import STRATEGY_MATRIX, default_selected, has_entry, matrix_nam
 app = typer.Typer(add_completion=False, help="Estimated token/cost savings benchmark for agent-session proxies.")
 console = Console()
 
+# ---- quality / trajectory-preservation bench ---------------------------------
+# The cost bench (`run`, `report`, `replay`, …) measures how much a proxy SAVES.
+# The quality bench measures whether the compressed session still does the same
+# work. It lives in minmax_bench.quality; these thin passthrough commands surface
+# it under one entrypoint. Flags pass straight through to the underlying drivers
+# (which own all defaults/validation) — `minmax-bench quality run --help` shows them.
+_PASS = {"allow_extra_args": True, "ignore_unknown_options": True, "help_option_names": []}
+quality_app = typer.Typer(add_completion=False, help="Quality / trajectory-preservation bench.")
+app.add_typer(quality_app, name="quality")
+
+
+@quality_app.command("run", context_settings=_PASS)
+def quality_run(ctx: typer.Context):
+    """Run the agents end-to-end via Harbor and compare trajectories (SPENDS).
+
+    The quality analog of `minmax-bench run`. e.g. `minmax-bench quality run
+    --tasks 5 --arms condense,headroom-ccr --milestones`.
+    """
+    from minmax_bench.quality.generate import main
+    main(["--mode", "full", *ctx.args])
+
+
+@quality_app.command("replay", context_settings=_PASS)
+def quality_replay(ctx: typer.Context):
+    """Teacher-force one --session step-by-step through each arm (SPENDS, paired)."""
+    from minmax_bench.quality.generate import main
+    main(["--mode", "incremental", *ctx.args])
+
+
+@quality_app.command("judge", context_settings=_PASS)
+def quality_judge(ctx: typer.Context):
+    """Run the LLM milestone judge over existing full-mode runs (SPENDS)."""
+    from minmax_bench.quality.generate import main
+    main(["--mode", "judge", *ctx.args])
+
+
+@quality_app.command("report", context_settings=_PASS)
+def quality_report(ctx: typer.Context):
+    """Render the quality bench from stored artifacts — never spends."""
+    from minmax_bench.quality.report import main
+    main(list(ctx.args))
+
 
 def _meta(m) -> dict:
     return {
