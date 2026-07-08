@@ -244,6 +244,10 @@ def incremental(args, env):
     else:
         eng.patch_cwd(tmpl_body, args.template, args.cwd_patch)
         msgs, points = eng.parse_session(args.session)
+        # stub every tool the session references (incl. tool-search-discovered MCP
+        # tools) so a tool-search session doesn't 400 on an unresolved reference
+        tmpl_body["tools"] = eng.build_tools(eng.referenced_tool_names(msgs),
+                                             tmpl_body["tools"])
 
     if "headroom" in arms and not _proxy_up():
         _start_proxy(args.out, args.headroom_mode)

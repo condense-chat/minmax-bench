@@ -364,6 +364,26 @@ def load_swechat(path, idx):
     return msgs, points, rec["model"], used
 
 
+_MCP_TOOL_RE = re.compile(r"mcp__[A-Za-z0-9_]+")
+
+
+def referenced_tool_names(msgs):
+    """Every tool name the messages reference — not just the ones actually CALLED.
+
+    Direct ``tool_use`` names are the obvious set, but sessions that use Claude
+    Code's tool-search feature also reference MCP tools BY NAME inside tool-search
+    results without ever calling them. Anthropic validates every such reference
+    against the request's ``tools`` array (``Tool reference '…' not found in
+    available tools`` → 400), so a replay must stub the search-discovered tools
+    too. tool_use names are collected structurally; mcp__ tools (the only ones
+    surfaced by search in practice) are swept from the serialized content.
+    """
+    names = {b["name"] for m in msgs for b in m.get("content", [])
+             if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name")}
+    names.update(_MCP_TOOL_RE.findall(json.dumps(msgs)))
+    return names
+
+
 def build_tools(used, tmpl_tools):
     """Real template defs for known tools + permissive stubs for the rest (for replay)."""
     by_name = {t["name"]: t for t in tmpl_tools}

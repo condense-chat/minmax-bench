@@ -244,3 +244,23 @@ def test_auth_mode_resolution(monkeypatch):
     assert e.auth_mode({}) == "subscription"
     problems = e.check_arms(["control"], {})
     assert not problems  # subscription satisfies auth
+
+
+def test_referenced_tool_names_includes_search_discovered_mcp():
+    """Tool-search sessions reference MCP tools by name in results without ever
+    calling them; those must still be stubbed or Anthropic 400s on the reference."""
+    msgs = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "ToolSearch", "input": {"query": "resize"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1",
+             "content": "found: mcp__plugin_pw__browser_resize, mcp__plugin_pw__browser_click"}]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "mcp__plugin_pw__browser_click", "input": {}}]},
+    ]
+    names = eng.referenced_tool_names(msgs)
+    assert "ToolSearch" in names                              # direct call
+    assert "mcp__plugin_pw__browser_click" in names           # direct call
+    assert "mcp__plugin_pw__browser_resize" in names          # search-only, never called
+    built = {t["name"] for t in eng.build_tools(names, [])}
+    assert "mcp__plugin_pw__browser_resize" in built          # now stubbed -> no 400

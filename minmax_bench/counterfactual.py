@@ -252,9 +252,11 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     cross_model = replay_model != template_model
     tmpl_body["model"] = replay_model
 
-    # real template defs for CC tools; permissive stubs for mcp__/Skill/etc.
-    used = {b["name"] for m in msgs for b in m["content"] if b.get("type") == "tool_use"}
-    tmpl_body["tools"] = eng.build_tools(used, tmpl_body["tools"])
+    # real template defs for CC tools; permissive stubs for mcp__/Skill/etc. Stub
+    # every tool NAME the session references (incl. tool-search-discovered MCP tools
+    # never directly called), not just the ones actually used — Anthropic 400s on a
+    # reference to a tool absent from the array.
+    tmpl_body["tools"] = eng.build_tools(eng.referenced_tool_names(msgs), tmpl_body["tools"])
 
     args = SimpleNamespace(max_tokens=max_tokens, strip_thinking=cross_model,
                            swechat=None, keep_all_tools=True, drop_beta_config=cross_model)
