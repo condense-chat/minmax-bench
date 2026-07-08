@@ -111,12 +111,16 @@ def pick_session(console: Console) -> Path:
     t.add_column("#", justify="right", style="dim")
     t.add_column("when", style="dim")
     t.add_column("project")
-    t.add_column("size", justify="right")
+    t.add_column("~tok", justify="right")  # rough token estimate, not KB
     t.add_column("first prompt", max_width=52)
     for i, s in enumerate(sessions, 1):
+        # transcript stores each turn once, so bytes/4 ≈ the final-prefix token count
+        # (a rough proxy for peak context) — far more meaningful in the picker than KB
+        tok = s.size / 4
+        est = f"{tok / 1000:.0f}k" if tok >= 1000 else f"{tok:.0f}"
         t.add_row(str(i), datetime.fromtimestamp(s.mtime).strftime("%m-%d %H:%M"),
                   ("…" + s.project[-38:]) if len(s.project) > 39 else s.project,
-                  f"{s.size / 1024:.0f}k", s.prompt or "[dim](no text prompt)[/]")
+                  est, s.prompt or "[dim](no text prompt)[/]")
     console.print(t)
     raw = Prompt.ask("[cyan]session[/] (number or a /path/to/session.jsonl)",
                      console=console).strip()
@@ -416,6 +420,19 @@ def render_summary(summary: dict, console: Console) -> None:
             "[dim]* recorded = what these turns actually consumed when the session ran (its own "
             "model + live caching); the replay rows re-ran the same turns fresh, so compare arms "
             "to control for the counterfactual and to recorded for the backtest anchor.[/]")
+        # replays reconstruct only the tools the session references; the original CC
+        # requests also carried the full system prompt + available tool/MCP catalog
+        # (mostly unused). When that overhead is large the recorded row dwarfs the
+        # replay rows in absolute terms — flag it so the anchor isn't misread.
+        rc = rec.get("avg_ctx_tokens", 0)
+        cc = ctrl.get("avg_ctx_tokens", 0)
+        if rc and cc and cc < 0.75 * rc:
+            console.print(
+                f"[yellow]note:[/] replay context ({cc:,} avg) is well below recorded "
+                f"({rc:,}) — this session's original requests carried a large fixed "
+                f"overhead (system prompt + full tool/MCP catalog) the replay can't "
+                f"reconstruct. The arm-vs-control comparison is unaffected, but don't "
+                f"read absolute cost against the recorded anchor here.")
     if floor is not None:
         console.print(
             f"[dim]control replay agrees with the original {floor:.0%} of the time — that is the "
