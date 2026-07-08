@@ -76,12 +76,27 @@ def _proxy_up():
         return False
 
 
+def _proxy_mode():
+    """The mode a headroom proxy already on HRPORT reports (via /stats), or None."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{HRPORT}/stats", timeout=3) as r:
+            return (json.load(r).get("summary") or {}).get("mode")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _start_proxy(out, mode):
     if _proxy_up():
-        # something already listens on the port — its MODE is unknown, and running the
-        # arm against the wrong mode silently mislabels the results
-        sys.exit(f"port {HRPORT} is already serving a proxy of unknown mode; stop it "
-                 f"(or set HRPORT) before running a headroom arm that needs mode={mode}")
+        # a proxy is already up — reuse it iff it's the mode this arm needs (a leftover
+        # from an earlier run is common); refuse only on a genuine MODE mismatch, which
+        # would silently mislabel results. A reused proxy isn't ours, so we don't stop it.
+        existing = _proxy_mode()
+        if existing == mode:
+            print(f"[headroom] reusing existing {mode}-mode proxy on :{HRPORT}")
+            return None
+        sys.exit(f"port {HRPORT} is serving a {existing or 'unknown'}-mode proxy but this arm "
+                 f"needs mode={mode}; stop it (`kill $(lsof -ti :{HRPORT})`) or set HRPORT.")
     log = open(f"{out}/headroom-{mode}.log", "w")
     # nothing is installed into the user's global environment: if the headroom CLI
     # isn't already on PATH (e.g. project venv), run it via uvx in an isolated,
@@ -184,6 +199,12 @@ def full(args, env):
                 if args.dry_run:
                     print("   " + " ".join(cmd))
                     continue
+                # resume: skip a cell that already has its k finished trials (so a
+                # re-run after an abort fills in only the missing arms, no re-spend).
+                done = len(glob.glob(f"{cell}/*/*/verifier/reward.txt"))
+                if done >= k and not args.force:
+                    print(f"[skip] {arm}/{task} already has {done}/{k} trials (--force to rerun)")
+                    continue
                 # record intent BEFORE running so killed/crashed trials still count as
                 # attempted — report.py uses this to expose survivorship instead of
                 # silently shrinking n (a reward.txt-less trial is a failure, not noise)
@@ -271,8 +292,11 @@ def incremental(args, env):
         tmpl_body["tools"] = eng.build_tools(eng.referenced_tool_names(msgs),
                                              tmpl_body["tools"])
 
-    if "headroom" in arms and not _proxy_up():
-        _start_proxy(args.out, args.headroom_mode)
+    # start a proxy only if we need one and none is up; _start_proxy returns None when
+    # it reuses an existing same-mode proxy, so we only ever stop the one WE started
+    proxy = None
+    if "headroom" in arms:
+        proxy = _start_proxy(args.out, args.headroom_mode)
 
     sel = points[:: max(1, args.every)]
     if args.limit:
@@ -282,12 +306,15 @@ def incremental(args, env):
           f"per arm ({', '.join(arms)}), session {sid}")
     # arms hit independent endpoints with independent budgets — replay them concurrently;
     # steps WITHIN an arm stay sequential (incremental prompt caching needs nested prefixes)
-    with ThreadPoolExecutor(max_workers=len(arms)) as ex:
-        futures = [ex.submit(_replay_arm, arm, msgs, sel, tmpl_body, tmpl_headers,
-                             args, env, sid, os.path.join(out, f"{args.task}-{arm}.jsonl"))
-                   for arm in arms]
-        for fut in futures:
-            print(fut.result())
+    try:
+        with ThreadPoolExecutor(max_workers=len(arms)) as ex:
+            futures = [ex.submit(_replay_arm, arm, msgs, sel, tmpl_body, tmpl_headers,
+                                 args, env, sid, os.path.join(out, f"{args.task}-{arm}.jsonl"))
+                       for arm in arms]
+            for fut in futures:
+                print(fut.result())
+    finally:
+        _stop_proxy(proxy)  # always close the proxy we started (no-op if reused/none)
 
 
 # ------------------------------------------------------------------ milestone judge (LLM, gen-side)
@@ -455,6 +482,8 @@ def main(argv=None):
     ap.add_argument("--milestones", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the Harbor commands without running")
+    ap.add_argument("--force", action="store_true",
+                    help="re-run cells that already have their k trials (default: skip them)")
     # incremental
     ap.add_argument("--session", help="reference trajectory jsonl (incremental mode)")
     ap.add_argument("--task", default=None,
