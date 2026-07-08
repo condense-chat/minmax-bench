@@ -206,9 +206,12 @@ def check_arms(arms, env):
             problems.append(f"arm {arm!r} has no replay endpoint "
                             f"(known: {', '.join(sorted(ARMS))})")
     if not auth_mode(env):
-        problems.append("no auth found — set ANTHROPIC_API_KEY (API billing) or be "
-                        "logged in to Claude Code (subscription auth is used "
-                        "automatically)")
+        problems.append(
+            "no auth found. Either:\n"
+            "    - set ANTHROPIC_API_KEY (API billing), or\n"
+            "    - use your Claude Code subscription: run `claude setup-token` and\n"
+            "      `export CLAUDE_CODE_OAUTH_TOKEN=<the printed token>` "
+            "(it is not persisted where the bench can read it otherwise)")
     if any(ARMS.get(a, {}).get("condense_auth") for a in arms) and not env.get("CONDENSE_API_KEY"):
         problems.append("CONDENSE_API_KEY missing — needed for the condense arm")
     return problems
