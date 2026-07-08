@@ -126,6 +126,27 @@ def _stop_proxy(p):
             log.close()
 
 
+def _reap_docker():
+    """Remove leftover harbor trial containers/networks. Harbor cleans up after a
+    NORMAL trial, but a killed/aborted/crashed run leaks its `<task>__<id>__env*`
+    containers and networks — which exhaust Docker's address pools over time. Harbor
+    names EVERY trial resource with the `__env` marker, so that pattern targets only
+    harbor's leftovers (k3d clusters, user projects, and defaults don't match).
+    Best-effort: silent if Docker is absent."""
+    if not shutil.which("docker"):
+        return
+    reaped = 0
+    kinds = ((["ps", "-aq"], ["rm", "-f"]), (["network", "ls", "-q"], ["network", "rm"]))
+    for lister, remover in kinds:
+        ids = subprocess.run(["docker", *lister, "--filter", "name=__env"],
+                             capture_output=True, text=True).stdout.split()
+        if ids:
+            subprocess.run(["docker", *remover, *ids], capture_output=True)
+            reaped += len(ids)
+    if reaped:
+        print(f"[cleanup] removed {reaped} leftover harbor docker container(s)/network(s)")
+
+
 def _agent_auth_env(env):
     """Harbor --ae args so the container's Claude Code authenticates. Prefer an API
     key if configured; otherwise forward the user's Claude Code SUBSCRIPTION token
@@ -195,6 +216,13 @@ def full(args, env):
         if missing:
             sys.exit(f"[preflight] blocked by: {', '.join(missing)} — fix and re-run "
                      f"(nothing spent).")
+        # never leave a dead docker trail: reap harbor's leftover trial containers/
+        # networks on exit — normal, exception, or Ctrl-C (atexit) and kill (SIGTERM).
+        # (harbor cleans up healthy trials; this catches aborted/crashed ones.)
+        import atexit
+        import signal
+        atexit.register(_reap_docker)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # -> SystemExit -> atexit
     org = args.dataset.split("/", 1)[0]
     tasks = resolve_tasks(args.tasks, org, args.seed)
     out = args.out
