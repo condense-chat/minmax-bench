@@ -1,16 +1,18 @@
-"""Counterfactual replay of a *local* Claude Code session through compaction arms.
+"""Rich incremental replay of a *local* session — the engine behind
+``minmax-bench quality incremental`` (formerly the ``counterfactual`` command).
 
 Answers "how would my session have played out under condense/headroom?" the only way
 that is honest without re-executing tools on the user's machine: teacher-forced
-per-step replay (the same engine as ``scripts/generate.py --mode incremental``).
-At every assistant decision point the recorded prefix is sent through each arm's
-endpoint and the replayed next action is scored against what actually happened.
-Control (api.anthropic.com, no compaction) is always replayed too — it is the
-noise floor; an arm only "diverges" to the extent it falls below that floor.
+per-step replay. At every assistant decision point the recorded prefix is sent
+through each arm's endpoint and the replayed next action is scored against what
+actually happened. Control (api.anthropic.com, no compaction) is always replayed
+too — it is the noise floor; an arm only "diverges" to the extent it falls below it.
 
 This module is glue + display: session discovery under ``~/.claude/projects``,
-cost preview, privacy notice, and a rich summary. All replay mechanics live in
-``minmax_bench/quality/engine.py`` (single source of truth).
+model auto-fallback, cost preview, privacy notice, and a rich summary with the
+recorded backtest anchor. It writes ``<out>/incremental/<task>-<arm>.jsonl`` so
+``quality report`` can join it with full-mode runs. All replay MECHANICS live in
+``minmax_bench/quality/engine.py`` (the single stdlib source of truth).
 """
 
 from __future__ import annotations
@@ -201,7 +203,7 @@ def estimate_usd(msgs, points, price) -> tuple[float, float]:
 # --------------------------------------------------------------------------- replay
 def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, every: int,
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,
-           model: str | None = None, auth: str = "auto") -> dict:
+           model: str | None = None, auth: str = "auto", task: str = "session") -> dict:
     env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
     if auth == "subscription":
         # force the Claude Code login path even when an API key is configured
@@ -302,15 +304,18 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         f"[bold]rough cost/arm[/] ${lo:.2f}–${hi:.2f} (capped at ${budget_usd:.2f} each)\n"
         f"[yellow]this sends your session content to api.anthropic.com"
         f"{' and api.condense.chat' if 'condense' in arms else ''}[/]",
-        title="counterfactual replay", border_style="cyan"))
+        title="incremental replay", border_style="cyan"))
     if not assume_yes and not Confirm.ask("[cyan]replay it?[/]", default=False, console=console):
         raise SystemExit(0)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # write per-arm jsonl under <out>/incremental/<task>-<arm>.jsonl (control included) so
+    # `minmax-bench quality report --from <out>` can join these with full-mode runs
+    inc_dir = out_dir / "incremental"
+    inc_dir.mkdir(parents=True, exist_ok=True)
     sid = str(uuid.uuid4())
     summary: dict = {"session": str(session), "model": replay_model, "steps": len(sel), "arms": {}}
     for arm in all_arms:
-        path = out_dir / f"{arm}.jsonl"
+        path = inc_dir / f"{task}-{arm}.jsonl"
         spent, n_ok, n_action, n_exact, ctx_total = 0.0, 0, 0, 0, 0
         n_err, first_err, ctx_series = 0, None, []
         with path.open("w") as f, Progress(

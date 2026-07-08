@@ -66,7 +66,7 @@ below keep working on a bare `python3` from a fresh clone.
 | file | side | role |
 |---|---|---|
 | `minmax_bench/quality/generate.py` | generate | the one generation command (full + incremental + milestone judge) |
-| `minmax_bench/quality/engine.py` | generate | library: session I/O, request building, scoring, pricing — imported by generate, report (parser only) and `minmax-bench counterfactual` |
+| `minmax_bench/quality/engine.py` | generate | library: session I/O, request building, scoring, pricing — imported by generate, report (parser only) and `quality incremental` |
 | `minmax_bench/quality/report.py` | display | reads artifacts → html/md; never spends |
 | `harbor_agents/headroom_ccr_claude_code.py` | generate | self-contained CCR wiring for the `headroom-ccr` arm (preserves base MCP servers) |
 | `tests/test_quality.py` | — | unit tests for the metric code (`uv run pytest`) |
@@ -78,7 +78,7 @@ below keep working on a bare `python3` from a fresh clone.
 front-end (interactive picker, cost preview, cross-model thinking handling, summary table) is:
 
 ```bash
-uv run minmax-bench counterfactual        # wraps this engine; see minmax_bench/counterfactual.py
+uv run minmax-bench quality incremental   # rich replay of your own sessions (wraps this engine)
 ```
 
 ## End to end

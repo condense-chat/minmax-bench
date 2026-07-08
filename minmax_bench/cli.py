@@ -86,13 +86,10 @@ def quality_run(
         except (KeyboardInterrupt, EOFError):
             console.print("[yellow]aborted.[/]")
             raise typer.Exit(1) from None
-        from minmax_bench.quality.generate import main
         if w.mode == "incremental":
-            iargv = ["--mode", "incremental", "--arms", w.arms, "--session", w.session,
-                     "--task", w.task, "--out", w.out, "--budget-usd", str(w.budget_usd),
-                     "--every", str(w.every), "--limit", str(w.limit)]
-            _flag(iargv, "--model", w.model)
-            main(iargv)
+            _run_incremental(session=w.session, arms=w.arms, model=w.model, every=w.every,
+                             limit=w.limit, budget_usd=w.budget_usd, max_tokens=6000,
+                             out=w.out, task=w.task, auth="auto", assume_yes=True)
             return
         arms, tasks, model, k, budget_usd, milestones, out = (
             w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out)
@@ -127,21 +124,61 @@ def quality_report(
     main(argv)
 
 
-# `incremental` (teacher-forced per-step) is the paired counterpart to `run`'s full
-# trajectories; it and `judge` take many niche flags, so pass through to the driver,
-# which owns their help. `minmax-bench quality incremental --help` shows them.
-_PASS = {"allow_extra_args": True, "ignore_unknown_options": True, "help_option_names": []}
+def _run_incremental(*, session: str | None, arms: str, model: str | None, every: int,
+                     limit: int, budget_usd: float, max_tokens: int, out: str, task: str,
+                     auth: str, assume_yes: bool) -> None:
+    """Rich teacher-forced replay of one session — picker when no --session, model
+    auto-fallback, cost preview, per-arm progress, and a summary table with the
+    recorded backtest anchor. Writes <out>/incremental/<task>-<arm>.jsonl for report."""
+    from .counterfactual import pick_session, render_summary, replay
+    sp = Path(session).expanduser() if session else pick_session(console)
+    if not sp.is_file():
+        raise typer.BadParameter(f"not a session file: {sp}")
+    arm_list = [a.strip() for a in arms.split(",") if a.strip() and a.strip() != "control"]
+    try:
+        summary = replay(sp, arm_list, budget_usd=budget_usd, limit=limit, every=every,
+                         max_tokens=max_tokens, out_dir=Path(out), console=console,
+                         assume_yes=assume_yes, model=model, auth=auth, task=task)
+    except SystemExit as e:
+        raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
+    render_summary(summary, console)
+    console.print(f"[green]artifacts[/] {out}/incremental/  ([dim]report:[/] "
+                  f"minmax-bench quality report --from {out} --tasks {task} --arms {arms})")
 
 
-@quality_app.command("incremental", context_settings=_PASS)
-def quality_incremental(ctx: typer.Context):
+@quality_app.command("incremental")
+def quality_incremental(
+    session: str | None = typer.Argument(None, help="A session .jsonl (default: pick from ~/.claude/projects)."),
+    arms: str = typer.Option("condense", "--arms", help="Arms to replay besides control (condense, headroom)."),
+    model: str | None = typer.Option(None, "--model", "-m", help="Replay model (default: the session's own, with auto-fallback if an arm can't serve it)."),
+    every: int = typer.Option(1, "--every", help="Sample every Nth decision point."),
+    limit: int = typer.Option(0, "--limit", "-n", help="Max decision points (0 = all)."),
+    budget_usd: float = typer.Option(2.0, "--budget-usd", help="Per-arm spend cap (control included)."),
+    max_tokens: int = typer.Option(6000, "--max-tokens", help="Replay output cap per step."),
+    out: str | None = typer.Option(None, "--out", help="Output dir (default results/incremental/<session>-<ts>)."),
+    task: str = typer.Option("session", "--task", help="Task label for the report join."),
+    auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force the Claude Code login)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+):
     """Incremental (teacher-forced per-step) trajectories — the paired counterpart
-    to `run`'s full trajectories. Replays one --session through each arm (SPENDS)."""
-    from minmax_bench.quality.generate import main
-    main(["--mode", "incremental", *ctx.args])
+    to `run`'s full trajectories. Replays one session through control + each arm,
+    with the session's own model (auto-falling back if an arm can't serve it), a
+    cost preview, and a summary table incl. the recorded backtest anchor (SPENDS).
+
+    This is what used to be the `counterfactual` command — replay YOUR own sessions.
+    """
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    stem = Path(session).stem[:8] if session else "picked"
+    out_dir = out or str(Path("results/incremental") / f"{stem}-{stamp}")
+    _run_incremental(session=session, arms=arms, model=model, every=every, limit=limit,
+                     budget_usd=budget_usd, max_tokens=max_tokens, out=out_dir, task=task,
+                     auth=auth, assume_yes=yes)
 
 
-@quality_app.command("judge", context_settings=_PASS)
+# judge takes niche flags; pass through to the driver (which owns its --help)
+@quality_app.command("judge", context_settings={"allow_extra_args": True,
+                                                 "ignore_unknown_options": True,
+                                                 "help_option_names": []})
 def quality_judge(ctx: typer.Context):
     """Run the LLM milestone judge over existing full-mode runs (SPENDS)."""
     from minmax_bench.quality.generate import main
@@ -362,45 +399,6 @@ def fetch_cmd(
     t = time.time()
     sessions = _load_swe_chat_cached(limit, force=True)
     console.print(f"[green]cached[/] {len(sessions)} sessions -> {path} ({time.time() - t:.0f}s)")
-
-
-@app.command("counterfactual")
-def counterfactual_cmd(
-    session: str | None = typer.Argument(None, help="A Claude Code session .jsonl (default: pick interactively from ~/.claude/projects)."),
-    arms: str = typer.Option("condense", "--arms", help="Comma list of arms to replay besides control (condense, headroom)."),
-    budget_usd: float = typer.Option(2.0, "--budget-usd", help="Max spend per arm (control included)."),
-    limit: int = typer.Option(0, "--limit", "-n", help="Max decision points to replay (0 = all)."),
-    every: int = typer.Option(1, "--every", help="Replay every Nth decision point."),
-    max_tokens: int = typer.Option(6000, "--max-tokens", help="Replay output cap per step."),
-    model: str | None = typer.Option(None, "--model", help="Override the replay model (default: the session's own model)."),
-    out: str | None = typer.Option(None, "--out", help="Output dir (default results/counterfactual/<session>-<ts>)."),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
-    auth: str = typer.Option("auto", "--auth",
-                             help="auto (api key if configured, else Claude Code login) | "
-                                  "api-key | subscription (force the Claude Code login path)"),
-):
-    """Replay one of YOUR local Claude Code sessions through condense/headroom, step by step.
-
-    Teacher-forced counterfactual: at every decision point the recorded prefix is sent
-    through each arm and the next action is compared to what actually happened, next to
-    a control replay (the noise floor). Costs real money; shows an estimate first.
-    """
-    from .counterfactual import pick_session, render_summary, replay
-
-    sp = Path(session).expanduser() if session else pick_session(console)
-    if not sp.is_file():
-        raise typer.BadParameter(f"not a session file: {sp}")
-    arm_list = [a.strip() for a in arms.split(",") if a.strip()]
-    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    out_dir = Path(out) if out else Path("results/counterfactual") / f"{sp.stem[:8]}-{stamp}"
-    try:
-        summary = replay(sp, arm_list, budget_usd=budget_usd, limit=limit, every=every,
-                         max_tokens=max_tokens, out_dir=out_dir, console=console,
-                         assume_yes=yes, model=model, auth=auth)
-    except SystemExit as e:
-        raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
-    render_summary(summary, console)
-    console.print(f"[green]artifacts[/] {out_dir}/  (per-step jsonl + summary.json)")
 
 
 @app.command("strategies")
