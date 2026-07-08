@@ -200,10 +200,45 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     if meta["cwd"]:
         eng.patch_cwd(tmpl_body, str(template_path), meta["cwd"])
 
-    # replay on the session's own model so recorded thinking signatures stay valid;
-    # on any other model, thinking blocks must be stripped and beta config dropped.
+    # replay on the session's own model (auto-detected) so recorded thinking
+    # signatures stay valid; on any other model, thinking is stripped + beta config dropped.
     replay_model = model or meta["model"] or tmpl_body["model"]
-    cross_model = replay_model != tmpl_body["model"]
+    template_model = tmpl_body["model"]
+    all_arms = ["control"] + arms
+
+    # preflight every arm with a ~30-token probe BEFORE any real spend: a broken arm
+    # (bad key, gateway incompatibility with the replay model, dead proxy) must abort
+    # here, not after the control arm has already burned the budget. If an arm rejects
+    # the session's model, auto-detect a fallback that every arm can serve.
+    def _preflight(m):
+        probe = {"model": m, "max_tokens": 16, "stream": True,
+                 "messages": [{"role": "user", "content": "Say ok."}]}
+        for arm in all_arms:
+            _, err = eng.call_api(arm, probe, tmpl_headers, env)
+            if err:
+                return arm, err
+        return None, None
+
+    bad_arm, err = _preflight(replay_model)
+    if bad_arm:
+        console.print(f"[yellow]{bad_arm} can't serve {replay_model}[/] (the session's own "
+                      f"model): [dim]{err[:200]}[/]")
+        fallbacks = [m for m in (template_model, "claude-sonnet-4-6") if m != replay_model]
+        fb = next((m for m in dict.fromkeys(fallbacks) if _preflight(m) == (None, None)), None)
+        if not fb:
+            console.print("[red]no fallback model passed preflight for every arm — aborting "
+                          "before any replay spend (try --model explicitly).[/]")
+            raise SystemExit(1)
+        console.print(f"[yellow]falling back to {fb} for ALL arms[/] — the comparison stays "
+                      f"paired; recorded thinking blocks will be stripped (cross-model).")
+        if not assume_yes and not Confirm.ask(f"[cyan]replay on {fb}?[/]", default=True,
+                                              console=console):
+            raise SystemExit(0)
+        replay_model = fb
+    else:
+        console.print(f"[dim]preflight ok: {', '.join(all_arms)} respond on {replay_model}[/]")
+
+    cross_model = replay_model != template_model
     tmpl_body["model"] = replay_model
 
     # real template defs for CC tools; permissive stubs for mcp__/Skill/etc.
@@ -217,22 +252,6 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     if limit:
         sel = sel[:limit]
     lo, hi = estimate_usd(msgs, [i for i in sel], eng.rates_for(replay_model))
-    all_arms = ["control"] + arms
-
-    # preflight every arm with a ~30-token probe BEFORE any real spend: a broken arm
-    # (bad key, gateway incompatibility with the replay model, dead proxy) must abort
-    # here, not after the control arm has already burned the budget
-    probe = {"model": replay_model, "max_tokens": 16, "stream": True,
-             "messages": [{"role": "user", "content": "Say ok."}]}
-    for arm in all_arms:
-        _, err = eng.call_api(arm, probe, tmpl_headers, env)
-        if err:
-            console.print(f"[red]{arm} failed preflight on {replay_model}[/] — aborting "
-                          f"before any replay spend.\n[dim]{err[:300]}[/]\n"
-                          f"[dim]hint: if the arm's gateway rejects this model, retry with "
-                          f"--model <model it supports>[/]")
-            raise SystemExit(1)
-    console.print(f"[dim]preflight ok: {', '.join(all_arms)} respond on {replay_model}[/]")
 
     console.print(Panel.fit(
         f"[bold]session[/] {session.name}   [bold]decision points[/] {len(sel)}/{len(points)}"
