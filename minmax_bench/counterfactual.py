@@ -48,42 +48,62 @@ class LocalSession:
     size: int
     prompt: str           # first user text, for the picker
     cwd: str | None
+    peak_ctx: int         # peak per-request context tokens the session actually used
 
 
-def _peek(path: Path, max_lines: int = 300) -> tuple[str, str | None, bool]:
-    """(first user prompt snippet, cwd, has_assistant) from the head of a session file."""
-    prompt, cwd, has_assistant = "", None, False
+# cap the per-file read that computes peak context, so a multi-GB transcript
+# doesn't stall the picker; capped reads mark the estimate with a '~'
+_PEEK_BYTE_CAP = 12_000_000
+
+
+def _peek(path: Path, max_lines: int = 300) -> tuple[str, str | None, bool, int, bool]:
+    """(prompt, cwd, has_assistant, peak_ctx, capped) from a session file.
+
+    peak_ctx is the largest per-request context (input + cache read + cache write)
+    across the session's assistant turns — the number that decides whether a replay
+    would ever cross a compaction threshold. Only lines containing a usage block are
+    parsed, and the read stops at _PEEK_BYTE_CAP so giant transcripts stay cheap.
+    """
+    prompt, cwd, has_assistant, peak, capped, read = "", None, False, 0, False, 0
     try:
         with path.open(encoding="utf-8") as fh:
             for n, line in enumerate(fh):
-                if n >= max_lines and (prompt and cwd and has_assistant):
+                read += len(line)
+                if read > _PEEK_BYTE_CAP:
+                    capped = True
                     break
+                head = n < max_lines
+                if '"usage"' not in line and not head:
+                    continue  # cheap skip: only usage lines (and the head) need parsing
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
                 if rec.get("isSidechain"):
-                    return "", None, False  # sub-agent transcript, not a user session
-                cwd = cwd or rec.get("cwd")
-                t = rec.get("type")
-                if t == "assistant":
+                    return "", None, False, 0, False  # sub-agent transcript
+                if head:
+                    cwd = cwd or rec.get("cwd")
+                    if rec.get("type") == "assistant":
+                        has_assistant = True
+                    if rec.get("type") == "user" and not prompt:
+                        c = rec.get("message", {}).get("content")
+                        if isinstance(c, str):
+                            text = c
+                        elif isinstance(c, list):
+                            text = next((b.get("text", "") for b in c
+                                         if isinstance(b, dict) and b.get("type") == "text"), "")
+                        else:
+                            text = ""
+                        if text and not text.lstrip().startswith("<"):
+                            prompt = text
+                u = rec.get("message", {}).get("usage") if rec.get("type") == "assistant" else None
+                if isinstance(u, dict):
                     has_assistant = True
-                if t == "user" and not prompt:
-                    c = rec.get("message", {}).get("content")
-                    if isinstance(c, str):
-                        text = c
-                    elif isinstance(c, list):
-                        text = next((b.get("text", "") for b in c
-                                     if isinstance(b, dict) and b.get("type") == "text"), "")
-                    else:
-                        text = ""
-                    if text and not text.lstrip().startswith("<"):  # skip harness-injected tags
-                        prompt = text
-                if prompt and cwd and has_assistant and n >= max_lines:
-                    break
+                    peak = max(peak, u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                               + u.get("cache_creation_input_tokens", 0))
     except OSError:
-        return "", None, False
-    return " ".join(prompt.split())[:90], cwd, has_assistant
+        return "", None, False, 0, False
+    return " ".join(prompt.split())[:90], cwd, has_assistant, peak, capped
 
 
 def scan_sessions(root: Path = CC_PROJECTS, limit: int = 25) -> list[LocalSession]:
@@ -92,14 +112,22 @@ def scan_sessions(root: Path = CC_PROJECTS, limit: int = 25) -> list[LocalSessio
     for f in sorted(root.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
         if len(found) >= limit:
             break
-        prompt, cwd, has_assistant = _peek(f)
+        prompt, cwd, has_assistant, peak, capped = _peek(f)
         if not has_assistant:
             continue
         found.append(LocalSession(
             path=f, project=cwd or f.parent.name,  # cwd is exact; the dir name is a lossy slug
             mtime=f.stat().st_mtime, size=f.stat().st_size, prompt=prompt, cwd=cwd,
+            peak_ctx=peak if not capped else -peak,  # negative marks a capped (lower-bound) read
         ))
     return found
+
+
+def _fmt_ctx(peak: int) -> str:
+    """Peak context tokens for the picker; a capped read (peak < 0) shows '≥'."""
+    v = abs(peak)
+    body = f"{v / 1000:.0f}k" if v >= 1000 else str(v)
+    return (">" + body) if peak < 0 else body
 
 
 def pick_session(console: Console) -> Path:
@@ -111,16 +139,12 @@ def pick_session(console: Console) -> Path:
     t.add_column("#", justify="right", style="dim")
     t.add_column("when", style="dim")
     t.add_column("project")
-    t.add_column("~tok", justify="right")  # rough token estimate, not KB
+    t.add_column("peak ctx", justify="right")  # peak per-request context tokens actually used
     t.add_column("first prompt", max_width=52)
     for i, s in enumerate(sessions, 1):
-        # transcript stores each turn once, so bytes/4 ≈ the final-prefix token count
-        # (a rough proxy for peak context) — far more meaningful in the picker than KB
-        tok = s.size / 4
-        est = f"{tok / 1000:.0f}k" if tok >= 1000 else f"{tok:.0f}"
         t.add_row(str(i), datetime.fromtimestamp(s.mtime).strftime("%m-%d %H:%M"),
                   ("…" + s.project[-38:]) if len(s.project) > 39 else s.project,
-                  est, s.prompt or "[dim](no text prompt)[/]")
+                  _fmt_ctx(s.peak_ctx), s.prompt or "[dim](no text prompt)[/]")
     console.print(t)
     raw = Prompt.ask("[cyan]session[/] (number or a /path/to/session.jsonl)",
                      console=console).strip()

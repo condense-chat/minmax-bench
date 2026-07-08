@@ -264,3 +264,20 @@ def test_referenced_tool_names_includes_search_discovered_mcp():
     assert "mcp__plugin_pw__browser_resize" in names          # search-only, never called
     built = {t["name"] for t in eng.build_tools(names, [])}
     assert "mcp__plugin_pw__browser_resize" in built          # now stubbed -> no 400
+
+
+def test_peek_reports_peak_context(tmp_path):
+    from minmax_bench.counterfactual import _peek
+    sess = tmp_path / "s.jsonl"
+    lines = [
+        {"type": "user", "message": {"content": "hi"}},
+        {"type": "assistant", "message": {"usage": {"input_tokens": 10,
+                                                    "cache_read_input_tokens": 5000}}},
+        {"type": "assistant", "message": {"usage": {"input_tokens": 20,
+                                                    "cache_read_input_tokens": 40000}}},  # peak
+        {"type": "assistant", "message": {"usage": {"input_tokens": 20,
+                                                    "cache_read_input_tokens": 8000}}},  # after
+    ]
+    sess.write_text("\n".join(json.dumps(x) for x in lines))
+    prompt, cwd, has_assistant, peak, capped = _peek(sess)
+    assert has_assistant and peak == 40020 and not capped  # peak, not last, not first
