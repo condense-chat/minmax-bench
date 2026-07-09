@@ -48,6 +48,10 @@ UTC = timezone.utc  # noqa: UP017  (scripts run on system python3, may be 3.10)
 # (token-mode compression with NO retrieval). Both need a token-mode proxy.
 HEADROOM_MODES = {"headroom": "token", "headroom-kompress": "token"}
 
+# the harbor child currently running (for cleanup on interrupt) — a 1-slot box so
+# the signal handler / atexit reaper can terminate it before removing its network
+_HARBOR = [None]
+
 # ------------------------------------------------------------------ FULL: drive Harbor per arm/task
 def _arm_wiring(arm, env):
     """(base_url, allow_host, harbor_agent, extra_flags) for an arm — how a real user deploys it."""
@@ -135,6 +139,15 @@ def _reap_docker():
     Best-effort: silent if Docker is absent."""
     if not shutil.which("docker"):
         return
+    # if a harbor child is still tearing down its trial, terminate + wait for it first
+    # — otherwise its network is still 'in use', `network rm` skips it, and it dangles
+    proc = _HARBOR[0]
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
     reaped = 0
     kinds = ((["ps", "-aq"], ["rm", "-f"]), (["network", "ls", "-q"], ["network", "rm"]))
     for lister, remover in kinds:
@@ -298,13 +311,25 @@ def full(args, env):
                 # otherwise slow arms systematically lose their later trials.
                 # subprocess timeout (not the GNU `timeout` binary) — stock macOS has none.
                 with open(f"{out}/_runlog.txt", "a") as runlog:
+                    # tracked Popen (not subprocess.run) so an interrupt/timeout can
+                    # terminate this harbor child and wait for its container/network
+                    # teardown BEFORE the reaper runs
+                    proc = subprocess.Popen(cmd, env=renv, stdout=runlog,
+                                            stderr=subprocess.STDOUT)
+                    _HARBOR[0] = proc
                     try:
-                        subprocess.run(cmd, env=renv, stdout=runlog, stderr=subprocess.STDOUT,
-                                       timeout=args.wall_timeout * k)
+                        proc.wait(timeout=args.wall_timeout * k)
                     except subprocess.TimeoutExpired:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=20)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
                         print(f"[timeout] {arm}/{task} killed after "
                               f"{args.wall_timeout * k}s — partial trials recorded",
                               file=sys.stderr)
+                    finally:
+                        _HARBOR[0] = None
         finally:
             _stop_proxy(proxy)
     if args.milestones and not args.dry_run:
