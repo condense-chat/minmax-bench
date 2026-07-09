@@ -329,8 +329,9 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
             console.print(f"[green]captured[/] exact system prompt + "
                           f"{len(captured['tools'])} tools from the binary — no approximation")
         else:
-            console.print("[yellow]capture failed (binary/version missing or timed out) — "
-                          "falling back to the approximate template[/]")
+            why = getattr(eng.capture_cc_request, "last_error", "")
+            console.print(f"[yellow]capture failed — falling back to the approximate "
+                          f"template[/]{(' [dim](' + why + ')[/]') if why else ''}")
     if not captured:
         # real template defs for CC tools; permissive stubs for mcp__/Skill/etc. Stub
         # every tool NAME the session references (incl. tool-search-discovered MCP tools

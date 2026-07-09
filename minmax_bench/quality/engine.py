@@ -436,11 +436,12 @@ def _canned_sse(model):
     return "".join(f"event: {e}\ndata: {json.dumps(d)}\n\n" for e, d in evs).encode()
 
 
-def capture_cc_request(cwd, model=None, version=None, port=8791, timeout=90):
+def capture_cc_request(cwd, model=None, version=None, port=0, timeout=90):
     """Run the version-matched CC binary once in `cwd` against a local capture proxy and
     return the EXACT request it builds (system, tools, thinking/context_management/…), or
     None. Nothing leaves the machine: the proxy returns a canned response so `claude -p`
     exits. `model` is passed to `--model` so the config matches the session's model.
+    port=0 asks the OS for a FREE ephemeral port, so a stray listener never fails capture.
     Reads the user's own binary — the CALLER must have obtained consent."""
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -484,23 +485,29 @@ def capture_cc_request(cwd, model=None, version=None, port=8791, timeout=90):
             self.wfile.write(b)
 
     try:
-        srv = HTTPServer(("127.0.0.1", port), H)
+        srv = HTTPServer(("127.0.0.1", port), H)  # port=0 -> OS assigns a free one
     except OSError:
         return None
+    actual_port = srv.server_address[1]
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
+    err = ""
     try:
         cmd = [binary, "-p", "reply with just: OK"]
         if model:
             cmd += ["--model", model]
-        renv = {**os.environ, "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}"}
-        subprocess.run(cmd, cwd=cwd, env=renv, timeout=timeout, capture_output=True)
-    except (subprocess.SubprocessError, OSError):
-        pass
+        renv = {**os.environ, "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{actual_port}"}
+        r = subprocess.run(cmd, cwd=cwd, env=renv, timeout=timeout, capture_output=True, text=True)
+        err = (r.stderr or "")[-300:]
+    except subprocess.TimeoutExpired:
+        err = f"timed out after {timeout}s (MCP connect? re-run, or it falls back to template)"
+    except (subprocess.SubprocessError, OSError) as e:
+        err = str(e)[:300]
     finally:
         srv.shutdown()
         t.join(timeout=3)
     if not captured:
+        capture_cc_request.last_error = err or "no request captured"  # surfaced by the caller
         return None
     return max(captured, key=lambda r: len(r.get("tools", [])))  # the turn with the catalog
 
