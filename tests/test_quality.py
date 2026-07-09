@@ -346,3 +346,24 @@ def test_ensure_reminders_skips_when_already_present():
         {"type": "text", "text": "<system-reminder># claudeMd\ny</system-reminder>"},
         {"type": "text", "text": "hi"}]}]
     assert eng.ensure_reminders(already, rem) is already  # no duplication
+
+
+def test_judge_action_quality_parses_verdict(monkeypatch):
+    import minmax_bench.quality.engine as e
+    monkeypatch.setattr(e, "call_api",
+                        lambda *a, **k: ({"content": [{"text": '{"quality":"degraded"}'}]}, None))
+    assert e.judge_action_quality("fix the bug", None,
+                                  tool("Bash", command="ls"), {}) == "degraded"
+    monkeypatch.setattr(e, "call_api",
+                        lambda *a, **k: ({"content": [{"text": 'garbage'}]}, None))
+    assert e.judge_action_quality("t", None, {}, {}) is None  # unparseable -> None, not crash
+
+
+def test_step_verdict_prefers_goal_quality():
+    from minmax_bench import counterfactual as cf
+    # a structural disagreement that the goal judge rates 'good' -> shows good
+    rec = {"step": 0, "orig": tool("Read", file_path="/a"), "replay": tool("Bash", command="rg x"),
+           "agree_action": False, "sim": 0.0, "quality": "good"}
+    assert cf._step_verdict(rec) == "good"
+    rec["quality"] = "bad"
+    assert cf._step_verdict(rec) == "bad"

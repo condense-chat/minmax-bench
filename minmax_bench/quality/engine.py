@@ -791,3 +791,57 @@ def judge_equivalent(orig, replay, env, task_hint=""):
         return bool(json.loads(t[t.index("{"): t.rindex("}") + 1]).get("equivalent"))
     except (ValueError, json.JSONDecodeError):
         return None
+
+
+def _situation_text(msg):
+    """Short digest of the message the agent is reacting to (the last tool_result /
+    user turn) — the situation context the goal judge needs."""
+    if not isinstance(msg, dict):
+        return ""
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    parts = []
+    for b in c or []:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "tool_result":
+            tc = b.get("content")
+            parts.append(tc if isinstance(tc, str) else json.dumps(tc))
+        elif b.get("type") == "text":
+            parts.append(b.get("text", ""))
+    return " ".join(parts)
+
+
+_GOAL_PROMPT = (
+    "You are rating whether a coding agent's NEXT ACTION is a good step toward its task, "
+    "given the situation. Judge the action ON ITS OWN MERITS — a valid alternative to what "
+    "some other agent might do is still 'good'. Do NOT compare it to any reference action.\n"
+    "  good     = a sensible, productive step toward the task\n"
+    "  degraded = works but is redundant, suboptimal, or slightly confused\n"
+    "  bad      = wrong target, unproductive, hallucinated, or gives up prematurely\n"
+    "TASK:\n{task}\n"
+    "SITUATION (what it is reacting to):\n{situation}\n"
+    "PROPOSED NEXT ACTION:\n{action}\n"
+    'Return ONLY JSON {{"quality":"good"|"degraded"|"bad"}}.')
+
+
+def judge_action_quality(task, situation, action, env):
+    """Goal-based per-step judge: is this action a good/degraded/bad step toward the TASK,
+    on its own merits (not vs the original)? Returns 'good'|'degraded'|'bad' or None. This
+    is robust to valid divergence — a different-but-fine action scores 'good' — so control
+    (no compaction) scores near-100% and the signal is whether an arm takes WORSE steps."""
+    prompt = _GOAL_PROMPT.format(task=(task or "")[:500],
+                                 situation=_situation_text(situation)[:600],
+                                 action=_action_text(action))
+    req = {"model": JUDGE_MODEL, "max_tokens": 40, "temperature": 0,
+           "messages": [{"role": "user", "content": prompt}]}
+    resp, err = call_api("control", req, {"anthropic-version": "2023-06-01"}, env)
+    if err:
+        return None
+    t = "".join(b.get("text", "") for b in resp.get("content", [])).strip()
+    try:
+        q = json.loads(t[t.index("{"): t.rindex("}") + 1]).get("quality")
+        return q if q in ("good", "degraded", "bad") else None
+    except (ValueError, json.JSONDecodeError):
+        return None

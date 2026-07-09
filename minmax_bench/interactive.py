@@ -404,7 +404,7 @@ class QualityWizardResult:
     task: str = "session"
     every: int = 1
     limit: int = 0
-    judge: bool = False
+    judge: str = "off"
     capture: bool = False
 
 
@@ -595,12 +595,15 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         border_style="cyan"))
     capture = Confirm.ask("[cyan]capture the exact request from your Claude Code binary?[/]",
                           default=True, console=console)
-    # per-step scoring: structural match is free; the LLM judge upgrades near-misses
-    # (grep vs rg, a differently-spelled same command) from ✗ bad to ✓ good, for a
-    # small extra cost (one cheap call per structural disagreement)
-    judge = Confirm.ask("[cyan]use the LLM equivalence judge?[/] (catches equivalent-but-"
-                        "differently-spelled actions; small extra cost)",
-                        default=False, console=console)
+    # per-step scoring mode. structural (free) matches the exact action; but free-running
+    # agents wander valid routes (control agrees only ~26%), so 'goal' is more robust — it
+    # rates each action good/degraded/bad toward the TASK on its own merits.
+    judge = _select_one(console, "per-step scoring", [
+        ("goal", "goal-based — rate each action good/degraded/bad toward the task "
+                 "(robust to valid divergence; one LLM call/step) [recommended]", True),
+        ("off", "structural only — exact same-action match, free (read vs control floor)", True),
+        ("equivalence", "structural + LLM upgrade of near-misses (grep vs rg) to 'agrees'", True),
+    ])
     out = Prompt.ask("[cyan]output dir[/]", default="results/jobs/run", console=console).strip()
     _quality_preflight(console, arms, need_docker=False)
     model_lbl = f"inherit ({own})" if model is None else model
@@ -610,7 +613,7 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         f"[bold]arms[/] control + {', '.join(arms)}   [bold]every[/] {every}   "
         f"[bold]limit[/] {limit or 'all'}\n"
         f"[bold]source[/] {'exact capture' if capture else 'template'}   "
-        f"[bold]scoring[/] {'LLM-judged' if judge else 'structural'}\n"
+        f"[bold]scoring[/] {judge}\n"
         f"[bold]per-arm cap[/] ${budget:g}   [bold]out[/] {out}",
         title="ready", border_style="green"))
     if not Confirm.ask("[cyan]replay it?[/]", default=False, console=console):

@@ -206,7 +206,7 @@ def estimate_usd(msgs, points, price) -> tuple[float, float]:
 def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, every: int,
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,
            model: str | None = None, auth: str = "auto", task: str = "session",
-           judge: bool = False, capture: bool = False, headroom_mode: str = "token") -> dict:
+           judge: str = "off", capture: bool = False, headroom_mode: str = "token") -> dict:
     env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
     if auth == "subscription":
         # force the Claude Code login path even when an API key is configured
@@ -378,6 +378,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         path = inc_dir / f"{task}-{arm}.jsonl"
         spent, n_ok, n_action, n_exact, ctx_total = 0.0, 0, 0, 0, 0
         n_err, first_err, ctx_series = 0, None, []
+        qual = {"good": 0, "degraded": 0, "bad": 0}  # goal-judge tally
         with path.open("w") as f, Progress(
             TextColumn(f"[cyan]{arm:9}[/]"), BarColumn(),
             TextColumn("{task.completed}/{task.total} [dim]{task.fields[stat]}[/]"),
@@ -407,13 +408,12 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                     # score against the session's REAL cwd so `cd <proj> && …` artifacts
                     # normalize (local sessions run in their project dir, not /app)
                     exact, action, sim = eng.score(orig, rep, cwd=meta["cwd"] or "/app")
-                    # semantic agreement: an LLM upgrades a structural near-miss that is
-                    # a functionally-equivalent decision (grep vs rg, a differently-spelled
-                    # same command). Only judge the disagreements — matches are already yes.
+                    # semantic agreement (judge=equivalence): an LLM upgrades a structural
+                    # near-miss that is a functionally-equivalent decision (grep vs rg). Only
+                    # judge disagreements — matches already agree.
                     agree_sem = action
-                    if judge and not action:
-                        eq = eng.judge_equivalent(orig, rep, env, task_hint)
-                        agree_sem = bool(eq)
+                    if judge == "equivalence" and not action:
+                        agree_sem = bool(eng.judge_equivalent(orig, rep, env, task_hint))
                     usage = resp.get("usage", {})
                     c = eng.cost_usd(usage, replay_model)
                     spent += c
@@ -428,6 +428,14 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                     rec.update(replay=rep, agree_exact=exact, agree_action=action,
                                agree_semantic=agree_sem, sim=round(sim, 3),
                                usage=usage, cost_usd=round(c, 4))
+                    # goal-based per-step quality: is the arm's action a good/degraded/bad
+                    # step toward the TASK, on its own merits (robust to valid divergence)
+                    if judge == "goal":
+                        q = eng.judge_action_quality(
+                            task_hint, msgs[i - 1] if i > 0 else None, rep, env)
+                        rec["quality"] = q
+                        if q in qual:
+                            qual[q] += 1
                 f.write(json.dumps(rec) + "\n")
                 f.flush()
                 prog.update(tid, advance=1,
@@ -436,9 +444,10 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
             "steps_ok": n_ok, "agree_action": n_action, "agree_exact": n_exact,
             "errors": n_err, "first_error": (first_err or "")[:300],
             "avg_ctx_tokens": (ctx_total // n_ok) if n_ok else 0,
-            "ctx_series": ctx_series,
+            "ctx_series": ctx_series, "quality": qual,
             "cost_usd": round(spent, 4), "file": str(path),
         }
+    summary["judge"] = judge
     # backtest anchor: what these same turns ACTUALLY consumed when the session ran
     # (recorded usage, the session's own model + live caching) — replays above re-ran
     # them fresh, so this row is the "you actually paid" reference point
@@ -457,6 +466,49 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
 
 
 # --------------------------------------------------------------------------- verdict
+def _render_goal_quality(summary: dict, console: Console) -> None:
+    """Goal-based per-step quality — the HEADLINE when judge=goal. Each action is rated
+    good/degraded/bad as a step toward the task (on its own merits), so control ≈100% and
+    an arm 'loses' only by taking worse steps. Robust to the valid-divergence noise that
+    dominates same-action agreement."""
+    cq = summary["arms"].get("control", {}).get("quality", {})
+    ctot = sum(cq.values())
+    cgood = cq.get("good", 0) / ctot if ctot else None
+    gt = Table(title="[bold]goal-based per-step quality — is each action a good step "
+                     "toward the task?")
+    for c in ("arm", "good", "degraded", "bad", "good rate"):
+        gt.add_column(c, justify="right" if c != "arm" else "left")
+    for arm, a in summary["arms"].items():
+        q = a.get("quality", {})
+        tot = sum(q.values())
+        if not tot:
+            continue
+        gp = q.get("good", 0) / tot
+        cell = (f"[dim]{gp:.0%} (floor)[/]" if arm == "control" else
+                f"[green]{gp:.0%}[/]" if cgood is None or gp >= cgood - 0.05
+                else f"[red]{gp:.0%}[/]")
+        gt.add_row(arm, str(q.get("good", 0)), str(q.get("degraded", 0)),
+                   str(q.get("bad", 0)), cell)
+    console.print(gt)
+    if cgood is not None:
+        for arm, a in summary["arms"].items():
+            if arm == "control":
+                continue
+            q = a.get("quality", {})
+            tot = sum(q.values())
+            if not tot:
+                continue
+            gp, d = q.get("good", 0) / tot, q.get("good", 0) / tot - cgood
+            verdict = ("[green]≈ control → compaction does not degrade decisions[/]"
+                       if d >= -0.05 else
+                       f"[red]{d:+.0%} vs control → compaction is degrading decisions[/]")
+            console.print(f"[bold]{arm}[/]  good-step rate [bold]{gp:.0%}[/]  "
+                          f"vs control {cgood:.0%}   →   {verdict}")
+    console.print("[dim]goal-based: each action judged a valid step toward the task on its own "
+                  "merits (not vs the original) — control scores ~100%, so an arm only 'loses' by "
+                  "taking WORSE steps. More robust than same-action agreement.[/]")
+
+
 def render_summary(summary: dict, console: Console) -> None:
     ctrl = summary["arms"].get("control", {})
     cn, ca = ctrl.get("steps_ok", 0), ctrl.get("agree_action", 0)
@@ -500,8 +552,11 @@ def render_summary(summary: dict, console: Console) -> None:
             f"{costd:+.0%}" if costd is not None else "—",
         )
     console.print(t)
+    if summary.get("judge") == "goal":
+        _render_goal_quality(summary, console)
     if floor is not None:
-        console.print(f"[dim]control replays the SAME session with NO compaction; its "
+        label = "(secondary — structural) " if summary.get("judge") == "goal" else ""
+        console.print(f"[dim]{label}control replays the SAME session with NO compaction; its "
                       f"{floor:.0%} agreement with the original is the NOISE FLOOR (sampling + "
                       f"free-running divergence), not 100%. An arm only loses the trajectory to "
                       f"the extent it falls below it; a few points on <30 steps is noise.[/]")
@@ -605,6 +660,11 @@ def _is_refetch(a, files, cmds):
 def _step_verdict(rec):
     if "error" in rec or not rec.get("replay"):
         return "err"
+    # goal-based verdict (judge=goal) takes precedence — it rates the action's quality
+    # toward the task, not agreement with the original
+    q = rec.get("quality")
+    if q:
+        return {"good": "good", "degraded": "semi", "bad": "bad"}.get(q, "bad")
     if rec.get("agree_semantic") or rec.get("agree_exact") or rec.get("agree_action"):
         return "good"
     o, p = rec.get("orig", {}), rec["replay"]
@@ -632,9 +692,10 @@ def render_steps(summary: dict, console: Console, max_rows: int = 60) -> None:
             rows.append((r["step"], r.get("orig", {}), r.get("replay"), cat, rd))
             _mark_seen(r.get("orig"), files, cmds)  # the real history the arm should recall
 
-        judged = summary.get("judged")
-        title = (f"[bold]{arm} — per step[/] (vs original; "
-                 f"{'LLM-judged equivalence' if judged else 'structural match'})")
+        mode = {"goal": "goal-based quality", "equivalence": "structural + LLM equivalence",
+                "off": "structural match"}.get(summary.get("judge"), "structural match")
+        anchor = "toward the task" if summary.get("judge") == "goal" else "vs original"
+        title = f"[bold]{arm} — per step[/] ({anchor}; {mode})"
         if len(rows) <= max_rows:
             t = Table(title=title)
             t.add_column("step", justify="right", style="dim")

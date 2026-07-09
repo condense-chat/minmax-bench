@@ -132,7 +132,7 @@ def quality_report(
 
 def _run_incremental(*, session: str | None, arms: str, model: str | None, every: int,
                      limit: int, budget_usd: float, max_tokens: int, out: str, task: str,
-                     auth: str, assume_yes: bool, judge: bool = False, steps: bool = True,
+                     auth: str, assume_yes: bool, judge: str = "off", steps: bool = True,
                      capture: bool = False, headroom_mode: str = "token") -> None:
     """Rich teacher-forced replay of one session — picker when no --session, model
     auto-fallback, cost preview, per-arm progress, a summary table with the recorded
@@ -169,7 +169,7 @@ def quality_incremental(
     out: str | None = typer.Option(None, "--out", help="Output dir (default results/incremental/<session>-<ts>)."),
     task: str = typer.Option("session", "--task", help="Task label for the report join."),
     auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force the Claude Code login)."),
-    judge: bool = typer.Option(False, "--judge", help="LLM-adjudicate structural near-misses (grep vs rg etc.) as equivalent."),
+    judge: str = typer.Option("off", "--judge", help="Per-step LLM judge: off | goal (rate each action good/degraded/bad toward the task — robust, recommended) | equivalence (upgrade grep-vs-rg near-misses to 'agrees')."),
     steps: bool = typer.Option(True, "--steps/--no-steps", help="Show the per-step good/semi/bad/redundant readout."),
     capture: bool = typer.Option(False, "--capture", help="Run your version-matched Claude Code binary once (locally) to capture its EXACT system prompt + tools, instead of an approximate template."),
     headroom_mode: str = typer.Option("token", "--headroom-mode", help="For a headroom arm: token (compression — the meaningful test) or cache (~passthrough). Auto-starts the proxy."),
