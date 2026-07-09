@@ -438,7 +438,7 @@ def render_summary(summary: dict, console: Console) -> None:
     floor = ca / cn if cn else None
     t = Table(title=f"[bold]counterfactual — {Path(summary['session']).name} "
                     f"({summary['model']}, {summary['steps']} decision points)")
-    for col in ("arm", "steps", "errors", "same action", "exact", "avg ctx tokens",
+    for col in ("arm", "steps", "errors", "vs original", "exact", "avg ctx tokens",
                 "ctx vs control", "cost", "$ vs control"):
         t.add_column(col, justify="right" if col != "arm" else "left")
     rec = summary.get("recorded")
@@ -454,9 +454,20 @@ def render_summary(summary: dict, console: Console) -> None:
         costd = (1 - a["cost_usd"] / ctrl["cost_usd"]
                  if arm != "control" and ctrl.get("cost_usd") else None)
         errs = a.get("errors", 0)
+        # colour each arm's vs-original agreement AGAINST the control floor: at/above the
+        # floor is green (no measurable loss), below is red. control itself is the floor.
+        if agree is None:
+            agree_cell = "—"
+        elif arm == "control":
+            agree_cell = f"[dim]{agree:.0%} (floor)[/]"
+        elif floor is not None:
+            agree_cell = (f"[green]{agree:.0%}[/]" if agree >= floor - 0.02
+                          else f"[red]{agree:.0%}[/]")
+        else:
+            agree_cell = f"{agree:.0%}"
         t.add_row(
             arm, str(n), f"[red]{errs}[/]" if errs else "0",
-            f"{agree:.0%}" if agree is not None else "—",
+            agree_cell,
             f"{a['agree_exact'] / n:.0%}" if n else "—",
             f"{a['avg_ctx_tokens']:,}",
             f"{comp:+.0%}" if comp is not None else "—",
@@ -464,6 +475,11 @@ def render_summary(summary: dict, console: Console) -> None:
             f"{costd:+.0%}" if costd is not None else "—",
         )
     console.print(t)
+    if floor is not None:
+        console.print(f"[dim]control replays the SAME session with NO compaction; its "
+                      f"{floor:.0%} agreement with the original is the NOISE FLOOR (sampling + "
+                      f"free-running divergence), not 100%. An arm only loses the trajectory to "
+                      f"the extent it falls below it; a few points on <30 steps is noise.[/]")
     ctrl_series = ctrl.get("ctx_series") or []
     for arm, a in summary["arms"].items():
         if arm == "control":
@@ -472,6 +488,16 @@ def render_summary(summary: dict, console: Console) -> None:
             console.print(f"[red]{arm} FAILED every step ({a.get('errors', 0)} errors)[/] — "
                           f"no verdict is possible. First error: {a.get('first_error', '?')}")
             continue
+        # headline verdict: the arm's vs-original agreement against the control floor
+        agree = a["agree_action"] / a["steps_ok"]
+        if floor is not None:
+            delta = agree - floor
+            if delta >= -0.02:
+                verdict = ("[green]at/above the noise floor → no measurable trajectory loss[/]")
+            else:
+                verdict = (f"[red]{delta:+.0%} below the floor → possible trajectory loss[/]")
+            console.print(f"[bold]{arm}[/]  same action vs original [bold]{agree:.0%}[/]  "
+                          f"vs control floor {floor:.0%}   →   {verdict}")
         if not ctrl_series:
             continue
         series = a.get("ctx_series") or []
@@ -479,16 +505,15 @@ def render_summary(summary: dict, console: Console) -> None:
         onset = next((i for i, (x, c) in enumerate(pairs) if c and x < c * 0.9), None)
         if onset is None:
             console.print(
-                f"[yellow]{arm} never compacted this session[/] — its context matched "
-                f"control at every replayed step, so it acted as a passthrough (session "
-                f"below its trigger). Agreement/cost deltas above are sampling noise, "
-                f"not a compaction effect.")
+                f"[dim]  └ {arm} never compacted this session (context matched control at "
+                f"every step) — a passthrough below its trigger, so the delta is sampling "
+                f"noise, not a compaction effect.[/]")
         else:
             deepest = max((1 - x / c) for x, c in pairs[onset:] if c)
             console.print(
-                f"[green]{arm} compacted from step {onset}[/] "
-                f"(context −{deepest:.0%} vs control at the deepest point) — fidelity and "
-                f"$ deltas from step {onset} on are measuring real compaction.")
+                f"[dim]  └ {arm} compacted from step {onset} (context −{deepest:.0%} vs "
+                f"control at the deepest point) — the delta from step {onset} on is real "
+                f"compaction.[/]")
     if rec:
         console.print(
             "[dim]* recorded = what these turns actually consumed when the session ran (its own "
@@ -507,11 +532,6 @@ def render_summary(summary: dict, console: Console) -> None:
                 f"overhead (system prompt + full tool/MCP catalog) the replay can't "
                 f"reconstruct. The arm-vs-control comparison is unaffected, but don't "
                 f"read absolute cost against the recorded anchor here.")
-    if floor is not None:
-        console.print(
-            f"[dim]control replay agrees with the original {floor:.0%} of the time — that is the "
-            f"noise floor (sampling + replay error), not 100%. An arm is only drifting to the "
-            f"extent it falls meaningfully below it; a few points on <30 steps is noise.[/]")
 
 
 # --------------------------------------------------------------------------- per-step view
