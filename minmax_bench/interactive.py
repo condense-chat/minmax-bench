@@ -404,6 +404,7 @@ class QualityWizardResult:
     task: str = "session"
     every: int = 1
     limit: int = 0
+    judge: bool = False
 
 
 def _select_one(console: Console, title: str, options: list[tuple[str, str, bool]],
@@ -578,6 +579,12 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     limit = int(Prompt.ask("[cyan]max decision points[/] (0 = all)", default="0",
                            console=console) or 0)
     budget = float(Prompt.ask("[cyan]per-arm $ cap[/]", default="2", console=console) or 2)
+    # per-step scoring: structural match is free; the LLM judge upgrades near-misses
+    # (grep vs rg, a differently-spelled same command) from ✗ bad to ✓ good, for a
+    # small extra cost (one cheap call per structural disagreement)
+    judge = Confirm.ask("[cyan]use the LLM equivalence judge?[/] (catches equivalent-but-"
+                        "differently-spelled actions; small extra cost)",
+                        default=False, console=console)
     out = Prompt.ask("[cyan]output dir[/]", default="results/jobs/run", console=console).strip()
     _quality_preflight(console, arms, need_docker=False)
     model_lbl = f"inherit ({own})" if model is None else model
@@ -586,10 +593,11 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         f"[bold]session[/] {Path(session).name}\n"
         f"[bold]arms[/] control + {', '.join(arms)}   [bold]every[/] {every}   "
         f"[bold]limit[/] {limit or 'all'}\n"
+        f"[bold]scoring[/] {'LLM-judged' if judge else 'structural'}   "
         f"[bold]per-arm cap[/] ${budget:g}   [bold]out[/] {out}",
         title="ready", border_style="green"))
     if not Confirm.ask("[cyan]replay it?[/]", default=False, console=console):
         raise KeyboardInterrupt
     return QualityWizardResult(mode="incremental", source=src, session=session, swechat=swechat,
                                conv=conv, task=task, arms=",".join(arms), model=model,
-                               every=every, limit=limit, budget_usd=budget, out=out)
+                               every=every, limit=limit, budget_usd=budget, out=out, judge=judge)

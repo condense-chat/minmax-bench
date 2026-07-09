@@ -91,7 +91,7 @@ def quality_run(
         if w.mode == "incremental":
             _run_incremental(session=w.session, arms=w.arms, model=w.model, every=w.every,
                              limit=w.limit, budget_usd=w.budget_usd, max_tokens=6000,
-                             out=w.out, task=w.task, auth="auto", assume_yes=True)
+                             out=w.out, task=w.task, auth="auto", assume_yes=True, judge=w.judge)
             return
         arms, tasks, model, k, budget_usd, milestones, out = (
             w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out)
