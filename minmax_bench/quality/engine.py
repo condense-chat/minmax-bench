@@ -392,6 +392,148 @@ def referenced_tool_names(msgs):
     return names
 
 
+# ------------------------------------------------------------------ faithful capture
+# The most faithful reconstruction of a session's request isn't to hand-rebuild the
+# system prompt / CLAUDE.md / tools — it is to let the ACTUAL Claude Code binary do it.
+# CC keeps every version it has run under ~/.local/share/claude/versions/<version>, and
+# each session records the `version` it ran on. We run the version-matched binary once
+# in the session's cwd, pointed at a LOCAL capture proxy that returns a canned response
+# (no upstream call, no spend), and grab the exact request it emits: base prompt (from
+# the binary), CLAUDE.md + env (re-read from disk), and the full tool catalog (MCP
+# re-connected). Teacher-forcing the recorded messages through THAT is the real thing.
+CC_VERSIONS_DIR = os.path.expanduser("~/.local/share/claude/versions")
+
+
+def cc_binary_for(version=None):
+    """Path to the Claude Code binary matching `version` (exact if kept on disk), else
+    the newest kept version, else whatever `claude` is on PATH. None if none found."""
+    import shutil
+    if version:
+        exact = os.path.join(CC_VERSIONS_DIR, version)
+        if os.path.isfile(exact):
+            return exact
+    if os.path.isdir(CC_VERSIONS_DIR):
+        kept = sorted(os.listdir(CC_VERSIONS_DIR))  # semver-ish; newest last
+        if kept:
+            return os.path.join(CC_VERSIONS_DIR, kept[-1])
+    return shutil.which("claude")
+
+
+def _canned_sse(model):
+    evs = [
+        ("message_start", {"type": "message_start", "message": {
+            "id": "msg_cap", "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": None, "usage": {"input_tokens": 3, "output_tokens": 1}}}),
+        ("content_block_start", {"type": "content_block_start", "index": 0,
+                                 "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                 "delta": {"type": "text_delta", "text": "OK"}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                           "usage": {"output_tokens": 1}}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    return "".join(f"event: {e}\ndata: {json.dumps(d)}\n\n" for e, d in evs).encode()
+
+
+def capture_cc_request(cwd, model=None, version=None, port=8791, timeout=90):
+    """Run the version-matched CC binary once in `cwd` against a local capture proxy and
+    return the EXACT request it builds (system, tools, thinking/context_management/…), or
+    None. Nothing leaves the machine: the proxy returns a canned response so `claude -p`
+    exits. `model` is passed to `--model` so the config matches the session's model.
+    Reads the user's own binary — the CALLER must have obtained consent."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    binary = cc_binary_for(version)
+    if not binary:
+        return None
+    captured = []
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self._send(200, b'{"ok":true}', "application/json")
+
+        def do_POST(self):
+            n = int(self.headers.get("content-length", 0))
+            body = self.rfile.read(n) if n else b"{}"
+            try:
+                req = json.loads(body)
+            except json.JSONDecodeError:
+                req = {}
+            if "count_tokens" in self.path:
+                self._send(200, b'{"input_tokens":3}', "application/json")
+                return
+            if "/v1/messages" in self.path:
+                captured.append(req)  # the real agent turn carries `tools`
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            try:
+                self.wfile.write(_canned_sse(req.get("model") or model or "claude-sonnet-4-6"))
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _send(self, code, b, ct):
+            self.send_response(code)
+            self.send_header("content-type", ct)
+            self.send_header("content-length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+    try:
+        srv = HTTPServer(("127.0.0.1", port), H)
+    except OSError:
+        return None
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        cmd = [binary, "-p", "reply with just: OK"]
+        if model:
+            cmd += ["--model", model]
+        renv = {**os.environ, "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}"}
+        subprocess.run(cmd, cwd=cwd, env=renv, timeout=timeout, capture_output=True)
+    except (subprocess.SubprocessError, OSError):
+        pass
+    finally:
+        srv.shutdown()
+        t.join(timeout=3)
+    if not captured:
+        return None
+    return max(captured, key=lambda r: len(r.get("tools", [])))  # the turn with the catalog
+
+
+def captured_reminders(captured_req):
+    """The <system-reminder> context blocks CC injected into its first user message
+    (CLAUDE.md, env/git, the agent+tool catalog) — everything except the throwaway
+    capture prompt. CC adds these at request-build time and the transcript usually does
+    NOT log them, so a faithful replay must carry them into the recorded first user turn."""
+    msgs = (captured_req or {}).get("messages", [])
+    c = msgs[0].get("content", []) if msgs else []
+    if not isinstance(c, list):
+        return []
+    return [b for b in c if isinstance(b, dict) and b.get("type") == "text"
+            and "system-reminder" in b.get("text", "")]
+
+
+def ensure_reminders(msgs, reminders):
+    """Return msgs with the captured injected reminders present in the first user turn
+    (prepended) — unless it already carries them (some CC versions log them). Non-
+    mutating. Makes a replay see the same CLAUDE.md/env context the original run did."""
+    if not reminders or not msgs:
+        return msgs
+    first = json.dumps(msgs[0].get("content"))
+    if "system-reminder" in first and "claudeMd" in first:
+        return msgs  # already present in the recording — don't duplicate
+    out = [dict(m) for m in msgs]
+    c = out[0].get("content")
+    body = c if isinstance(c, list) else [{"type": "text", "text": c or ""}]
+    out[0]["content"] = [*reminders, *body]
+    return out
+
+
 def build_tools(used, tmpl_tools):
     """Real template defs for known tools + permissive stubs for the rest (for replay)."""
     by_name = {t["name"]: t for t in tmpl_tools}

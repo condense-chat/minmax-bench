@@ -91,7 +91,8 @@ def quality_run(
         if w.mode == "incremental":
             _run_incremental(session=w.session, arms=w.arms, model=w.model, every=w.every,
                              limit=w.limit, budget_usd=w.budget_usd, max_tokens=6000,
-                             out=w.out, task=w.task, auth="auto", assume_yes=True, judge=w.judge)
+                             out=w.out, task=w.task, auth="auto", assume_yes=True, judge=w.judge,
+                             capture=w.capture)
             return
         arms, tasks, model, k, budget_usd, milestones, out = (
             w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out)
@@ -131,7 +132,8 @@ def quality_report(
 
 def _run_incremental(*, session: str | None, arms: str, model: str | None, every: int,
                      limit: int, budget_usd: float, max_tokens: int, out: str, task: str,
-                     auth: str, assume_yes: bool, judge: bool = False, steps: bool = True) -> None:
+                     auth: str, assume_yes: bool, judge: bool = False, steps: bool = True,
+                     capture: bool = False) -> None:
     """Rich teacher-forced replay of one session — picker when no --session, model
     auto-fallback, cost preview, per-arm progress, a summary table with the recorded
     backtest anchor, and a per-step good/semi/bad/redundant readout. Writes
@@ -144,7 +146,8 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None, every
     try:
         summary = replay(sp, arm_list, budget_usd=budget_usd, limit=limit, every=every,
                          max_tokens=max_tokens, out_dir=Path(out), console=console,
-                         assume_yes=assume_yes, model=model, auth=auth, task=task, judge=judge)
+                         assume_yes=assume_yes, model=model, auth=auth, task=task, judge=judge,
+                         capture=capture)
     except SystemExit as e:
         raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
     render_summary(summary, console)
@@ -168,6 +171,7 @@ def quality_incremental(
     auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force the Claude Code login)."),
     judge: bool = typer.Option(False, "--judge", help="LLM-adjudicate structural near-misses (grep vs rg etc.) as equivalent."),
     steps: bool = typer.Option(True, "--steps/--no-steps", help="Show the per-step good/semi/bad/redundant readout."),
+    capture: bool = typer.Option(False, "--capture", help="Run your version-matched Claude Code binary once (locally) to capture its EXACT system prompt + tools, instead of an approximate template."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
 ):
     """Incremental (teacher-forced per-step) trajectories — the paired counterpart
@@ -182,7 +186,7 @@ def quality_incremental(
     out_dir = out or str(Path("results/incremental") / f"{stem}-{stamp}")
     _run_incremental(session=session, arms=arms, model=model, every=every, limit=limit,
                      budget_usd=budget_usd, max_tokens=max_tokens, out=out_dir, task=task,
-                     auth=auth, assume_yes=yes, judge=judge, steps=steps)
+                     auth=auth, assume_yes=yes, judge=judge, steps=steps, capture=capture)
 
 
 # judge takes niche flags; pass through to the driver (which owns its --help)

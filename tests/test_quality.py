@@ -322,3 +322,27 @@ def test_patch_cwd_rewrites_the_templates_real_advertised_cwd():
     assert "/Users/x/dev/capture-proj" not in s          # path form rewritten
     assert "-Users-x-dev-capture-proj" not in s          # CC slug form rewritten
     assert "working directory: /Users/x/dev/real-session" in s
+
+
+def test_captured_reminders_and_ensure_reminders_carry_injected_context():
+    # a captured request injects CLAUDE.md/env as <system-reminder> blocks in msg[0];
+    # they must be carried into a recorded session that lacks them (non-mutating)
+    captured = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "<system-reminder># claudeMd\nprefer ripgrep</system-reminder>"},
+        {"type": "text", "text": "reply with just: OK"}]}]}
+    rem = eng.captured_reminders(captured)
+    assert len(rem) == 1 and "claudeMd" in rem[0]["text"]
+    recorded = [{"role": "user", "content": [{"type": "text", "text": "fix server.py"}]}]
+    before = json.dumps(recorded)
+    merged = eng.ensure_reminders(recorded, rem)
+    assert "claudeMd" in json.dumps(merged[0]["content"])       # reminder carried in
+    assert "fix server.py" in json.dumps(merged[0]["content"])  # original prompt kept
+    assert json.dumps(recorded) == before                        # source not mutated
+
+
+def test_ensure_reminders_skips_when_already_present():
+    rem = [{"type": "text", "text": "<system-reminder># claudeMd\nx</system-reminder>"}]
+    already = [{"role": "user", "content": [
+        {"type": "text", "text": "<system-reminder># claudeMd\ny</system-reminder>"},
+        {"type": "text", "text": "hi"}]}]
+    assert eng.ensure_reminders(already, rem) is already  # no duplication

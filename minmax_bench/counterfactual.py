@@ -161,8 +161,9 @@ def pick_session(console: Console) -> Path:
 
 # --------------------------------------------------------------------------- session meta
 def session_meta(path: Path) -> dict:
-    """cwd + recorded model from a session's records (first occurrence wins)."""
-    cwd, model = None, None
+    """cwd + recorded model + Claude Code version from a session (first occurrence wins);
+    version picks the exact binary to capture the request from."""
+    cwd, model, version = None, None, None
     with path.open(encoding="utf-8") as fh:
         for line in fh:
             try:
@@ -170,11 +171,12 @@ def session_meta(path: Path) -> dict:
             except json.JSONDecodeError:
                 continue
             cwd = cwd or rec.get("cwd")
+            version = version or rec.get("version")
             if rec.get("type") == "assistant":
                 model = model or rec.get("message", {}).get("model")
-            if cwd and model:
+            if cwd and model and version:
                 break
-    return {"cwd": cwd, "model": model}
+    return {"cwd": cwd, "model": model, "version": version}
 
 
 def _prefix_chars(msgs: list[dict], points: list[int]) -> list[int]:
@@ -204,7 +206,7 @@ def estimate_usd(msgs, points, price) -> tuple[float, float]:
 def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, every: int,
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,
            model: str | None = None, auth: str = "auto", task: str = "session",
-           judge: bool = False) -> dict:
+           judge: bool = False, capture: bool = False) -> dict:
     env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
     if auth == "subscription":
         # force the Claude Code login path even when an API key is configured
@@ -281,16 +283,44 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         console.print(f"[dim]preflight ok: {', '.join(all_arms)} respond on {replay_model}[/]")
 
     cross_model = replay_model != template_model
+    reminders, captured = [], None
+    # FAITHFUL path: let the real version-matched CC binary build the request (exact
+    # system prompt, full tool catalog, CLAUDE.md/env re-read from disk, exact config)
+    # instead of approximating with a frozen template. The caller gates this on consent.
+    if capture:
+        console.print(f"[dim]capturing the exact request from Claude Code "
+                      f"{meta.get('version') or '(newest on disk)'} in {meta['cwd']}… "
+                      f"(local only — nothing is sent externally)[/]")
+        captured = eng.capture_cc_request(meta["cwd"], model=replay_model,
+                                          version=meta.get("version"))
+        if captured:
+            for k in ("system", "tools", "thinking", "context_management", "output_config"):
+                if k in captured:
+                    tmpl_body[k] = captured[k]
+            # add stubs for any tool the session referenced that the capture didn't list
+            # (e.g. an MCP server no longer configured) so the request never 400s
+            extra = eng.referenced_tool_names(msgs) - {t["name"] for t in captured["tools"]}
+            tmpl_body["tools"] = captured["tools"] + eng.build_tools(extra, [])
+            reminders = eng.captured_reminders(captured)
+            console.print(f"[green]captured[/] exact system prompt + "
+                          f"{len(captured['tools'])} tools from the binary — no approximation")
+        else:
+            console.print("[yellow]capture failed (binary/version missing or timed out) — "
+                          "falling back to the approximate template[/]")
+    if not captured:
+        # real template defs for CC tools; permissive stubs for mcp__/Skill/etc. Stub
+        # every tool NAME the session references (incl. tool-search-discovered MCP tools
+        # never directly called) — Anthropic 400s on a reference to a tool not in the array.
+        tmpl_body["tools"] = eng.build_tools(eng.referenced_tool_names(msgs), tmpl_body["tools"])
     tmpl_body["model"] = replay_model
+    msgs = eng.ensure_reminders(msgs, reminders)  # carry CC's injected CLAUDE.md/env context
 
-    # real template defs for CC tools; permissive stubs for mcp__/Skill/etc. Stub
-    # every tool NAME the session references (incl. tool-search-discovered MCP tools
-    # never directly called), not just the ones actually used — Anthropic 400s on a
-    # reference to a tool absent from the array.
-    tmpl_body["tools"] = eng.build_tools(eng.referenced_tool_names(msgs), tmpl_body["tools"])
-
-    args = SimpleNamespace(max_tokens=max_tokens, strip_thinking=cross_model,
-                           swechat=None, keep_all_tools=True, drop_beta_config=cross_model)
+    # recorded thinking blocks are only valid on the session's own model; the captured
+    # config is already built FOR replay_model, so it needn't be dropped as cross-model.
+    strip_thinking = replay_model != (meta["model"] or replay_model)
+    drop_beta = False if captured else cross_model
+    args = SimpleNamespace(max_tokens=max_tokens, strip_thinking=strip_thinking,
+                           swechat=None, keep_all_tools=True, drop_beta_config=drop_beta)
 
     sel = points[:: max(1, every)]
     if limit:

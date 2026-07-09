@@ -405,6 +405,7 @@ class QualityWizardResult:
     every: int = 1
     limit: int = 0
     judge: bool = False
+    capture: bool = False
 
 
 def _select_one(console: Console, title: str, options: list[tuple[str, str, bool]],
@@ -579,6 +580,21 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     limit = int(Prompt.ask("[cyan]max decision points[/] (0 = all)", default="0",
                            console=console) or 0)
     budget = float(Prompt.ask("[cyan]per-arm $ cap[/]", default="2", console=console) or 2)
+    # faithful capture: run the version-matched Claude Code binary once, LOCALLY, to
+    # capture the EXACT system prompt + tools + CLAUDE.md your run used — instead of an
+    # approximate frozen template. Consent + full transparency, per the user's ask.
+    from .counterfactual import session_meta
+    ver = session_meta(Path(session)).get("version") or "newest on disk"
+    console.print(Panel.fit(
+        f"[bold]faithful capture[/] (recommended for accuracy)\n"
+        f"Runs [bold]Claude Code {ver}[/] once in [bold]{Path(session).parent.name}[/]'s "
+        f"project dir to capture the EXACT system prompt, tool catalog, and CLAUDE.md your\n"
+        f"session actually used — far more faithful than an approximate template.\n"
+        f"[dim]• reads & runs your local `claude` binary   • one request to a LOCAL proxy — "
+        f"nothing is sent externally, $0\n• falls back to the template if you decline[/]",
+        border_style="cyan"))
+    capture = Confirm.ask("[cyan]capture the exact request from your Claude Code binary?[/]",
+                          default=True, console=console)
     # per-step scoring: structural match is free; the LLM judge upgrades near-misses
     # (grep vs rg, a differently-spelled same command) from ✗ bad to ✓ good, for a
     # small extra cost (one cheap call per structural disagreement)
@@ -593,11 +609,13 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         f"[bold]session[/] {Path(session).name}\n"
         f"[bold]arms[/] control + {', '.join(arms)}   [bold]every[/] {every}   "
         f"[bold]limit[/] {limit or 'all'}\n"
-        f"[bold]scoring[/] {'LLM-judged' if judge else 'structural'}   "
+        f"[bold]source[/] {'exact capture' if capture else 'template'}   "
+        f"[bold]scoring[/] {'LLM-judged' if judge else 'structural'}\n"
         f"[bold]per-arm cap[/] ${budget:g}   [bold]out[/] {out}",
         title="ready", border_style="green"))
     if not Confirm.ask("[cyan]replay it?[/]", default=False, console=console):
         raise KeyboardInterrupt
     return QualityWizardResult(mode="incremental", source=src, session=session, swechat=swechat,
                                conv=conv, task=task, arms=",".join(arms), model=model,
-                               every=every, limit=limit, budget_usd=budget, out=out, judge=judge)
+                               every=every, limit=limit, budget_usd=budget, out=out,
+                               judge=judge, capture=capture)
