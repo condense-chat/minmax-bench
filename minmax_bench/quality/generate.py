@@ -171,13 +171,25 @@ def _validate_full(args, env):
     return arms
 
 
+def _docker_alive():
+    """True iff the docker daemon actually RESPONDS — `which docker` only proves the
+    binary exists; a stopped/starting Docker Desktop still fails every trial with
+    'Docker daemon is not running'. `docker info` is the cheap liveness probe."""
+    if not shutil.which("docker"):
+        return False
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=15).returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
 def _preflight_full(arms, env):
     """Dependency preflight before spending (like the cost bench's run preflight):
     every dependency each requested arm needs, as (name, ok, detail, fatal). Docker
     and harbor run the containers; auth runs the agent; per-arm: the condense key and
     the headroom proxy/port. Printed as a table; a fatal miss aborts before any spend."""
     rows = [
-        ("Docker", bool(shutil.which("docker")), "runs the agent containers", True),
+        ("Docker daemon", _docker_alive(), "must be running (not just installed)", True),
         ("harbor CLI", bool(shutil.which("harbor")), "uv tool install harbor", True),
         ("Anthropic auth", bool(eng.auth_mode(env)),
          eng.auth_mode(env) or "ANTHROPIC_API_KEY or `claude setup-token`", True),
@@ -250,8 +262,13 @@ def full(args, env):
                        "-n", str(args.concurrency),
                        "-o", cell, "--ak", f"max_budget_usd={args.budget_usd}",
                        "--allow-agent-host", allow, *_agent_auth_env(env), *extra]
-                # the CCR agent installs python3 + headroom-ai + the mcp SDK per container;
-                # harbor's default 360s agent-setup timeout is not enough on a cold image
+                # agent SETUP (install Claude Code + node/deps per container) has its OWN
+                # timeout (harbor default 360s), separate from EXECUTION. On a cold image
+                # or a loaded machine even the plain agent blows past 360s and every trial
+                # dies before the agent runs — so bump the setup timeout for EVERY arm.
+                cmd += ["--agent-setup-timeout-multiplier", str(args.setup_timeout_mult)]
+                # agent EXECUTION timeout: the CCR agent (headroom) also installs headroom-ai
+                # + the mcp SDK and runs a heavier loop, so give it more execution time too.
                 mult = args.agent_timeout_mult or (3 if arm == "headroom" else None)
                 if mult:
                     cmd += ["--agent-timeout-multiplier", str(mult)]
@@ -540,7 +557,11 @@ def main(argv=None):
     ap.add_argument("--concurrency", type=int, default=1,
                     help="harbor -n: parallel trials per cell (parallel containers can add "
                          "resource-contention noise to trajectories; 1 = cleanest)")
-    ap.add_argument("--agent-timeout-mult", type=int, default=None)
+    ap.add_argument("--agent-timeout-mult", type=int, default=None,
+                    help="harbor agent EXECUTION timeout multiplier (headroom auto-3)")
+    ap.add_argument("--setup-timeout-mult", type=float, default=3.0,
+                    help="harbor agent SETUP timeout multiplier for every arm (installing "
+                         "Claude Code + deps per container is slow; default 3 = ~18min)")
     ap.add_argument("--auth", default="auto", choices=["auto", "api-key", "subscription"],
                     help="auto = API key if set, else Claude Code login; subscription = force "
                          "the Claude Code login (container agent gets CLAUDE_CODE_OAUTH_TOKEN)")

@@ -62,7 +62,8 @@ def quality_run(
     milestones: bool = typer.Option(False, "--milestones", help="Also run the LLM milestone judge."),
     out: str = typer.Option("results/jobs/run", "--out", help="Results root."),
     seed: int | None = typer.Option(None, "--seed", help="Seed for --tasks random:N."),
-    agent_timeout_mult: int | None = typer.Option(None, "--agent-timeout-mult", help="Harbor agent-setup timeout multiplier."),
+    agent_timeout_mult: int | None = typer.Option(None, "--agent-timeout-mult", help="Harbor agent EXECUTION timeout multiplier (headroom auto-3)."),
+    setup_timeout_mult: float = typer.Option(3.0, "--setup-timeout-mult", help="Harbor agent SETUP timeout multiplier, all arms (slow container installs; 3 = ~18min)."),
     list_tasks: bool = typer.Option(False, "--list-tasks", help="Print the known tasks and exit."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the Harbor commands without running."),
     auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force Claude Code login; no API key needed)."),
@@ -101,6 +102,7 @@ def quality_run(
     _flag(argv, "--k-vanilla", k_vanilla)
     _flag(argv, "--seed", seed)
     _flag(argv, "--agent-timeout-mult", agent_timeout_mult)
+    _flag(argv, "--setup-timeout-mult", setup_timeout_mult, default=3.0)
     if auth != "auto":
         argv += ["--auth", auth]
     if milestones:
