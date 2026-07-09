@@ -206,7 +206,7 @@ def estimate_usd(msgs, points, price) -> tuple[float, float]:
 def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, every: int,
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,
            model: str | None = None, auth: str = "auto", task: str = "session",
-           judge: bool = False, capture: bool = False) -> dict:
+           judge: bool = False, capture: bool = False, headroom_mode: str = "token") -> dict:
     env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
     if auth == "subscription":
         # force the Claude Code login path even when an API key is configured
@@ -250,6 +250,20 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     template_model = tmpl_body["model"]
     all_arms = ["control"] + arms
 
+    # a headroom arm needs a local proxy on :8787 — this replay path doesn't go through
+    # generate.full's proxy management, so start (or reuse a same-mode) proxy here, else
+    # every headroom probe is Connection-refused. token mode = compression that can
+    # actually change the next action (the meaningful quality test; cache is ~passthrough).
+    if any(a.startswith("headroom") for a in arms):
+        import atexit
+
+        from minmax_bench.quality import generate as gen
+        out_dir.mkdir(parents=True, exist_ok=True)
+        console.print(f"[dim]starting headroom proxy on :{gen.HRPORT} (mode={headroom_mode})…[/]")
+        proxy = gen._start_proxy(str(out_dir), headroom_mode)  # sys.exits with a clear msg on fail
+        if proxy:
+            atexit.register(gen._stop_proxy, proxy)
+
     # preflight every arm with a ~30-token probe BEFORE any real spend: a broken arm
     # (bad key, gateway incompatibility with the replay model, dead proxy) must abort
     # here, not after the control arm has already burned the budget. If an arm rejects
@@ -263,7 +277,17 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                 return arm, err
         return None, None
 
+    def _is_transport(e):
+        return e and any(s in e for s in ("Connection refused", "URLError", "Errno 61",
+                                          "Max retries", "Failed to establish"))
+
     bad_arm, err = _preflight(replay_model)
+    if bad_arm and _is_transport(err):
+        # not a model problem — a model fallback can't fix an unreachable endpoint
+        console.print(f"[red]{bad_arm} is unreachable[/]: [dim]{err[:160]}[/]\n"
+                      f"[yellow]connectivity issue, not a model one — check the {bad_arm} "
+                      f"endpoint/proxy is up (not the model). Aborting before any spend.[/]")
+        raise SystemExit(1)
     if bad_arm:
         console.print(f"[yellow]{bad_arm} can't serve {replay_model}[/] (the session's own "
                       f"model): [dim]{err[:200]}[/]")
