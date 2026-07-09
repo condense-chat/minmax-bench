@@ -309,3 +309,16 @@ def test_judge_equivalent_parses_json(monkeypatch):
                               tool("Bash", command="rg x f"), {"ANTHROPIC_API_KEY": "k"}) is True
     monkeypatch.setattr(e, "call_api", lambda *a, **k: (None, "HTTP 500"))
     assert e.judge_equivalent({}, {}, {}) is None  # error -> None, not a crash
+
+
+def test_patch_cwd_rewrites_the_templates_real_advertised_cwd():
+    # the template advertises SOME capture project; a replay in another project must
+    # not be told it's in the capture dir (the bug: it cd'd into the wrong repo)
+    tmpl = {"system": [{"type": "text",
+            "text": "<env>\nworking directory: /Users/x/dev/capture-proj\n"
+                    "logs at -Users-x-dev-capture-proj/memory/\n</env>"}]}
+    eng.patch_cwd(tmpl, "data/cc_request_template.json", "/Users/x/dev/real-session")
+    s = json.dumps(tmpl["system"])
+    assert "/Users/x/dev/capture-proj" not in s          # path form rewritten
+    assert "-Users-x-dev-capture-proj" not in s          # CC slug form rewritten
+    assert "working directory: /Users/x/dev/real-session" in s

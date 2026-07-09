@@ -218,17 +218,25 @@ def check_arms(arms, env):
 
 
 def patch_cwd(tmpl_body, template_path, new_cwd):
-    """Rewrite the capture machine's cwd in the template system prompt to new_cwd.
+    """Rewrite the template system prompt's advertised working directory to new_cwd.
 
-    The template was captured from a live CC session whose cwd was <repo>/ccwork
-    (sibling of the template's data/ dir); replayed sessions ran elsewhere
-    (containers: /app, local sessions: their own project dir), and a mismatched
-    advertised cwd depresses action fidelity for every arm.
+    The template is a real CC request captured in SOME project; its ``<env>`` block
+    hardcodes that project's cwd (e.g. ``working directory: /Users/x/dev/foo``) and
+    Claude Code's project-dir SLUG form (``-Users-x-dev-foo``). Replaying a DIFFERENT
+    session against that template tells the model it is in the wrong directory, so it
+    cd's there and reads that project's files — the trajectory is lost from step 0.
+
+    We auto-detect the cwd the template actually advertises (the old heuristic guessed
+    a ``<repo>/ccwork`` path that no longer exists in the template, so the rewrite was
+    a silent no-op) and replace BOTH the path and slug forms with the session's cwd.
     """
-    cap_dir = os.path.dirname(os.path.abspath(template_path))
-    cap_cwd = os.path.join(os.path.dirname(cap_dir), "ccwork")
-    tmpl_body["system"] = json.loads(
-        json.dumps(tmpl_body["system"]).replace(cap_cwd, new_cwd))
+    s = json.dumps(tmpl_body["system"])
+    m = re.search(r'working directory:\s*(/[^\s\\"]+)', s)
+    cap_cwd = m.group(1) if m else None
+    if cap_cwd and cap_cwd != new_cwd:
+        s = s.replace(cap_cwd, new_cwd)
+        s = s.replace(cap_cwd.replace("/", "-"), new_cwd.replace("/", "-"))  # CC dir slug
+        tmpl_body["system"] = json.loads(s)
     return tmpl_body
 
 

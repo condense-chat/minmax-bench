@@ -349,7 +349,9 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                 else:
                     consec_err = 0
                     rep = eng.extract_action(resp.get("content", []))
-                    exact, action, sim = eng.score(orig, rep)
+                    # score against the session's REAL cwd so `cd <proj> && …` artifacts
+                    # normalize (local sessions run in their project dir, not /app)
+                    exact, action, sim = eng.score(orig, rep, cwd=meta["cwd"] or "/app")
                     # semantic agreement: an LLM upgrades a structural near-miss that is
                     # a functionally-equivalent decision (grep vs rg, a differently-spelled
                     # same command). Only judge the disagreements — matches are already yes.
