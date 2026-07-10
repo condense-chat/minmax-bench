@@ -47,7 +47,7 @@ _console = Console()  # full-run progress renders through this (rich, coordinate
 class _CellGrid:
     """Live status grid for a full run — one row per (arm, task) cell, updated in place."""
     _S = {"pending": ("dim", "· pending"), "running": ("cyan", "▶ running"),
-          "done": ("green", "✓ done"), "skip": ("dim", "↩ skipped"),
+          "done": ("green", "✓ done"), "skip": ("blue", "⤺ cached"),
           "failed": ("red", "✗ failed"), "timeout": ("red", "✗ timeout")}
 
     def __init__(self, arms, tasks, kv, k, budget):
@@ -299,6 +299,19 @@ def full(args, env):
     out = args.out
     os.makedirs(out, exist_ok=True)
     model = args.model or DEFAULT_MODEL
+    # bind an output dir to its (model, dataset): reusing/resuming cached cells only makes
+    # sense for the SAME model+dataset — otherwise the cache would mix incomparable results
+    # (e.g. sonnet-5 vanilla cells reused for a sonnet-4-6 run). Refuse the mismatch.
+    mf_path = os.path.join(out, "run-manifest.json")
+    if os.path.exists(mf_path) and not args.force and not args.dry_run:
+        mf = json.load(open(mf_path))
+        if mf.get("model") != model or mf.get("dataset") != args.dataset:
+            sys.exit(f"[conflict] {out} already holds a run with model={mf.get('model')} "
+                     f"dataset={mf.get('dataset')}; you asked for model={model} "
+                     f"dataset={args.dataset}. Reusing it would mix incomparable results — "
+                     f"use a fresh --out, or --force to overwrite.")
+    if not args.dry_run:
+        json.dump({"model": model, "dataset": args.dataset}, open(mf_path, "w"))
     kv = args.k_vanilla or args.k + 1
     trials = len(tasks) * (kv + args.k * (len(arms) - 1))
     _console.print(f"[bold]plan[/] {len(arms)} arms ({', '.join(arms)}) × {len(tasks)} tasks "
@@ -354,7 +367,7 @@ def full(args, env):
                     # record intent BEFORE running so killed/crashed trials still count as
                     # attempted — report.py exposes survivorship instead of silently shrinking n
                     os.makedirs(cell, exist_ok=True)
-                    json.dump({"k": k, "arm": arm, "task": task,
+                    json.dump({"k": k, "arm": arm, "task": task, "model": model,
                                "started_utc": datetime.now(UTC).isoformat(timespec="seconds")},
                               open(f"{cell}/attempted.json", "w"))
                     timed_out = False
