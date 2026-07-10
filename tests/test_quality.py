@@ -384,7 +384,8 @@ def test_recent_context_finds_the_live_user_question():
         {"role": "user", "content": [{"type": "text", "text": "explain ZDR"}]},
         {"role": "assistant", "content": [tool("Read", file_path="/zdr.py")]},
         {"role": "user", "content": [{"type": "tool_result", "content": "class ZDR: ..."}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "here's how ZDR works"}]},
     ]
-    ctx = e.recent_context(msgs, 2)  # the assistant is about to answer
+    ctx = e.recent_context(msgs, 3)  # decision point = the assistant answer after the read
     assert "explain ZDR" in ctx                       # the live question is surfaced
-    assert "class ZDR" in ctx                          # and the latest observation
+    assert "class ZDR" in ctx                          # and the latest observation (tool_result)
