@@ -26,8 +26,10 @@ import json
 import os
 import re
 
-# one session parser for the spend side (generate/engine) and the display side — the
-# quality package is pure stdlib, so this keeps the "nothing to install to analyze" rule
+from rich.console import Console
+from rich.table import Table
+
+# one session parser for the spend side (generate/engine) and the display side.
 from minmax_bench.quality.engine import (
     SESSION_GLOB,
     extract_action,
@@ -226,7 +228,13 @@ def build(args):
             )
             row["arms"][arm] = a
         rows.append(row)
-    return {"arms": arms, "rows": rows, "has_milestone": bool(milestones), "has_incr": bool(incr)}
+    model = None
+    try:  # the run's model, for the report title (written by generate.full)
+        model = json.load(open(f"{root}/run-manifest.json")).get("model")
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"arms": arms, "rows": rows, "model": model,
+            "has_milestone": bool(milestones), "has_incr": bool(incr)}
 
 
 def _load_incremental(root, arms):
@@ -393,15 +401,46 @@ def main(argv=None):
     ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
     d = build(args)
-    head, rows = table(d)
-    widths = [max(len(h), *(len(r[i][0]) for r in rows)) if rows else len(h)
-              for i, h in enumerate(head)]
-    print("  ".join(h.ljust(w) for h, w in zip(head, widths, strict=False)))
-    for row in rows:
-        print("  ".join(c.ljust(w) for (c, _), w in zip(row, widths, strict=False)))
+    render_console(d)
     out = args.out or f"report.{args.format}"
     open(out, "w").write(render_md(d) if args.format == "md" else render_html(d))
-    print(f"wrote {out}")
+    Console().print(f"[dim]wrote {out}[/]")
+
+
+_HEAD_ABBR = {"solve v·arm": "solve v·a", "ctx peak (v)": "ctx(v)", "length (v)": "len(v)",
+              "length (arm)": "len(a)", "milestone": "mile", "rework": "rwk",
+              "fid (arm·ctrl)": "fid a·c"}
+
+
+def render_console(d):
+    """Rich terminal table for the quality bench — colours each verdict by its ok flag
+    (✓ green / ✗ red), flags ⚠ lost trials yellow. Columns that are entirely empty (e.g.
+    the incremental fid/comp/$Δ on a pure full run) are dropped so the table fits."""
+    console = Console()
+    head, rows = table(d)
+    keep = [i for i in range(len(head))
+            if i < 2 or not rows or any(r[i][0] not in ("—", "") for r in rows)]
+    model = d.get("model")
+    title = "[bold]quality — trajectory preservation" + (f" · {model}" if model else "") + "[/]"
+    t = Table(title=title, caption=SUB, caption_justify="left", caption_style="dim")
+    for i in keep:
+        t.add_column(_HEAD_ABBR.get(head[i], head[i]), no_wrap=(i < 2))
+    for row in rows:
+        cells = []
+        for i in keep:
+            text, ok = row[i]
+            if ok is True:
+                cells.append(f"[green]{text}[/]")
+            elif ok is False:
+                cells.append(f"[red]{text}[/]")
+            elif "lost" in text:
+                cells.append(f"[yellow]{text}[/]")
+            elif "⊘" in text or "passthrough" in text:
+                cells.append(f"[dim]{text}[/]")
+            else:
+                cells.append(text)
+        t.add_row(*cells)
+    console.print(t)
 
 
 if __name__ == "__main__":
