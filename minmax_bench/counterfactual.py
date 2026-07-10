@@ -555,10 +555,17 @@ def render_summary(summary: dict, console: Console) -> None:
     ctrl_c = _over(ctrl, common)
     floor = (ctrl_c["agree"] if ctrl_c else
              ctrl.get("agree_action", 0) / ctrl["steps_ok"] if ctrl.get("steps_ok") else None)
+    # the comparison window is capped at the fewest steps any arm reached — an arm that
+    # hits its budget stops there, and comparing past that point is apples-to-oranges
+    reaches = {arm: a.get("steps_ok", 0) for arm, a in summary["arms"].items() if a.get("by_step")}
+    cap_n = len(common)
+    capper = min(reaches, key=reaches.get) if reaches else None
+    capped = capper and len(set(reaches.values())) > 1
+    cap_txt = f", where {capper} hit its budget" if capped else ""
     t = Table(title=f"[bold]counterfactual — {Path(summary['session']).name} "
                     f"({summary['model']}, {summary['steps']} decision points; "
-                    f"deltas over {len(common)} common steps)")
-    for col in ("arm", "steps", "errors", "vs original", "exact", "avg ctx tokens",
+                    f"all deltas over the first {cap_n} steps{cap_txt})")
+    for col in ("arm", "reached", "errors", "vs original", "exact", "avg ctx tokens",
                 "ctx vs control", "cost", "$ vs control"):
         t.add_column(col, justify="right" if col != "arm" else "left")
     rec = summary.get("recorded")
@@ -599,8 +606,11 @@ def render_summary(summary: dict, console: Console) -> None:
         # contradicts a per-step saving). The 'steps' column shows the arm's own reach.
         ctx_cell = f"{round(ac['ctx']):,}" if ac else f"{a['avg_ctx_tokens']:,}"
         cost_cell = f"${ac['cost']:.2f}" if ac else f"${a['cost_usd']:.2f}"
+        # 'reached' = how far this arm got; mark the arm that capped the window (hit budget)
+        reached_cell = (f"[yellow]{n} ◀ budget cap[/]"
+                        if capper == arm and len(set(reaches.values())) > 1 else str(n))
         t.add_row(
-            arm, str(n), f"[red]{errs}[/]" if errs else "0",
+            arm, reached_cell, f"[red]{errs}[/]" if errs else "0",
             agree_cell,
             f"{a['agree_exact'] / n:.0%}" if n else "—",
             ctx_cell,
