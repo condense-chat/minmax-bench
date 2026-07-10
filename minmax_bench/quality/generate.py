@@ -31,7 +31,7 @@ import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from minmax_bench.quality import engine as eng  # the teacher-forced replay engine
 from minmax_bench.quality.engine import DEFAULT_TASKS, dataset_tasks, resolve_tasks
@@ -40,7 +40,6 @@ DEFAULT_DATASET = "terminal-bench/terminal-bench-2-1"  # the only validated data
 DEFAULT_MODEL = "claude-sonnet-4-6"
 SUPPORTED_AGENTS = {"claude-code"}  # codex / opencode: TODO; harbor agent ids in _arm_wiring
 HRPORT = int(os.environ.get("HRPORT", "8787"))
-UTC = timezone.utc  # noqa: UP017  (scripts run on system python3, may be 3.10)
 
 # arm -> headroom proxy mode. Two arms, mirroring the cost bench's headroom names:
 # 'headroom' is the REGULAR/full product (token-mode proxy + the mcp retrieve loop,

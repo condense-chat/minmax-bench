@@ -415,73 +415,81 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                 if consec_err >= 5:
                     prog.update(tid, stat=f"aborted: {consec_err} consecutive errors")
                     break
-                orig = eng.extract_action(msgs[i]["content"])
-                ccr_overhead = 0.0
-                if ccr_active and mcp and mcp.ok:
-                    resp, err, nr, ccr_overhead = eng.ccr_step(arm, tmpl_body, msgs[:i], args,
-                                                               sid, tmpl_headers, env, mcp)
-                    n_retrieves += nr
-                else:
-                    req = eng.build_request(tmpl_body, msgs[:i], args, sid)
-                    resp, err = eng.call_api(arm, req, tmpl_headers, env)
-                rec = {"arm": arm, "step": step, "msg_index": i, "orig": orig}
-                if err:
-                    rec["error"] = err
+                rec = {"arm": arm, "step": step, "msg_index": i}
+                nr = 0
+                try:  # an unexpected error in one step is recorded, not fatal to the run
+                    orig = eng.extract_action(msgs[i]["content"])
+                    rec["orig"] = orig
+                    ccr_overhead = 0.0
+                    if ccr_active and mcp and mcp.ok:
+                        resp, err, nr, ccr_overhead = eng.ccr_step(arm, tmpl_body, msgs[:i], args,
+                                                                   sid, tmpl_headers, env, mcp)
+                        n_retrieves += nr
+                    else:
+                        req = eng.build_request(tmpl_body, msgs[:i], args, sid)
+                        resp, err = eng.call_api(arm, req, tmpl_headers, env)
+                    if err:
+                        rec["error"] = err
+                        n_err += 1
+                        consec_err += 1
+                        first_err = first_err or err
+                    else:
+                        consec_err = 0
+                        rep = eng.extract_action(resp.get("content", []))
+                        # score against the session's REAL cwd so `cd <proj> && …` artifacts
+                        # normalize (local sessions run in their project dir, not /app)
+                        exact, action, sim = eng.score(orig, rep, cwd=meta["cwd"] or "/app")
+                        # semantic agreement (judge=equivalence): an LLM upgrades a structural
+                        # near-miss that is a functionally-equivalent decision (grep vs rg). Only
+                        # judge disagreements — matches already agree.
+                        agree_sem = action
+                        if judge == "equivalence" and not action:
+                            eq, jc = eng.judge_equivalent(orig, rep, env, task_hint)
+                            agree_sem = bool(eq)
+                            judge_spent += jc
+                            spent += jc
+                        usage = resp.get("usage", {})
+                        # bill the CCR retrieve round-trips as part of this decision's cost —
+                        # else headroom-CCR looks artificially cheap (it pays for extra calls)
+                        c = eng.cost_usd(usage, replay_model) + ccr_overhead
+                        spent += c
+                        n_ok += 1
+                        n_action += action
+                        n_exact += exact
+                        step_ctx = (usage.get("input_tokens", 0)
+                                    + usage.get("cache_read_input_tokens", 0)
+                                    + usage.get("cache_creation_input_tokens", 0))
+                        ctx_total += step_ctx
+                        ctx_series.append(step_ctx)
+                        # per-step, keyed by the shared decision-point index so arm-vs-control
+                        # deltas can be computed over the COMMON steps all arms reached (an arm
+                        # that hits its budget early must not be compared over a longer step set)
+                        by_step[step] = {"ctx": step_ctx, "cost": round(c, 4),
+                                         "agree": bool(action)}
+                        rec.update(replay=rep, agree_exact=exact, agree_action=action,
+                                   agree_semantic=agree_sem, sim=round(sim, 3),
+                                   usage=usage, cost_usd=round(c, 4))
+                        # goal-based per-step quality: is the arm's action good/degraded/bad
+                        # toward the TASK, on its own merits (robust to valid divergence)
+                        if judge == "goal":
+                            # hybrid: a TEXT reply is judged against the ORIGINAL's text (same
+                            # conclusion = good); a TOOL action is judged on its own merits
+                            if rep.get("type") == "text" and orig.get("type") == "text":
+                                q, jc = eng.judge_text_match(orig, rep, task_hint, env)
+                            else:
+                                q, jc = eng.judge_action_quality(
+                                    task_hint, eng.recent_context(msgs, i), rep, env)
+                            judge_spent += jc
+                            spent += jc
+                            rec["quality"] = q
+                            by_step[step]["quality"] = q
+                            if q in qual:
+                                qual[q] += 1
+                except Exception as e:  # noqa: BLE001 — record & continue, never abort the run
+                    rec["error"] = f"replay exception: {type(e).__name__}: {e}"[:250]
                     n_err += 1
                     consec_err += 1
-                    first_err = first_err or err
-                else:
-                    consec_err = 0
-                    rep = eng.extract_action(resp.get("content", []))
-                    # score against the session's REAL cwd so `cd <proj> && …` artifacts
-                    # normalize (local sessions run in their project dir, not /app)
-                    exact, action, sim = eng.score(orig, rep, cwd=meta["cwd"] or "/app")
-                    # semantic agreement (judge=equivalence): an LLM upgrades a structural
-                    # near-miss that is a functionally-equivalent decision (grep vs rg). Only
-                    # judge disagreements — matches already agree.
-                    agree_sem = action
-                    if judge == "equivalence" and not action:
-                        eq, jc = eng.judge_equivalent(orig, rep, env, task_hint)
-                        agree_sem = bool(eq)
-                        judge_spent += jc
-                        spent += jc
-                    usage = resp.get("usage", {})
-                    # bill the CCR retrieve round-trips as part of this decision's cost —
-                    # else headroom-CCR looks artificially cheap (it pays for extra calls)
-                    c = eng.cost_usd(usage, replay_model) + ccr_overhead
-                    spent += c
-                    n_ok += 1
-                    n_action += action
-                    n_exact += exact
-                    step_ctx = (usage.get("input_tokens", 0)
-                                + usage.get("cache_read_input_tokens", 0)
-                                + usage.get("cache_creation_input_tokens", 0))
-                    ctx_total += step_ctx
-                    ctx_series.append(step_ctx)
-                    # per-step, keyed by the shared decision-point index so arm-vs-control
-                    # deltas can be computed over the COMMON steps all arms reached (an arm
-                    # that hits its budget early must not be compared over a longer step set)
-                    by_step[step] = {"ctx": step_ctx, "cost": round(c, 4), "agree": bool(action)}
-                    rec.update(replay=rep, agree_exact=exact, agree_action=action,
-                               agree_semantic=agree_sem, sim=round(sim, 3),
-                               usage=usage, cost_usd=round(c, 4))
-                    # goal-based per-step quality: is the arm's action a good/degraded/bad
-                    # step toward the TASK, on its own merits (robust to valid divergence)
-                    if judge == "goal":
-                        # hybrid: a TEXT reply is judged against the ORIGINAL's text (the
-                        # reference answer — same conclusion = good); a TOOL action is judged
-                        # on its own merits toward the task (robust to valid path divergence)
-                        if rep.get("type") == "text" and orig.get("type") == "text":
-                            q, jc = eng.judge_text_match(orig, rep, task_hint, env)
-                        else:
-                            q, jc = eng.judge_action_quality(
-                                task_hint, eng.recent_context(msgs, i), rep, env)
-                        judge_spent += jc
-                        spent += jc
-                        rec["quality"] = q
-                        by_step[step]["quality"] = q
-                        if q in qual:
-                            qual[q] += 1
+                    first_err = first_err or rec["error"]
                 if ccr_active and mcp and mcp.ok:
                     rec["ccr_retrieves"] = nr
                 f.write(json.dumps(rec) + "\n")
