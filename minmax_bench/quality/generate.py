@@ -21,6 +21,7 @@ Optional (full): --milestones runs an LLM judge over the runs → results/<out>/
 Nothing here is read by report.py except the files it writes. Keep generation and display separate.
 """
 import argparse
+import contextlib
 import glob
 import json
 import os
@@ -33,8 +34,54 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+
 from minmax_bench.quality import engine as eng  # the teacher-forced replay engine
 from minmax_bench.quality.engine import DEFAULT_TASKS, dataset_tasks, resolve_tasks
+
+_console = Console()  # full-run progress renders through this (rich, coordinates with Live)
+
+
+class _CellGrid:
+    """Live status grid for a full run — one row per (arm, task) cell, updated in place."""
+    _S = {"pending": ("dim", "· pending"), "running": ("cyan", "▶ running"),
+          "done": ("green", "✓ done"), "skip": ("dim", "↩ skipped"),
+          "failed": ("red", "✗ failed"), "timeout": ("red", "✗ timeout")}
+
+    def __init__(self, arms, tasks, kv, k, budget):
+        self.order = [(a, t) for a in arms for t in tasks]
+        self.kof = {a: (kv if a == "vanilla" else k) for a in arms}
+        self.budget, self.run_start = budget, time.monotonic()
+        self.state = {c: {"status": "pending", "trials": 0, "start": None} for c in self.order}
+
+    def set(self, arm, task, status, trials=None, start=None):
+        s = self.state[(arm, task)]
+        s["status"] = status
+        if trials is not None:
+            s["trials"] = trials
+        if start is not None:
+            s["start"] = start
+
+    def render(self):
+        now = time.monotonic()
+        t = Table(title="[bold]quality run — full trajectories")
+        for c, j in (("#", "right"), ("arm", "left"), ("task", "left"),
+                     ("status", "left"), ("trials", "right"), ("elapsed", "right")):
+            t.add_column(c, justify=j)
+        finished = {"done", "skip", "failed", "timeout"}
+        n_done = 0
+        for i, (arm, task) in enumerate(self.order, 1):
+            s = self.state[(arm, task)]
+            style, label = self._S[s["status"]]
+            n_done += s["status"] in finished
+            el = f"{int(now - s['start'])}s" if s["start"] and s["status"] == "running" else ""
+            t.add_row(str(i), arm, task, f"[{style}]{label}[/]",
+                      f"{s['trials']}/{self.kof[arm]}", el)
+        t.caption = (f"{n_done}/{len(self.order)} cells · {int(now - self.run_start)}s elapsed · "
+                     f"ceiling ${sum(self.kof.values()) * self.budget:.0f}")
+        return t
 
 DEFAULT_DATASET = "terminal-bench/terminal-bench-2-1"  # the only validated dataset so far
 DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -97,7 +144,7 @@ def _start_proxy(out, mode):
         # would silently mislabel results. A reused proxy isn't ours, so we don't stop it.
         existing = _proxy_mode()
         if existing == mode:
-            print(f"[headroom] reusing existing {mode}-mode proxy on :{HRPORT}")
+            _console.print(f"[dim][headroom] reusing existing {mode}-mode proxy on :{HRPORT}[/]")
             return None
         sys.exit(f"port {HRPORT} is serving a {existing or 'unknown'}-mode proxy but this arm "
                  f"needs mode={mode}; stop it (`kill $(lsof -ti :{HRPORT})`) or set HRPORT.")
@@ -112,7 +159,7 @@ def _start_proxy(out, mode):
     p._tmb_log = log  # closed in _stop_proxy
     for _ in range(90):  # token mode cold-starts slowly (model/tokenizer downloads)
         if _proxy_up():
-            print(f"[headroom] proxy up on :{HRPORT} (mode={mode})")
+            _console.print(f"[dim][headroom] proxy up on :{HRPORT} (mode={mode})[/]")
             return p
         if p.poll() is not None:
             break
@@ -156,7 +203,7 @@ def _reap_docker():
             subprocess.run(["docker", *remover, *ids], capture_output=True)
             reaped += len(ids)
     if reaped:
-        print(f"[cleanup] removed {reaped} leftover harbor docker container(s)/network(s)")
+        _console.print(f"[dim][cleanup] removed {reaped} leftover harbor container(s)/net(s)[/]")
 
 
 def _agent_auth_env(env):
@@ -254,102 +301,94 @@ def full(args, env):
     model = args.model or DEFAULT_MODEL
     kv = args.k_vanilla or args.k + 1
     trials = len(tasks) * (kv + args.k * (len(arms) - 1))
-    print(f"[plan] {len(arms)} arms ({', '.join(arms)}) x {len(tasks)} tasks "
-          f"({', '.join(tasks)}) x k={args.k} (vanilla {kv}) = {trials} trials, "
-          f"cost ceiling ~${trials * args.budget_usd:.0f} "
-          f"(--budget-usd {args.budget_usd:g}/trial cap)")
-    total_cells, cell_idx = len(arms) * len(tasks), 0
-    for arm in arms:
-        # the vanilla band is the noise floor every arm is judged against — one extra
-        # vanilla run sharpens every verdict, so it defaults to k+1
-        k = (args.k_vanilla or args.k + 1) if arm == "vanilla" else args.k
-        proxy = None
-        try:
-            if arm in HEADROOM_MODES and not args.dry_run:
-                proxy = _start_proxy(out, HEADROOM_MODES[arm])
-            base, allow, agent, extra = _arm_wiring(arm, env)
-            for task in tasks:
-                cell_idx += 1
-                cell = f"{out}/{arm}-{task}"
-                # trial-level resume: run only the trials this cell is still missing, so an
-                # interrupted run picks up where it left off instead of re-spending finished
-                # trials (a whole cell is skipped when it's already complete)
-                done = len(glob.glob(f"{cell}/*/*/verifier/reward.txt"))
-                run_k = k if args.force else max(0, k - done)
-                cmd = ["harbor", "run", "-d", args.dataset, "-a", agent, "-m", model,
-                       "-i", f"{org}/{task}", "-k", str(run_k),
-                       "-n", str(args.concurrency),
-                       "-o", cell, "--ak", f"max_budget_usd={args.budget_usd}",
-                       "--allow-agent-host", allow, *_agent_auth_env(env), *extra]
-                # agent SETUP (install Claude Code + node/deps per container) has its OWN
-                # timeout (harbor default 360s), separate from EXECUTION. On a cold image
-                # or a loaded machine even the plain agent blows past 360s and every trial
-                # dies before the agent runs — so bump the setup timeout for EVERY arm.
-                cmd += ["--agent-setup-timeout-multiplier", str(args.setup_timeout_mult)]
-                # agent EXECUTION timeout: the CCR agent (headroom) also installs headroom-ai
-                # + the mcp SDK and runs a heavier loop, so give it more execution time too.
-                mult = args.agent_timeout_mult or (3 if arm == "headroom" else None)
-                if mult:
-                    cmd += ["--agent-timeout-multiplier", str(mult)]
-                renv = {**os.environ, "ANTHROPIC_BASE_URL": base,
-                        "PYTHONPATH": os.getcwd() + os.pathsep + os.environ.get("PYTHONPATH", "")}
-                if arm == "headroom-kompress":
-                    print("[note] headroom-kompress = token-mode compression WITHOUT the retrieve "
-                          "loop (ablation); the full product is the 'headroom' arm (with CCR)")
-                print(f"### [{cell_idx}/{total_cells}] {arm} / {task} (k={k}, base={base}) ###")
-                if args.dry_run:
-                    print("   " + " ".join(cmd))
-                    continue
-                if run_k <= 0:
-                    print(f"[skip] {arm}/{task} complete ({done}/{k} trials, --force to rerun)")
-                    continue
-                if done:
-                    print(f"[resume] {arm}/{task} has {done}/{k} — running the {run_k} missing")
-                # record intent BEFORE running so killed/crashed trials still count as
-                # attempted — report.py uses this to expose survivorship instead of
-                # silently shrinking n (a reward.txt-less trial is a failure, not noise)
-                os.makedirs(cell, exist_ok=True)
-                json.dump({"k": k, "arm": arm, "task": task,
-                           "started_utc": datetime.now(UTC).isoformat(timespec="seconds")},
-                          open(f"{cell}/attempted.json", "w"))
-                # per-trial wall budget: the timeout must cover all k trials of the cell,
-                # otherwise slow arms systematically lose their later trials.
-                # subprocess timeout (not the GNU `timeout` binary) — stock macOS has none.
-                with open(f"{out}/_runlog.txt", "a") as runlog:
-                    # tracked Popen (not subprocess.run) so an interrupt/timeout can
-                    # terminate this harbor child and wait for its container/network
-                    # teardown BEFORE the reaper runs
-                    proc = subprocess.Popen(cmd, env=renv, stdout=runlog,
-                                            stderr=subprocess.STDOUT)
-                    _HARBOR[0] = proc
-                    # harbor logs to _runlog.txt (not the console), so a cell would otherwise
-                    # run silently for minutes — print a heartbeat with elapsed / cap so a long
-                    # run visibly progresses. wall_timeout scales with the trials actually run.
-                    start, cap = time.monotonic(), args.wall_timeout * run_k
-                    beat = start
-                    try:
-                        while True:
-                            try:
-                                proc.wait(timeout=15)
-                                break
-                            except subprocess.TimeoutExpired:
-                                now = time.monotonic()
-                                if now - start >= cap:
-                                    proc.terminate()
-                                    try:
-                                        proc.wait(timeout=20)
-                                    except subprocess.TimeoutExpired:
-                                        proc.kill()
-                                    print(f"[timeout] {arm}/{task} killed after {int(cap)}s "
-                                          f"— partial trials recorded", file=sys.stderr)
-                                    break
-                                if now - beat >= 60:  # heartbeat once a minute
-                                    print(f"   …running ({int(now - start)}s / cap {int(cap)}s)")
-                                    beat = now
-                    finally:
-                        _HARBOR[0] = None
-        finally:
-            _stop_proxy(proxy)
+    _console.print(f"[bold]plan[/] {len(arms)} arms ({', '.join(arms)}) × {len(tasks)} tasks "
+                   f"× k={args.k} (vanilla {kv}) = {trials} trials, cost ceiling "
+                   f"~${trials * args.budget_usd:.0f} (${args.budget_usd:g}/trial cap)")
+    grid = _CellGrid(arms, tasks, kv, args.k, args.budget_usd)
+    # a live status grid for the run (matches the wizard's rich look); dry-run stays plain
+    live_ctx = (contextlib.nullcontext() if args.dry_run
+                else Live(grid.render(), console=_console, refresh_per_second=4))
+    with live_ctx as live:
+        for arm in arms:
+            # the vanilla band is the noise floor every arm is judged against — one extra
+            # vanilla run sharpens every verdict, so it defaults to k+1
+            k = (args.k_vanilla or args.k + 1) if arm == "vanilla" else args.k
+            proxy = None
+            try:
+                if arm in HEADROOM_MODES and not args.dry_run:
+                    proxy = _start_proxy(out, HEADROOM_MODES[arm])
+                base, allow, agent, extra = _arm_wiring(arm, env)
+                for task in tasks:
+                    cell = f"{out}/{arm}-{task}"
+                    # trial-level resume: run only the trials this cell is still missing, so an
+                    # interrupt picks up where it left off instead of re-spending finished trials
+                    done = len(glob.glob(f"{cell}/*/*/verifier/reward.txt"))
+                    run_k = k if args.force else max(0, k - done)
+                    cmd = ["harbor", "run", "-d", args.dataset, "-a", agent, "-m", model,
+                           "-i", f"{org}/{task}", "-k", str(run_k),
+                           "-n", str(args.concurrency),
+                           "-o", cell, "--ak", f"max_budget_usd={args.budget_usd}",
+                           "--allow-agent-host", allow, *_agent_auth_env(env), *extra]
+                    # agent SETUP (install Claude Code + node/deps per container) has its OWN
+                    # timeout (harbor default 360s), separate from EXECUTION — bump it for every
+                    # arm so a cold image doesn't kill trials before the agent even runs.
+                    cmd += ["--agent-setup-timeout-multiplier", str(args.setup_timeout_mult)]
+                    # EXECUTION timeout: the CCR agent (headroom) installs headroom-ai + the mcp
+                    # SDK and runs a heavier loop, so give it more execution time too.
+                    mult = args.agent_timeout_mult or (3 if arm == "headroom" else None)
+                    if mult:
+                        cmd += ["--agent-timeout-multiplier", str(mult)]
+                    renv = {**os.environ, "ANTHROPIC_BASE_URL": base,
+                            "PYTHONPATH": os.getcwd() + os.pathsep
+                            + os.environ.get("PYTHONPATH", "")}
+                    if args.dry_run:
+                        print(f"### {arm} / {task} (k={k}, base={base}) ###")
+                        print("   " + " ".join(cmd))
+                        continue
+                    if run_k <= 0:
+                        grid.set(arm, task, "skip", done)
+                        live.update(grid.render())
+                        continue
+                    grid.set(arm, task, "running", done, start=time.monotonic())
+                    live.update(grid.render())
+                    # record intent BEFORE running so killed/crashed trials still count as
+                    # attempted — report.py exposes survivorship instead of silently shrinking n
+                    os.makedirs(cell, exist_ok=True)
+                    json.dump({"k": k, "arm": arm, "task": task,
+                               "started_utc": datetime.now(UTC).isoformat(timespec="seconds")},
+                              open(f"{cell}/attempted.json", "w"))
+                    timed_out = False
+                    # per-trial wall budget scaled to the trials actually run. tracked Popen (not
+                    # subprocess.run) so an interrupt/timeout terminates the harbor child and waits
+                    # for its container/network teardown BEFORE the reaper runs.
+                    with open(f"{out}/_runlog.txt", "a") as runlog:
+                        proc = subprocess.Popen(cmd, env=renv, stdout=runlog,
+                                                stderr=subprocess.STDOUT)
+                        _HARBOR[0] = proc
+                        cap = args.wall_timeout * run_k
+                        cell_start = grid.state[(arm, task)]["start"]
+                        try:
+                            while proc.poll() is None:
+                                live.update(grid.render())  # ticks the elapsed clock
+                                try:
+                                    proc.wait(timeout=0.5)
+                                except subprocess.TimeoutExpired:
+                                    if time.monotonic() - cell_start >= cap:
+                                        proc.terminate()
+                                        try:
+                                            proc.wait(timeout=20)
+                                        except subprocess.TimeoutExpired:
+                                            proc.kill()
+                                        timed_out = True
+                                        break
+                        finally:
+                            _HARBOR[0] = None
+                    ntrials = len(glob.glob(f"{cell}/*/*/verifier/reward.txt"))
+                    status = "timeout" if timed_out else ("done" if ntrials >= k else "failed")
+                    grid.set(arm, task, status, ntrials)
+                    live.update(grid.render())
+            finally:
+                _stop_proxy(proxy)
     if not args.dry_run:
         # resume hint: cells still missing trials (timeouts, failures, or an interrupt) —
         # re-running the same command finishes them without re-spending completed trials
@@ -357,12 +396,14 @@ def full(args, env):
             want = (args.k_vanilla or args.k + 1) if a == "vanilla" else args.k
             return len(glob.glob(f"{out}/{a}-{t}/*/*/verifier/reward.txt")) < want
         incomplete = [(a, t) for a in arms for t in tasks if _need(a, t)]
+        ncells = len(arms) * len(tasks)
         if incomplete:
-            print(f"[resume] {len(incomplete)}/{total_cells} cells incomplete — re-run the SAME "
-                  f"command to finish them (done trials skip; partial cells run only the missing).")
+            _console.print(f"[yellow][resume][/] {len(incomplete)}/{ncells} cells incomplete — "
+                           f"re-run the SAME command to finish them (done trials skip; partial "
+                           f"cells run only the missing).")
         else:
-            print(f"[done] all {total_cells} cells complete → "
-                  f"minmax-bench quality report --from {out} --tasks {len(tasks)}")
+            _console.print(f"[green][done][/] all {ncells} cells complete → "
+                           f"minmax-bench quality report --from {out} --tasks {len(tasks)}")
     if args.milestones and not args.dry_run:
         judge_milestones(args, env)
 
