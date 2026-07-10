@@ -67,8 +67,8 @@ cp .env.dist .env       # then fill in only the keys for what you run
 |---|---|
 | `report` / `replay` reference runs, offline demo, `run --dataset sample` | **none** |
 | your sessions' *recorded* cost (the counterfactual `recorded` row) | **none** |
-| replays: counterfactual, incremental, cost-bench proxy runs | `ANTHROPIC_API_KEY`, **or a Claude Code login** (see below) |
-| the condense arm | + `CONDENSE_API_KEY` |
+| replays: `quality incremental` (your own sessions) + cost-bench proxy runs | `ANTHROPIC_API_KEY`, **or a Claude Code login** (see below) |
+| the quality-bench condense arm | + `CONDENSE_API_KEY` (cost-bench condense uses the `dense` CLI login) |
 | `--mode full` (Harbor) | Docker + `uv tool install harbor` + the above |
 
 **No API key? Your Claude Code subscription works.** When `ANTHROPIC_API_KEY` is unset, the
@@ -158,7 +158,7 @@ replayable and re-scorable exactly like the reference runs above:
 ```bash
 uv run minmax-bench run -d swe-chat:32 \
   -s headroom -s headroom-kompress -s condense-async \
-  -m claude-haiku-4-5 --token-budget 190k --json out/run.json
+  -m claude-haiku-4-5 --token-budget 190k
 ```
 
 - `--token-budget 190k` keeps every turn under Haiku's 200k cap so long sessions
@@ -176,8 +176,8 @@ Per strategy, two tables bucketed by input-chain length:
 - **tokens saved** — baseline vs strategy prompt tokens, per-tier and percent.
 - **cost saved (USD)** — the same after cache-aware pricing.
 
-Empty buckets are dropped; the `ALL` row is the aggregate. `--json PATH` writes the
-full bucket stats for further analysis.
+Empty buckets are dropped; the `ALL` row is the aggregate. Every run is saved under
+`runs/run-<uuid>/report.json` with the full bucket stats for further analysis.
 
 ### Illustrative findings (from the reference runs)
 
@@ -235,12 +235,13 @@ A verdict is **✓** if the method's band *overlaps* vanilla's, **✗** if disjo
 **≥ 2 finished runs per arm** (a single run can't be told from a fluke; this kills the k=1 mirage
 where length and cost swing wildly). Read ✓ honestly: with k≈3, band overlap only detects *gross*
 divergence — it means "no detectable divergence at this k", not statistical equivalence.
-Arm names match the cost bench's strategy matrix so quality verdicts and cost numbers join
-by name: `headroom` = cache-mode proxy; **`headroom-ccr`** = token-mode proxy *plus* the MCP
-retrieve loop — the full Compress-Cache-Retrieve product, which is headroom's intended
-token-mode deployment and therefore the fair token-mode arm; `headroom-kompress` = token-mode
-compression *without* retrieval, kept only as an ablation (it matches the cost-bench strategy
-of the same name, but judging headroom's quality by it would be a strawman).
+Quality arms: `headroom` = the token-mode proxy *plus* the MCP retrieve loop — the full
+Compress-Cache-Retrieve (CCR) product; `headroom-kompress` = token-mode compression *without*
+retrieval, kept only as an ablation (judging headroom's quality by it would be a strawman).
+Note the same names carry different meanings across the two benches: in the **cost** bench
+`headroom` is the cache-mode strategy and `headroom-kompress` is token-mode; only
+`headroom-kompress` (token, no retrieval) means the same thing in both. The quality bench's
+`headroom` (token + CCR) has no cost-bench counterpart, because CCR needs a running agent.
 Full tooling + reproduction: [`scripts/README.md`](scripts/README.md).
 
 **Offline demo — no keys, no Docker (~30 s)** — a tiny sample of real recorded runs ships in
@@ -307,7 +308,7 @@ Reported impartially, including results unfavorable to condense.
   (5 → 12 steps) by **inducing todo-tool planning + verification** — behavioral, *not* amnesia. This
   *explains* that task's large full-run cost gap (which looked like noise at k=1).
 - **Token savings ≠ dollar savings** — compaction busts the prompt cache (the same effect behind the
-  `headroom-token` cost result above); verified two ways (teacher-forced replay + real runs).
+  `headroom-kompress` (token-mode) cost result above); verified two ways (teacher-forced replay + real runs).
 
 ## Layout
 
