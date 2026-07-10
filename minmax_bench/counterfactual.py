@@ -17,8 +17,10 @@ recorded backtest anchor. It writes ``<out>/incremental/<task>-<arm>.jsonl`` so
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -371,8 +373,11 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     inc_dir.mkdir(parents=True, exist_ok=True)
     sid = str(uuid.uuid4())
     # the session's first user text — task context for the equivalence judge
-    task_hint = next((b.get("text", "") for b in msgs[0]["content"]
-                      if isinstance(b, dict) and b.get("type") == "text"), "") if msgs else ""
+    # the first real user instruction — skip injected <system-reminder>/CLAUDE.md blocks
+    # (ensure_reminders may have prepended them) so the judges get the task, not the reminders
+    task_hint = next((b.get("text", "") for b in (msgs[0]["content"] if msgs else [])
+                      if isinstance(b, dict) and b.get("type") == "text"
+                      and not b.get("text", "").lstrip().startswith("<")), "")
     summary: dict = {"session": str(session), "model": replay_model, "steps": len(sel),
                      "judged": judge, "arms": {}}
     from minmax_bench.quality import generate as gen
@@ -392,10 +397,11 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
             TextColumn(f"[cyan]{arm:9}[/]"), BarColumn(),
             TextColumn("{task.completed}/{task.total} [dim]{task.fields[stat]}[/]"),
             TimeElapsedColumn(), console=console,
-        ) as prog:
+        ) as prog, contextlib.ExitStack() as stack:
             if ccr_active:
-                mcp = eng.HeadroomMCP(f"http://127.0.0.1:{gen.HRPORT}",
-                                      str(out_dir / "headroom-mcp.log")).__enter__()
+                # ExitStack closes the mcp serve subprocess on ANY exit (incl. exception)
+                mcp = stack.enter_context(eng.HeadroomMCP(
+                    f"http://127.0.0.1:{gen.HRPORT}", str(out_dir / "headroom-mcp.log")))
                 console.print("[dim]headroom CCR: retrieve loop active via mcp serve[/]" if mcp.ok
                               else "[yellow]headroom CCR: mcp serve unavailable — arm runs as "
                                    "kompress (no retrieve)[/]")
@@ -476,8 +482,6 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                 f.flush()
                 prog.update(tid, advance=1,
                             stat=f"agree {n_action}/{n_ok or 1} ${spent:.2f}")
-            if mcp:
-                mcp.__exit__()
         summary["arms"][arm] = {
             "steps_ok": n_ok, "agree_action": n_action, "agree_exact": n_exact,
             "errors": n_err, "first_error": (first_err or "")[:300],
@@ -733,7 +737,7 @@ def render_summary(summary: dict, console: Console) -> None:
 # --------------------------------------------------------------------------- per-step view
 _CAT_STYLE = {"good": ("green", "✓ good"), "semi": ("yellow", "◐ semi"),
               "bad": ("red", "✗ bad"), "err": ("dim", "· err")}
-_REDUND_RE = __import__("re").compile(r"\b(cat|head|tail|less|more|bat|sed -n|nl|grep|rg)\b")
+_REDUND_RE = re.compile(r"\b(cat|head|tail|less|more|bat|sed -n|nl|grep|rg)\b")
 
 
 def _digest(a):

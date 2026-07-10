@@ -17,7 +17,7 @@ flipped actions, and per-step agreement doesn't capture compounding.
 
 This module is the LIBRARY: session I/O, request building, calling, scoring.
 The drivers are `scripts/generate.py --mode incremental` (batch, artifacts for
-report.py) and `minmax-bench counterfactual` (interactive, local sessions).
+report.py) and `minmax-bench quality incremental` (interactive, local sessions).
 
 Template = a real CC request captured via a local recording server (has the
 version-matched system prompt, tools, beta headers, thinking/context_management
@@ -115,9 +115,10 @@ def resolve_tasks(raw, org="terminal-bench", seed=None):
     return [t for t in raw.split(",") if t.strip()]
 
 
-# NOTE: teacher-forced replay executes no tools, so headroom's CCR retrieve loop cannot
-# engage here — the 'headroom' arm below measures the proxy only (cache or token mode,
-# per the driver's --headroom-mode). CCR is only measurable in generate.py --mode full.
+# The 'headroom' arm hits the proxy (cache or token mode, per --headroom-mode). In the
+# interactive `quality incremental` path, the CCR retrieve loop is INJECTED per step
+# (HeadroomMCP + ccr_step below) so it runs the full Compress-Cache-Retrieve product;
+# generate.py --mode incremental (batch) leaves it proxy-only.
 ARMS = {
     "control": {"base": "https://api.anthropic.com"},
     "condense": {"base": "https://api.condense.chat/anthropic", "condense_auth": True},
@@ -445,8 +446,10 @@ def capture_cc_request(cwd, model=None, version=None, port=0, timeout=90):
     Reads the user's own binary — the CALLER must have obtained consent."""
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
+    capture_cc_request.last_error = ""  # reset so a stale reason from a prior call can't leak
     binary = cc_binary_for(version)
     if not binary:
+        capture_cc_request.last_error = "no Claude Code binary found"
         return None
     captured = []
 
@@ -505,11 +508,16 @@ def capture_cc_request(cwd, model=None, version=None, port=0, timeout=90):
         err = str(e)[:300]
     finally:
         srv.shutdown()
+        srv.server_close()  # release the listening socket fd
         t.join(timeout=3)
     if not captured:
         capture_cc_request.last_error = err or "no request captured"  # surfaced by the caller
         return None
-    return max(captured, key=lambda r: len(r.get("tools", [])))  # the turn with the catalog
+    # the turn with the tool catalog is the agent turn (title/quota helpers carry no tools);
+    # guarantee a `tools` key so the caller never KeyErrors
+    best = max(captured, key=lambda r: len(r.get("tools", [])))
+    best.setdefault("tools", [])
+    return best
 
 
 def captured_reminders(captured_req):
@@ -593,11 +601,19 @@ class HeadroomMCP:
         self.p.stdin.write(json.dumps(obj) + "\n")
         self.p.stdin.flush()
 
-    def _rpc(self, method, params):
+    def _rpc(self, method, params, timeout=30):
+        import select
         self._id += 1
         rid = self._id
         self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
         while True:  # skip any interleaved notifications until our response id comes back
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None  # a hung `mcp serve` must not stall the whole replay
+            ready, _, _ = select.select([self.p.stdout], [], [], remaining)
+            if not ready:
+                return None
             line = self.p.stdout.readline()
             if not line:
                 return None
@@ -640,13 +656,20 @@ def ccr_step(arm, tmpl_body, prefix, args, sid, tmpl_headers, env, mcp, max_retr
         resp, err = call_api(arm, build_request(tmpl_body, working, args, sid), tmpl_headers, env)
         if err:
             return resp, err, n, overhead
-        tu = next((b for b in resp.get("content", [])
-                   if b.get("type") == "tool_use" and b.get("name") in CCR_TOOL_NAMES), None)
-        if not tu or mcp is None or not mcp.ok:
-            return resp, err, n, overhead  # a real action (or no executor) → caller scores + bills
+        content = resp.get("content", [])
+        tool_uses = [b for b in content if b.get("type") == "tool_use"]
+        retr = [b for b in tool_uses if b.get("name") in CCR_TOOL_NAMES]
+        # only continue the loop when retrieve is the SOLE tool call — if the turn mixes a
+        # retrieve with another tool_use we can't resolve the other, so treat it as the action
+        if len(retr) != 1 or len(tool_uses) != 1 or mcp is None or not mcp.ok:
+            return resp, err, n, overhead  # real action (or unresolvable) → caller scores + bills
+        tu = retr[0]
         overhead += cost_usd(resp.get("usage", {}), model)  # this retrieve round-trip's cost
         result = mcp.retrieve(tu.get("input", {})) or "[headroom_retrieve: content unavailable]"
-        working.append({"role": "assistant", "content": resp["content"]})
+        # feed back the assistant turn WITHOUT thinking blocks — a replayed thinking block has
+        # no valid signature, and Anthropic 400s on an unsigned thinking block before tool_use
+        asst = [b for b in content if b.get("type") not in ("thinking", "redacted_thinking")]
+        working.append({"role": "assistant", "content": asst})
         working.append({"role": "user", "content": [{"type": "tool_result",
                         "tool_use_id": tu["id"], "content": result}]})
         n += 1
@@ -678,7 +701,9 @@ def _norm_cmd(cmd, cwd="/app"):
     phrasing. Normalizing both sides keeps the comparison about the decision.
     """
     c = _CD_PREFIX.sub("", str(cmd))
-    c = c.replace(cwd.rstrip("/") + "/", "").replace(cwd.rstrip("/"), ".")
+    base = (cwd or "").rstrip("/")
+    if base:  # a root cwd ("/") would strip every slash — skip the path rewrite then
+        c = c.replace(base + "/", "").replace(base, ".")
     return norm_ws(c)
 
 
