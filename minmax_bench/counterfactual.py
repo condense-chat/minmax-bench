@@ -206,7 +206,8 @@ def estimate_usd(msgs, points, price) -> tuple[float, float]:
 def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, every: int,
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,
            model: str | None = None, auth: str = "auto", task: str = "session",
-           judge: str = "off", capture: bool = False, headroom_mode: str = "token") -> dict:
+           judge: str = "off", capture: bool = False, headroom_mode: str = "token",
+           ccr: bool = True) -> dict:
     env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
     if auth == "subscription":
         # force the Claude Code login path even when an API key is configured
@@ -374,17 +375,30 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                       if isinstance(b, dict) and b.get("type") == "text"), "") if msgs else ""
     summary: dict = {"session": str(session), "model": replay_model, "steps": len(sel),
                      "judged": judge, "arms": {}}
+    from minmax_bench.quality import generate as gen
     for arm in all_arms:
         path = inc_dir / f"{task}-{arm}.jsonl"
         spent, n_ok, n_action, n_exact, ctx_total = 0.0, 0, 0, 0, 0
         n_err, first_err, ctx_series = 0, None, []
         qual = {"good": 0, "degraded": 0, "bad": 0}  # goal-judge tally
         by_step = {}  # step-index -> {ctx, cost, agree} for common-step fair aggregation
+        # CCR injection: for the headroom arm, execute headroom_retrieve calls via
+        # `headroom mcp serve` so the real Compress-Cache-Retrieve loop engages (else the
+        # arm is only kompress). Retrieves are counted as CCR's step overhead.
+        ccr_active = ccr and arm == "headroom"
+        n_retrieves = 0
+        mcp = None
         with path.open("w") as f, Progress(
             TextColumn(f"[cyan]{arm:9}[/]"), BarColumn(),
             TextColumn("{task.completed}/{task.total} [dim]{task.fields[stat]}[/]"),
             TimeElapsedColumn(), console=console,
         ) as prog:
+            if ccr_active:
+                mcp = eng.HeadroomMCP(f"http://127.0.0.1:{gen.HRPORT}",
+                                      str(out_dir / "headroom-mcp.log")).__enter__()
+                console.print("[dim]headroom CCR: retrieve loop active via mcp serve[/]" if mcp.ok
+                              else "[yellow]headroom CCR: mcp serve unavailable — arm runs as "
+                                   "kompress (no retrieve)[/]")
             tid = prog.add_task("", total=len(sel), stat="")
             consec_err = 0
             for step, i in enumerate(sel):
@@ -395,8 +409,14 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                     prog.update(tid, stat=f"aborted: {consec_err} consecutive errors")
                     break
                 orig = eng.extract_action(msgs[i]["content"])
-                req = eng.build_request(tmpl_body, msgs[:i], args, sid)
-                resp, err = eng.call_api(arm, req, tmpl_headers, env)
+                ccr_overhead = 0.0
+                if ccr_active and mcp and mcp.ok:
+                    resp, err, nr, ccr_overhead = eng.ccr_step(arm, tmpl_body, msgs[:i], args,
+                                                               sid, tmpl_headers, env, mcp)
+                    n_retrieves += nr
+                else:
+                    req = eng.build_request(tmpl_body, msgs[:i], args, sid)
+                    resp, err = eng.call_api(arm, req, tmpl_headers, env)
                 rec = {"arm": arm, "step": step, "msg_index": i, "orig": orig}
                 if err:
                     rec["error"] = err
@@ -416,7 +436,9 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                     if judge == "equivalence" and not action:
                         agree_sem = bool(eng.judge_equivalent(orig, rep, env, task_hint))
                     usage = resp.get("usage", {})
-                    c = eng.cost_usd(usage, replay_model)
+                    # bill the CCR retrieve round-trips as part of this decision's cost —
+                    # else headroom-CCR looks artificially cheap (it pays for extra calls)
+                    c = eng.cost_usd(usage, replay_model) + ccr_overhead
                     spent += c
                     n_ok += 1
                     n_action += action
@@ -448,15 +470,20 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                         by_step[step]["quality"] = q
                         if q in qual:
                             qual[q] += 1
+                if ccr_active and mcp and mcp.ok:
+                    rec["ccr_retrieves"] = nr
                 f.write(json.dumps(rec) + "\n")
                 f.flush()
                 prog.update(tid, advance=1,
                             stat=f"agree {n_action}/{n_ok or 1} ${spent:.2f}")
+            if mcp:
+                mcp.__exit__()
         summary["arms"][arm] = {
             "steps_ok": n_ok, "agree_action": n_action, "agree_exact": n_exact,
             "errors": n_err, "first_error": (first_err or "")[:300],
             "avg_ctx_tokens": (ctx_total // n_ok) if n_ok else 0,
             "ctx_series": ctx_series, "quality": qual, "by_step": by_step,
+            "ccr_retrieves": n_retrieves, "ccr": bool(ccr_active and mcp and mcp.ok),
             "cost_usd": round(spent, 4), "file": str(path),
         }
     summary["judge"] = judge
@@ -628,6 +655,19 @@ def render_summary(summary: dict, console: Console) -> None:
                       f"({', '.join(f'{k} {v}' for k, v in reach.items())}) — likely a budget/"
                       f"error cap on [bold]{short}[/]. All vs-control deltas use the "
                       f"{len(common)} steps every arm reached, so they stay apples-to-apples.")
+    for arm, a in summary["arms"].items():
+        if arm != "headroom" or not a.get("by_step"):
+            continue
+        if a.get("ccr"):
+            nr = a.get("ccr_retrieves", 0)
+            console.print(f"[cyan]headroom = CCR[/]: the retrieve loop was injected — "
+                          f"{nr} headroom_retrieve call(s) executed via mcp serve "
+                          f"(counted as steps; that's CCR's real overhead). A fair vs-condense "
+                          f"comparison, not the kompress ablation.")
+        else:
+            console.print("[yellow]headroom ran as kompress[/] (retrieve loop unavailable) — "
+                          "compression WITHOUT retrieval, so it's handicapped vs its real CCR "
+                          "product. Use full mode (`quality run`) for the definitive comparison.")
     if summary.get("judge") == "goal":
         _render_goal_quality(summary, console, common)
     if floor is not None:

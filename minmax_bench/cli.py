@@ -133,7 +133,7 @@ def quality_report(
 def _run_incremental(*, session: str | None, arms: str, model: str | None, every: int,
                      limit: int, budget_usd: float, max_tokens: int, out: str, task: str,
                      auth: str, assume_yes: bool, judge: str = "off", steps: bool = True,
-                     capture: bool = False, headroom_mode: str = "token") -> None:
+                     capture: bool = False, headroom_mode: str = "token", ccr: bool = True) -> None:
     """Rich teacher-forced replay of one session — picker when no --session, model
     auto-fallback, cost preview, per-arm progress, a summary table with the recorded
     backtest anchor, and a per-step good/semi/bad/redundant readout. Writes
@@ -147,7 +147,7 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None, every
         summary = replay(sp, arm_list, budget_usd=budget_usd, limit=limit, every=every,
                          max_tokens=max_tokens, out_dir=Path(out), console=console,
                          assume_yes=assume_yes, model=model, auth=auth, task=task, judge=judge,
-                         capture=capture, headroom_mode=headroom_mode)
+                         capture=capture, headroom_mode=headroom_mode, ccr=ccr)
     except SystemExit as e:
         raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
     render_summary(summary, console)
@@ -173,6 +173,7 @@ def quality_incremental(
     steps: bool = typer.Option(True, "--steps/--no-steps", help="Show the per-step good/semi/bad/redundant readout."),
     capture: bool = typer.Option(False, "--capture", help="Run your version-matched Claude Code binary once (locally) to capture its EXACT system prompt + tools, instead of an approximate template."),
     headroom_mode: str = typer.Option("token", "--headroom-mode", help="For a headroom arm: token (compression — the meaningful test) or cache (~passthrough). Auto-starts the proxy."),
+    ccr: bool = typer.Option(True, "--ccr/--no-ccr", help="For the headroom arm, inject the CCR retrieve loop (via headroom mcp serve) so it runs the real product, not the kompress ablation."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
 ):
     """Incremental (teacher-forced per-step) trajectories — the paired counterpart
@@ -188,7 +189,7 @@ def quality_incremental(
     _run_incremental(session=session, arms=arms, model=model, every=every, limit=limit,
                      budget_usd=budget_usd, max_tokens=max_tokens, out=out_dir, task=task,
                      auth=auth, assume_yes=yes, judge=judge, steps=steps, capture=capture,
-                     headroom_mode=headroom_mode)
+                     headroom_mode=headroom_mode, ccr=ccr)
 
 
 # judge takes niche flags; pass through to the driver (which owns its --help)

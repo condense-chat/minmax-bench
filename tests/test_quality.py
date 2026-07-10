@@ -404,3 +404,34 @@ def test_common_step_aggregation_is_fair_when_an_arm_stops_early():
     ctrl = cf._over(arms["control"], common)
     # $ vs control over common steps = 1 - 0.8/2.0 = 60% (not 1 - 1.6/2.0 = 20% over own steps)
     assert abs((1 - c["cost"] / ctrl["cost"]) - 0.6) < 1e-9
+
+
+def test_ccr_step_executes_retrieve_then_scores_the_real_action(monkeypatch):
+    import minmax_bench.quality.engine as e
+    calls = {"n": 0}
+    def fake_call(arm, req, hdr, env):
+        calls["n"] += 1
+        if calls["n"] == 1:  # first response: the model asks to retrieve
+            return {"content": [{"type": "tool_use", "id": "t1", "name": "headroom_retrieve",
+                                 "input": {"hash": "abc"}}]}, None
+        return {"content": [tool("Read", file_path="/real.py")]}, None  # then the real action
+    monkeypatch.setattr(e, "call_api", fake_call)
+    monkeypatch.setattr(e, "build_request", lambda *a, **k: {"messages": a[1]})
+
+    class FakeMCP:
+        ok = True
+        def retrieve(self, args):
+            return "full content for " + args["hash"]
+    resp, err, nr, oh = e.ccr_step("headroom", {"model": "m"}, [], _args(), "sid", {}, {},
+                                   FakeMCP())
+    assert err is None and nr == 1                         # one retrieve executed
+    assert e.extract_action(resp["content"])["name"] == "Read"  # scored the post-retrieval action
+
+
+def test_ccr_step_no_mcp_falls_back_to_single_call(monkeypatch):
+    import minmax_bench.quality.engine as e
+    monkeypatch.setattr(e, "call_api",
+                        lambda *a, **k: ({"content": [tool("Bash", command="ls")]}, None))
+    monkeypatch.setattr(e, "build_request", lambda *a, **k: {})
+    resp, err, nr, oh = e.ccr_step("headroom", {}, [], _args(), "s", {}, {}, None)
+    assert nr == 0 and e.extract_action(resp["content"])["name"] == "Bash"

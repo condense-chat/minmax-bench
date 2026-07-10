@@ -554,6 +554,105 @@ def build_tools(used, tmpl_tools):
     return out
 
 
+# ------------------------------------------------------------------ CCR retrieve injection
+# Teacher-forced replay never executes tools, so headroom's CCR retrieve loop can't engage —
+# the arm sees compressed hash-markers but can't pull content back, which unfairly handicaps
+# it (it becomes the kompress ablation). We inject the client half: drive `headroom mcp serve`
+# over MCP-stdio to EXECUTE headroom_retrieve calls, exactly as Claude Code would, so the arm
+# runs the real Compress-Cache-Retrieve loop. Retrieve calls are counted as CCR's overhead.
+CCR_TOOL_NAMES = {"headroom_retrieve", "mcp__headroom__headroom_retrieve"}
+
+
+class HeadroomMCP:
+    """Runs `headroom mcp serve` (pointed at the token proxy) and executes headroom_retrieve
+    calls over MCP-stdio. Context manager. retrieve() returns the original content or a miss
+    note; a failed server degrades gracefully (the arm falls back to no-retrieve = kompress)."""
+    def __init__(self, proxy_url, log_path=None):
+        self.proxy_url, self.log_path = proxy_url, log_path
+        self.p, self._id, self.ok = None, 1, False
+
+    def __enter__(self):
+        import shutil
+        cmd = (["headroom"] if shutil.which("headroom")
+               else ["uvx", "--from", "headroom-ai", "headroom"]) + ["mcp", "serve"]
+        env = {**os.environ, "HEADROOM_PROXY_URL": self.proxy_url}
+        log = open(self.log_path, "w") if self.log_path else subprocess.DEVNULL
+        try:
+            self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=log, env=env, text=True, bufsize=1)
+            r = self._rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                         "clientInfo": {"name": "tmb-replay", "version": "1"}})
+            if r and r.get("result"):
+                self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                self.ok = True
+        except (OSError, ValueError):
+            self.ok = False
+        return self
+
+    def _send(self, obj):
+        self.p.stdin.write(json.dumps(obj) + "\n")
+        self.p.stdin.flush()
+
+    def _rpc(self, method, params):
+        self._id += 1
+        rid = self._id
+        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        while True:  # skip any interleaved notifications until our response id comes back
+            line = self.p.stdout.readline()
+            if not line:
+                return None
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") == rid:
+                return msg
+
+    def retrieve(self, arguments):
+        if not self.ok:
+            return None
+        try:
+            r = self._rpc("tools/call", {"name": "headroom_retrieve", "arguments": arguments})
+        except (OSError, ValueError):
+            return None
+        content = (r or {}).get("result", {}).get("content", [])
+        return " ".join(b.get("text", "") for b in content if isinstance(b, dict)) or None
+
+    def __exit__(self, *a):
+        if self.p:
+            try:
+                self.p.terminate()
+                self.p.wait(timeout=5)
+            except (subprocess.SubprocessError, OSError):
+                self.p.kill()
+
+
+def ccr_step(arm, tmpl_body, prefix, args, sid, tmpl_headers, env, mcp, max_retrieves=6):
+    """One decision point WITH the CCR retrieve loop: send the (compressed) prefix; while the
+    model calls headroom_retrieve, execute it via `mcp` and feed the result back; stop at the
+    first real action. Returns (resp, err, n_retrieves, overhead_usd) — n_retrieves is CCR's
+    step overhead and overhead_usd is what those extra retrieve round-trips cost (the caller
+    bills the final response itself, so this is the ADDED cost CCR incurs to reach the action)."""
+    working, n, overhead = list(prefix), 0, 0.0
+    model = tmpl_body.get("model")
+    resp, err = None, None
+    for _ in range(max_retrieves + 1):
+        resp, err = call_api(arm, build_request(tmpl_body, working, args, sid), tmpl_headers, env)
+        if err:
+            return resp, err, n, overhead
+        tu = next((b for b in resp.get("content", [])
+                   if b.get("type") == "tool_use" and b.get("name") in CCR_TOOL_NAMES), None)
+        if not tu or mcp is None or not mcp.ok:
+            return resp, err, n, overhead  # a real action (or no executor) → caller scores + bills
+        overhead += cost_usd(resp.get("usage", {}), model)  # this retrieve round-trip's cost
+        result = mcp.retrieve(tu.get("input", {})) or "[headroom_retrieve: content unavailable]"
+        working.append({"role": "assistant", "content": resp["content"]})
+        working.append({"role": "user", "content": [{"type": "tool_result",
+                        "tool_use_id": tu["id"], "content": result}]})
+        n += 1
+    return resp, err, n, overhead  # hit the retrieve cap → score whatever it last produced
+
+
 def extract_action(content):
     """First tool_use in an assistant content list, else the text."""
     for b in content:
