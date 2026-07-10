@@ -171,9 +171,9 @@ def quality_incremental(
     auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force the Claude Code login)."),
     judge: str = typer.Option("off", "--judge", help="Per-step LLM judge: off | goal (rate each action good/degraded/bad toward the task — robust, recommended) | equivalence (upgrade grep-vs-rg near-misses to 'agrees')."),
     steps: bool = typer.Option(True, "--steps/--no-steps", help="Show the per-step good/semi/bad/redundant readout."),
-    capture: bool = typer.Option(False, "--capture", help="Run your version-matched Claude Code binary once (locally) to capture its EXACT system prompt + tools, instead of an approximate template."),
+    capture: bool = typer.Option(False, "--capture", help="Run your version-matched Claude Code binary once (locally) to capture its system prompt + tools, instead of a stored template."),
     headroom_mode: str = typer.Option("token", "--headroom-mode", help="For a headroom arm: token (compression — the meaningful test) or cache (~passthrough). Auto-starts the proxy."),
-    ccr: bool = typer.Option(True, "--ccr/--no-ccr", help="For the headroom arm, inject the CCR retrieve loop (via headroom mcp serve) so it runs the real product, not the kompress ablation."),
+    ccr: bool = typer.Option(True, "--ccr/--no-ccr", help="For the headroom arm, inject the CCR retrieve loop (via headroom mcp serve); --no-ccr runs it as kompress (compression only)."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
 ):
     """Incremental (teacher-forced per-step) trajectories — the paired counterpart

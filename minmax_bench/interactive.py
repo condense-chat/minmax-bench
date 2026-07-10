@@ -490,12 +490,12 @@ def _full_wizard(console: Console) -> QualityWizardResult:
     from .quality.engine import DEFAULT_TASKS, resolve_tasks
     _select_one(console, "dataset", [
         ("terminal-bench", "terminal-bench-2-1 — curated coding tasks WITH verifiers", True),
-        ("swe-chat", "SWE-chat — real recorded sessions (no verifiers; incremental only)", False),
+        ("swe-chat", "SWE-chat — recorded sessions (no verifiers; incremental only)", False),
         ("custom", "another Harbor dataset", False),
     ])
     arms = _multiselect(console, "arms to compare (vanilla baseline always included)", [
         ("condense", "condense — compaction proxy", True, True),
-        ("headroom", "headroom — the full product: token proxy + retrieve loop (CCR)", True, True),
+        ("headroom", "headroom — token proxy + retrieve loop (CCR)", True, True),
         ("headroom-kompress", "headroom-kompress — token compression, no retrieval (ablation)",
          True, False),
     ])
@@ -560,7 +560,7 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     # compressible tool outputs; short ones fall back to kompress — the summary says which.)
     arms = _multiselect(console, "arms (vanilla control always included)", [
         ("condense", "condense — compaction proxy", True, True),
-        ("headroom", "headroom — real CCR: token proxy + injected retrieve loop", True, False),
+        ("headroom", "headroom — token proxy + injected retrieve loop (CCR)", True, False),
     ])
     # inherit the session's OWN model by default — replaying it faithfully is the point;
     # an arm that can't serve it auto-falls-back at run time (only override deliberately)
@@ -589,14 +589,14 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     from .counterfactual import session_meta
     ver = session_meta(Path(session)).get("version") or "newest on disk"
     console.print(Panel.fit(
-        f"[bold]faithful capture[/] (recommended for accuracy)\n"
+        f"[bold]capture from your Claude Code binary[/] (recommended)\n"
         f"Runs [bold]Claude Code {ver}[/] once in [bold]{Path(session).parent.name}[/]'s "
-        f"project dir to capture the EXACT system prompt, tool catalog, and CLAUDE.md your\n"
-        f"session actually used — far more faithful than an approximate template.\n"
+        f"project dir to capture the system prompt, tool catalog, and CLAUDE.md your\n"
+        f"session used, instead of a stored template.\n"
         f"[dim]• reads & runs your local `claude` binary   • one request to a LOCAL proxy — "
         f"nothing is sent externally, $0\n• falls back to the template if you decline[/]",
         border_style="cyan"))
-    capture = Confirm.ask("[cyan]capture the exact request from your Claude Code binary?[/]",
+    capture = Confirm.ask("[cyan]capture from your Claude Code binary?[/]",
                           default=True, console=console)
     # per-step scoring mode. structural (free) matches the exact action; but free-running
     # agents wander valid routes (control agrees only ~26%), so 'goal' is more robust — it

@@ -327,11 +327,11 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
             extra = eng.referenced_tool_names(msgs) - {t["name"] for t in captured["tools"]}
             tmpl_body["tools"] = captured["tools"] + eng.build_tools(extra, [])
             reminders = eng.captured_reminders(captured)
-            console.print(f"[green]captured[/] exact system prompt + "
-                          f"{len(captured['tools'])} tools from the binary — no approximation")
+            console.print(f"[green]captured[/] system prompt + "
+                          f"{len(captured['tools'])} tools from the binary")
         else:
             why = getattr(eng.capture_cc_request, "last_error", "")
-            console.print(f"[yellow]capture failed — falling back to the approximate "
+            console.print(f"[yellow]capture failed — falling back to the stored "
                           f"template[/]{(' [dim](' + why + ')[/]') if why else ''}")
     if not captured:
         # real template defs for CC tools; permissive stubs for mcp__/Skill/etc. Stub
@@ -660,14 +660,13 @@ def render_summary(summary: dict, console: Console) -> None:
             continue
         if a.get("ccr"):
             nr = a.get("ccr_retrieves", 0)
-            console.print(f"[cyan]headroom = CCR[/]: the retrieve loop was injected — "
-                          f"{nr} headroom_retrieve call(s) executed via mcp serve "
-                          f"(counted as steps; that's CCR's real overhead). A fair vs-condense "
-                          f"comparison, not the kompress ablation.")
+            console.print(f"[cyan]headroom: CCR retrieve loop engaged[/] — "
+                          f"{nr} headroom_retrieve call(s) executed via mcp serve, "
+                          f"counted as steps and billed into cost (CCR's overhead).")
         else:
             console.print("[yellow]headroom ran as kompress[/] (retrieve loop unavailable) — "
-                          "compression WITHOUT retrieval, so it's handicapped vs its real CCR "
-                          "product. Use full mode (`quality run`) for the definitive comparison.")
+                          "compression without retrieval. For headroom with CCR, use full mode "
+                          "(`quality run`), or check the mcp serve log.")
     if summary.get("judge") == "goal":
         _render_goal_quality(summary, console, common)
     if floor is not None:
