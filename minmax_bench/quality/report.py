@@ -168,6 +168,7 @@ def index_runs(root, agent):
             continue
         cell = idx.setdefault(key, {"runs": [], "attempted": None, "seen": set()})
         cell["attempted"] = (cell["attempted"] or 0) + k
+        cell["dir"] = os.path.dirname(ap)  # to tell "never ran" from "ran and crashed"
     return idx
 
 
@@ -189,8 +190,16 @@ def _cell_stats(cell):
         peaks.append(_peak_ctx(p))
     n = len(runs)
     attempted = cell["attempted"] if cell and cell["attempted"] else n
+    started = n  # trial dirs that actually opened (reward or not); >n means some crashed
+    cdir = cell.get("dir") if cell else None
+    if cdir:
+        try:
+            started = max(started, sum(1 for e in os.scandir(cdir) if e.is_dir()))
+        except OSError:
+            pass
     return {
         "n": n, "attempted": max(attempted, n), "lost": max(attempted, n) - n,
+        "started": started,
         # a trial that never finished is a failure on the solve axis, not missing data
         "solve": sum(r == "1" for _, r in runs),
         "length": band(lens), "rework": band(rws), "_lens": lens,
@@ -300,6 +309,9 @@ def _pct(x):
 
 
 def _solve(c):
+    # requested but no trial dir ever opened -> aborted / never ran, not a real 0/k
+    if c["n"] == 0 and c.get("started", 0) == 0:
+        return "—"
     s = f"{c['solve']}/{c['attempted']}"
     return s + (f" (⚠{c['lost']} lost)" if c["lost"] else "")
 
@@ -321,8 +333,10 @@ def table(d):
             a = r["arms"][arm]
             pk = r["vanilla"]["peak_ctx"]
             pk_txt = "—" if not pk else f"{pk / 1000:.0f}k" + (" ⊘" if r["sub_gate"] else "")
+            sv, sa = _solve(r["vanilla"]), _solve(a)
+            solve_txt = "—" if sv == "—" and sa == "—" else f"{sv} · {sa}"
             cells = [(r["task"], None), (arm, None),
-                     (f"{_solve(r['vanilla'])} · {_solve(a)}", None),
+                     (solve_txt, None),
                      (pk_txt, None),
                      (_b(r["vanilla"]["length"]), None), (_b(a["length"]), None),
                      (_v(a["length_ok"]), a["length_ok"]),
@@ -344,8 +358,10 @@ def table(d):
 
 
 SUB = ("vanilla = the noise floor; ✓ = the arm's band overlaps vanilla's, ✗ = disjoint "
-       "(needs ≥2 finished runs/arm; ⚠ lost = attempted trials that never finished — counted "
-       "as unsolved). ⊘ = vanilla's peak context stayed below the compaction gate "
+       "(needs ≥2 finished runs/arm). In solve, ⚠ lost = trials that opened but crashed / "
+       "timed out (counted as unsolved), while — = the cell was never run in this pass "
+       "(no trial ever opened — aborted or out of scope, not a failure). "
+       "⊘ = vanilla's peak context stayed below the compaction gate "
        "(--ctx-gate, default 50k): condense's whole-conversation compaction cannot have "
        "triggered and headroom only compresses individual tool outputs >200 tokens, so a "
        "len ✗ on a ⊘ task is a BEHAVIORAL effect of the arm's wiring, not compaction damage. "
@@ -441,6 +457,29 @@ def render_console(d):
                 cells.append(text)
         t.add_row(*cells)
     console.print(t)
+    _takeaway(console, d)
+
+
+_AXES = (("length", "length_ok"), ("rework", "rework_ok"), ("milestone", "milestone_ok"))
+
+
+def _takeaway(console, d):
+    """A one-glance summary under the table: how much of the matrix actually graded, and
+    every arm×axis that DIVERGED from the vanilla noise floor (the whole point of the run)."""
+    cells = [(r, arm, r["arms"][arm]) for r in d["rows"] for arm in d["arms"]]
+    graded = {r["task"] for r, _, a in cells if any(a.get(k) is not None for _, k in _AXES)}
+    notrun = [1 for r, _, a in cells
+              if a["n"] == 0 and a.get("started", 0) == 0 and r["vanilla"]["n"] == 0]
+    diverge = [f"{r['task']}/{arm} {axis}" for r, arm, a in cells
+               for axis, k in _AXES if a.get(k) is False]
+    parts = [f"{len(graded)}/{len(d['rows'])} tasks graded"]
+    if notrun:
+        parts.append(f"[dim]{len(notrun)} arm-cells not run in this pass[/]")
+    console.print("[bold]takeaway[/]  " + " · ".join(parts))
+    if diverge:
+        console.print("[red]  ✗ diverges vs vanilla:[/] " + ", ".join(diverge))
+    elif graded:
+        console.print("[green]  ✓ no divergence from the vanilla noise floor[/]")
 
 
 if __name__ == "__main__":

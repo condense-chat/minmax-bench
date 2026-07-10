@@ -235,6 +235,26 @@ def test_report_marks_sub_gate_tasks():
     assert row["sub_gate"] is True  # kv-store peaks ~25-35k: compaction can't have fired
 
 
+def test_solve_distinguishes_never_ran_from_crashed(tmp_path):
+    """A cell requested but with no trial dir ever opened is aborted/out-of-scope, not a
+    0/k failure — it must render as '—', while a cell whose trials opened but produced no
+    reward is a genuine crash and must render as '⚠ lost'."""
+    # never ran: only attempted.json, no trial subdirs
+    never = tmp_path / "vanilla-taskA"
+    never.mkdir()
+    (never / "attempted.json").write_text(json.dumps({"k": 5, "arm": "vanilla"}))
+    # crashed: attempted.json AND an opened trial dir, but no verifier/reward.txt
+    crashed = tmp_path / "vanilla-taskB"
+    (crashed / "2026-01-01__00-00-00" / "inst").mkdir(parents=True)
+    (crashed / "attempted.json").write_text(json.dumps({"k": 5, "arm": "vanilla"}))
+
+    idx = report.index_runs(str(tmp_path), "claude-code")
+    s_never = report._cell_stats(idx.get("vanilla-taskA"))
+    s_crash = report._cell_stats(idx.get("vanilla-taskB"))
+    assert s_never["started"] == 0 and report._solve(s_never) == "—"
+    assert s_crash["started"] >= 1 and "lost" in report._solve(s_crash)
+
+
 def test_auth_mode_resolution(monkeypatch):
     import minmax_bench.quality.engine as e
     monkeypatch.setattr(e, "_CC_TOKEN_CACHE", ["unset"])
