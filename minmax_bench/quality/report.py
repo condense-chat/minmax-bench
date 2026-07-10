@@ -423,41 +423,100 @@ def main(argv=None):
     Console().print(f"[dim]wrote {out}[/]")
 
 
-_HEAD_ABBR = {"solve v·arm": "solve v·a", "ctx peak (v)": "ctx(v)", "length (v)": "len(v)",
-              "length (arm)": "len(a)", "milestone": "mile", "rework": "rwk",
-              "fid (arm·ctrl)": "fid a·c"}
+# The wide table() view (all axes as separate columns) is the HTML/md layout. The terminal
+# gets a narrow projection: the two length bands collapse into one "v→a" cell, verdicts show
+# as bare ✓/✗ icons, and the incremental-replay metrics move to their own second table.
+_LEGEND = (
+    "solve = vanilla·arm finished/attempted (⚠ = trials crashed, — = not run in this pass). "
+    "ctx = vanilla peak context; ⊘ = below the compaction gate, so compaction can't have "
+    "fired and any divergence is behavioural, not compaction damage. length v→a = vanilla→arm "
+    "step-count medians[min-max]; ✓/✗ = the arm's band overlaps vanilla's noise floor "
+    "(needs ≥2 runs/arm) — same for rework and milestone. No model was called.")
+_INCR_LEGEND = (
+    "incremental = teacher-forced per-step replay. comp = context compressed · fid a·c = "
+    "per-step action agreement (arm·control) · $Δ = cost delta. ⊘ passthrough = no compression "
+    "happened, so agreement deltas would be noise.")
+
+
+def _icon(ok):
+    return "✓" if ok is True else ("✗" if ok is False else "—")
+
+
+def _colok(text, ok):
+    return f"[green]{text}[/]" if ok is True else (f"[red]{text}[/]" if ok is False else text)
+
+
+def _solve_c(c):
+    """Compact solve: 'finished/attempted' + '⚠lost'; '—' when never run."""
+    if c["n"] == 0 and c.get("started", 0) == 0:
+        return "—"
+    return f"{c['solve']}/{c['attempted']}" + (f"⚠{c['lost']}" if c["lost"] else "")
 
 
 def render_console(d):
-    """Rich terminal table for the quality bench — colours each verdict by its ok flag
-    (✓ green / ✗ red), flags ⚠ lost trials yellow. Columns that are entirely empty (e.g.
-    the incremental fid/comp/$Δ on a pure full run) are dropped so the table fits."""
+    """Narrow terminal projection of the quality bench: ≤7 columns for the offline axes,
+    then a separate incremental-replay table when that data exists."""
     console = Console()
-    head, rows = table(d)
-    keep = [i for i in range(len(head))
-            if i < 2 or not rows or any(r[i][0] not in ("—", "") for r in rows)]
     model = d.get("model")
     title = "[bold]quality — trajectory preservation" + (f" · {model}" if model else "") + "[/]"
-    t = Table(title=title, caption=SUB, caption_justify="left", caption_style="dim")
-    for i in keep:
-        t.add_column(_HEAD_ABBR.get(head[i], head[i]), no_wrap=(i < 2))
-    for row in rows:
-        cells = []
-        for i in keep:
-            text, ok = row[i]
-            if ok is True:
-                cells.append(f"[green]{text}[/]")
-            elif ok is False:
-                cells.append(f"[red]{text}[/]")
-            elif "lost" in text:
-                cells.append(f"[yellow]{text}[/]")
-            elif "⊘" in text or "passthrough" in text:
-                cells.append(f"[dim]{text}[/]")
-            else:
-                cells.append(text)
-        t.add_row(*cells)
+    t = Table(title=title, caption=_LEGEND, caption_justify="left", caption_style="dim")
+    for h in ("task", "arm", "solve v·a", "ctx", "length v→a"):
+        t.add_column(h, no_wrap=True)
+    t.add_column("rwk", justify="center")
+    if d["has_milestone"]:
+        t.add_column("mile", justify="center")
+    for r in d["rows"]:
+        v = r["vanilla"]
+        pk = v["peak_ctx"]
+        ctx = "—" if not pk else f"{pk / 1000:.0f}k" + (" ⊘" if r["sub_gate"] else "")
+        for arm in d["arms"]:
+            a = r["arms"][arm]
+            sv, sa = _solve_c(v), _solve_c(a)
+            solve = "—" if sv == "—" and sa == "—" else f"{sv}·{sa}"
+            solve = "[dim]—[/]" if solve == "—" else (f"[yellow]{solve}[/]" if "⚠" in solve
+                                                      else solve)
+            lv, la = _b(v["length"]), _b(a["length"])
+            ltxt = "—" if lv == "—" and la == "—" else f"{lv}→{la}"
+            if a["length_ok"] is not None:
+                ltxt = f"{ltxt} {_icon(a['length_ok'])}"
+            cells = [r["task"], arm, solve,
+                     f"[dim]{ctx}[/]" if "⊘" in ctx else ctx,
+                     _colok(ltxt, a["length_ok"]),
+                     _colok(_icon(a["rework_ok"]), a["rework_ok"])]
+            if d["has_milestone"]:
+                cells.append(_colok(_icon(a["milestone_ok"]), a["milestone_ok"]))
+            t.add_row(*cells)
     console.print(t)
+    _incr_table(console, d)
     _takeaway(console, d)
+
+
+def _incr_table(console, d):
+    """The incremental-replay metrics as their own compact table (only when present)."""
+    rows = []
+    for r in d["rows"]:
+        for arm in d["arms"]:
+            inc = r["arms"][arm].get("incr")
+            if not inc:
+                continue
+            if inc.get("fid") is None:
+                fid = "—"
+            elif abs(inc.get("comp") or 0) < 0.02:
+                fid = "[dim]⊘ passthrough[/]"
+            else:
+                fid = f"{inc['fid']:.0%}·{inc['fid_ctrl']:.0%}"
+            rows.append((r["task"], arm, _pct(inc.get("comp")), fid, _pct(inc.get("costd"))))
+    if not rows:
+        return
+    t = Table(title="[bold]incremental replay[/]", caption=_INCR_LEGEND,
+              caption_justify="left", caption_style="dim")
+    for h in ("task", "arm"):
+        t.add_column(h, no_wrap=True)
+    for h in ("comp", "fid a·c", "$Δ"):
+        t.add_column(h, justify="center")
+    for row in rows:
+        t.add_row(*row)
+    console.print(t)
 
 
 _AXES = (("length", "length_ok"), ("rework", "rework_ok"), ("milestone", "milestone_ok"))
@@ -468,8 +527,7 @@ def _takeaway(console, d):
     every arm×axis that DIVERGED from the vanilla noise floor (the whole point of the run)."""
     cells = [(r, arm, r["arms"][arm]) for r in d["rows"] for arm in d["arms"]]
     graded = {r["task"] for r, _, a in cells if any(a.get(k) is not None for _, k in _AXES)}
-    notrun = [1 for r, _, a in cells
-              if a["n"] == 0 and a.get("started", 0) == 0 and r["vanilla"]["n"] == 0]
+    notrun = [1 for _, _, a in cells if a["n"] == 0 and a.get("started", 0) == 0]
     diverge = [f"{r['task']}/{arm} {axis}" for r, arm, a in cells
                for axis, k in _AXES if a.get(k) is False]
     parts = [f"{len(graded)}/{len(d['rows'])} tasks graded"]
