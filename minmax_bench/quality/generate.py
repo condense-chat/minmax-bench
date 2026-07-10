@@ -382,7 +382,11 @@ def full(args, env):
                         cell_start = grid.state[(arm, task)]["start"]
                         try:
                             while proc.poll() is None:
-                                live.update(grid.render())  # ticks the elapsed clock
+                                # count reward.txt live so the trials column ticks (0/4 → 1/4
+                                # → …) as harbor finishes each trial, not just at the end
+                                grid.set(arm, task, "running",
+                                         len(glob.glob(f"{cell}/*/*/verifier/reward.txt")))
+                                live.update(grid.render())
                                 try:
                                     proc.wait(timeout=0.5)
                                 except subprocess.TimeoutExpired:
