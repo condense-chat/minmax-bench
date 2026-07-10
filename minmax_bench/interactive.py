@@ -554,10 +554,13 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     # show the session's own model so the inherit default is meaningful
     from .counterfactual import session_meta
     own = session_meta(Path(session)).get("model")
-    # CCR can't engage without tool execution — incremental arms are proxy-only
-    arms = _multiselect(console, "arms (vanilla control always included; CCR needs full runs)", [
+    # headroom now runs the REAL CCR loop here too: the token proxy compresses and the
+    # retrieve calls are executed via `headroom mcp serve` (injected), so it's a fair
+    # comparison, not the kompress ablation. (Retrieval only fires on sessions with large
+    # compressible tool outputs; short ones fall back to kompress — the summary says which.)
+    arms = _multiselect(console, "arms (vanilla control always included)", [
         ("condense", "condense — compaction proxy", True, True),
-        ("headroom", "headroom — proxy only (cache/token via --headroom-mode)", True, False),
+        ("headroom", "headroom — real CCR: token proxy + injected retrieve loop", True, False),
     ])
     # inherit the session's OWN model by default — replaying it faithfully is the point;
     # an arm that can't serve it auto-falls-back at run time (only override deliberately)
