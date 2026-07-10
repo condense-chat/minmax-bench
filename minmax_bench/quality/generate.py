@@ -258,6 +258,7 @@ def full(args, env):
           f"({', '.join(tasks)}) x k={args.k} (vanilla {kv}) = {trials} trials, "
           f"cost ceiling ~${trials * args.budget_usd:.0f} "
           f"(--budget-usd {args.budget_usd:g}/trial cap)")
+    total_cells, cell_idx = len(arms) * len(tasks), 0
     for arm in arms:
         # the vanilla band is the noise floor every arm is judged against — one extra
         # vanilla run sharpens every verdict, so it defaults to k+1
@@ -268,9 +269,15 @@ def full(args, env):
                 proxy = _start_proxy(out, HEADROOM_MODES[arm])
             base, allow, agent, extra = _arm_wiring(arm, env)
             for task in tasks:
+                cell_idx += 1
                 cell = f"{out}/{arm}-{task}"
+                # trial-level resume: run only the trials this cell is still missing, so an
+                # interrupted run picks up where it left off instead of re-spending finished
+                # trials (a whole cell is skipped when it's already complete)
+                done = len(glob.glob(f"{cell}/*/*/verifier/reward.txt"))
+                run_k = k if args.force else max(0, k - done)
                 cmd = ["harbor", "run", "-d", args.dataset, "-a", agent, "-m", model,
-                       "-i", f"{org}/{task}", "-k", str(k),
+                       "-i", f"{org}/{task}", "-k", str(run_k),
                        "-n", str(args.concurrency),
                        "-o", cell, "--ak", f"max_budget_usd={args.budget_usd}",
                        "--allow-agent-host", allow, *_agent_auth_env(env), *extra]
@@ -289,16 +296,15 @@ def full(args, env):
                 if arm == "headroom-kompress":
                     print("[note] headroom-kompress = token-mode compression WITHOUT the retrieve "
                           "loop (ablation); the full product is the 'headroom' arm (with CCR)")
-                print(f"### {arm} / {task} (k={k}, base={base}) ###")
+                print(f"### [{cell_idx}/{total_cells}] {arm} / {task} (k={k}, base={base}) ###")
                 if args.dry_run:
                     print("   " + " ".join(cmd))
                     continue
-                # resume: skip a cell that already has its k finished trials (so a
-                # re-run after an abort fills in only the missing arms, no re-spend).
-                done = len(glob.glob(f"{cell}/*/*/verifier/reward.txt"))
-                if done >= k and not args.force:
-                    print(f"[skip] {arm}/{task} already has {done}/{k} trials (--force to rerun)")
+                if run_k <= 0:
+                    print(f"[skip] {arm}/{task} complete ({done}/{k} trials, --force to rerun)")
                     continue
+                if done:
+                    print(f"[resume] {arm}/{task} has {done}/{k} — running the {run_k} missing")
                 # record intent BEFORE running so killed/crashed trials still count as
                 # attempted — report.py uses this to expose survivorship instead of
                 # silently shrinking n (a reward.txt-less trial is a failure, not noise)
@@ -316,21 +322,47 @@ def full(args, env):
                     proc = subprocess.Popen(cmd, env=renv, stdout=runlog,
                                             stderr=subprocess.STDOUT)
                     _HARBOR[0] = proc
+                    # harbor logs to _runlog.txt (not the console), so a cell would otherwise
+                    # run silently for minutes — print a heartbeat with elapsed / cap so a long
+                    # run visibly progresses. wall_timeout scales with the trials actually run.
+                    start, cap = time.monotonic(), args.wall_timeout * run_k
+                    beat = start
                     try:
-                        proc.wait(timeout=args.wall_timeout * k)
-                    except subprocess.TimeoutExpired:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=20)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                        print(f"[timeout] {arm}/{task} killed after "
-                              f"{args.wall_timeout * k}s — partial trials recorded",
-                              file=sys.stderr)
+                        while True:
+                            try:
+                                proc.wait(timeout=15)
+                                break
+                            except subprocess.TimeoutExpired:
+                                now = time.monotonic()
+                                if now - start >= cap:
+                                    proc.terminate()
+                                    try:
+                                        proc.wait(timeout=20)
+                                    except subprocess.TimeoutExpired:
+                                        proc.kill()
+                                    print(f"[timeout] {arm}/{task} killed after {int(cap)}s "
+                                          f"— partial trials recorded", file=sys.stderr)
+                                    break
+                                if now - beat >= 60:  # heartbeat once a minute
+                                    print(f"   …running ({int(now - start)}s / cap {int(cap)}s)")
+                                    beat = now
                     finally:
                         _HARBOR[0] = None
         finally:
             _stop_proxy(proxy)
+    if not args.dry_run:
+        # resume hint: cells still missing trials (timeouts, failures, or an interrupt) —
+        # re-running the same command finishes them without re-spending completed trials
+        def _need(a, t):
+            want = (args.k_vanilla or args.k + 1) if a == "vanilla" else args.k
+            return len(glob.glob(f"{out}/{a}-{t}/*/*/verifier/reward.txt")) < want
+        incomplete = [(a, t) for a in arms for t in tasks if _need(a, t)]
+        if incomplete:
+            print(f"[resume] {len(incomplete)}/{total_cells} cells incomplete — re-run the SAME "
+                  f"command to finish them (done trials skip; partial cells run only the missing).")
+        else:
+            print(f"[done] all {total_cells} cells complete → "
+                  f"minmax-bench quality report --from {out} --tasks {len(tasks)}")
     if args.milestones and not args.dry_run:
         judge_milestones(args, env)
 
