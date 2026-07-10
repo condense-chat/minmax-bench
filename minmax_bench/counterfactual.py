@@ -379,6 +379,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         spent, n_ok, n_action, n_exact, ctx_total = 0.0, 0, 0, 0, 0
         n_err, first_err, ctx_series = 0, None, []
         qual = {"good": 0, "degraded": 0, "bad": 0}  # goal-judge tally
+        by_step = {}  # step-index -> {ctx, cost, agree} for common-step fair aggregation
         with path.open("w") as f, Progress(
             TextColumn(f"[cyan]{arm:9}[/]"), BarColumn(),
             TextColumn("{task.completed}/{task.total} [dim]{task.fields[stat]}[/]"),
@@ -425,6 +426,10 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                                 + usage.get("cache_creation_input_tokens", 0))
                     ctx_total += step_ctx
                     ctx_series.append(step_ctx)
+                    # per-step, keyed by the shared decision-point index so arm-vs-control
+                    # deltas can be computed over the COMMON steps all arms reached (an arm
+                    # that hits its budget early must not be compared over a longer step set)
+                    by_step[step] = {"ctx": step_ctx, "cost": round(c, 4), "agree": bool(action)}
                     rec.update(replay=rep, agree_exact=exact, agree_action=action,
                                agree_semantic=agree_sem, sim=round(sim, 3),
                                usage=usage, cost_usd=round(c, 4))
@@ -440,6 +445,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                             q = eng.judge_action_quality(
                                 task_hint, eng.recent_context(msgs, i), rep, env)
                         rec["quality"] = q
+                        by_step[step]["quality"] = q
                         if q in qual:
                             qual[q] += 1
                 f.write(json.dumps(rec) + "\n")
@@ -450,7 +456,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
             "steps_ok": n_ok, "agree_action": n_action, "agree_exact": n_exact,
             "errors": n_err, "first_error": (first_err or "")[:300],
             "avg_ctx_tokens": (ctx_total // n_ok) if n_ok else 0,
-            "ctx_series": ctx_series, "quality": qual,
+            "ctx_series": ctx_series, "quality": qual, "by_step": by_step,
             "cost_usd": round(spent, 4), "file": str(path),
         }
     summary["judge"] = judge
@@ -472,12 +478,22 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
 
 
 # --------------------------------------------------------------------------- verdict
-def _render_goal_quality(summary: dict, console: Console) -> None:
+def _goal_counts(a: dict, common: set):
+    """good/degraded/bad tally over the common steps (fair across arms that stopped at
+    different depths); falls back to the arm's whole tally if per-step data is absent."""
+    bs = a.get("by_step", {})
+    per_step = [bs[s].get("quality") for s in common if s in bs and "quality" in bs[s]]
+    if per_step:
+        return {k: per_step.count(k) for k in ("good", "degraded", "bad")}
+    return a.get("quality", {})
+
+
+def _render_goal_quality(summary: dict, console: Console, common: set) -> None:
     """Goal-based per-step quality — the HEADLINE when judge=goal. Each action is rated
     good/degraded/bad as a step toward the task (on its own merits), so control ≈100% and
     an arm 'loses' only by taking worse steps. Robust to the valid-divergence noise that
-    dominates same-action agreement."""
-    cq = summary["arms"].get("control", {}).get("quality", {})
+    dominates same-action agreement. Tallies use the common steps for a fair comparison."""
+    cq = _goal_counts(summary["arms"].get("control", {}), common)
     ctot = sum(cq.values())
     cgood = cq.get("good", 0) / ctot if ctot else None
     gt = Table(title="[bold]goal-based per-step quality — is each action a good step "
@@ -485,7 +501,7 @@ def _render_goal_quality(summary: dict, console: Console) -> None:
     for c in ("arm", "good", "degraded", "bad", "good rate"):
         gt.add_column(c, justify="right" if c != "arm" else "left")
     for arm, a in summary["arms"].items():
-        q = a.get("quality", {})
+        q = _goal_counts(a, common)
         tot = sum(q.values())
         if not tot:
             continue
@@ -500,7 +516,7 @@ def _render_goal_quality(summary: dict, console: Console) -> None:
         for arm, a in summary["arms"].items():
             if arm == "control":
                 continue
-            q = a.get("quality", {})
+            q = _goal_counts(a, common)
             tot = sum(q.values())
             if not tot:
                 continue
@@ -515,12 +531,33 @@ def _render_goal_quality(summary: dict, console: Console) -> None:
                   "taking WORSE steps. More robust than same-action agreement.[/]")
 
 
+def _common_steps(arms: dict) -> set:
+    """The decision-point indices EVERY arm reached. An arm that hit its budget (or
+    error-bailed) early stopped short; comparing cost/ctx/agreement over a longer step
+    set than the shortest arm is unfair, so all vs-control deltas use this intersection."""
+    sets = [set(a.get("by_step", {})) for a in arms.values() if a.get("by_step")]
+    return set.intersection(*sets) if sets else set()
+
+
+def _over(a: dict, common: set):
+    """An arm's agreement / avg-ctx / total-cost restricted to the common steps."""
+    steps = [a["by_step"][s] for s in common if s in a.get("by_step", {})]
+    n = len(steps)
+    if not n:
+        return None
+    return {"n": n, "agree": sum(x["agree"] for x in steps) / n,
+            "ctx": sum(x["ctx"] for x in steps) / n, "cost": sum(x["cost"] for x in steps)}
+
+
 def render_summary(summary: dict, console: Console) -> None:
     ctrl = summary["arms"].get("control", {})
-    cn, ca = ctrl.get("steps_ok", 0), ctrl.get("agree_action", 0)
-    floor = ca / cn if cn else None
+    common = _common_steps(summary["arms"])
+    ctrl_c = _over(ctrl, common)
+    floor = (ctrl_c["agree"] if ctrl_c else
+             ctrl.get("agree_action", 0) / ctrl["steps_ok"] if ctrl.get("steps_ok") else None)
     t = Table(title=f"[bold]counterfactual — {Path(summary['session']).name} "
-                    f"({summary['model']}, {summary['steps']} decision points)")
+                    f"({summary['model']}, {summary['steps']} decision points; "
+                    f"deltas over {len(common)} common steps)")
     for col in ("arm", "steps", "errors", "vs original", "exact", "avg ctx tokens",
                 "ctx vs control", "cost", "$ vs control"):
         t.add_column(col, justify="right" if col != "arm" else "left")
@@ -531,11 +568,20 @@ def render_summary(summary: dict, console: Console) -> None:
                   f"[dim]${rec['cost_usd']:.2f}[/]", "[dim]—[/]")
     for arm, a in summary["arms"].items():
         n = a["steps_ok"]
-        agree = a["agree_action"] / n if n else None
-        comp = (1 - a["avg_ctx_tokens"] / ctrl["avg_ctx_tokens"]
-                if arm != "control" and ctrl.get("avg_ctx_tokens") else None)
-        costd = (1 - a["cost_usd"] / ctrl["cost_usd"]
-                 if arm != "control" and ctrl.get("cost_usd") else None)
+        # vs-original agreement and the vs-control deltas are all computed over the COMMON
+        # steps (fair); the 'steps' column still shows each arm's OWN reach so you can see
+        # who stopped early. avg ctx / cost columns are each arm's own totals (context).
+        ac = _over(a, common)
+        if ac and ctrl_c:  # fair: common steps
+            agree = ac["agree"]
+            comp = 1 - ac["ctx"] / ctrl_c["ctx"] if arm != "control" and ctrl_c["ctx"] else None
+            costd = 1 - ac["cost"] / ctrl_c["cost"] if arm != "control" and ctrl_c["cost"] else None
+        else:  # fallback: no by_step (old artifact) -> each arm's own aggregates
+            agree = a["agree_action"] / n if n else None
+            comp = (1 - a["avg_ctx_tokens"] / ctrl["avg_ctx_tokens"]
+                    if arm != "control" and ctrl.get("avg_ctx_tokens") else None)
+            costd = (1 - a["cost_usd"] / ctrl["cost_usd"]
+                     if arm != "control" and ctrl.get("cost_usd") else None)
         errs = a.get("errors", 0)
         # colour each arm's vs-original agreement AGAINST the control floor: at/above the
         # floor is green (no measurable loss), below is red. control itself is the floor.
@@ -548,18 +594,32 @@ def render_summary(summary: dict, console: Console) -> None:
                           else f"[red]{agree:.0%}[/]")
         else:
             agree_cell = f"{agree:.0%}"
+        # ctx/cost cells use the common-step aggregates when available, so they reconcile
+        # with the deltas beside them (else an arm that ran longer shows a bigger total that
+        # contradicts a per-step saving). The 'steps' column shows the arm's own reach.
+        ctx_cell = f"{round(ac['ctx']):,}" if ac else f"{a['avg_ctx_tokens']:,}"
+        cost_cell = f"${ac['cost']:.2f}" if ac else f"${a['cost_usd']:.2f}"
         t.add_row(
             arm, str(n), f"[red]{errs}[/]" if errs else "0",
             agree_cell,
             f"{a['agree_exact'] / n:.0%}" if n else "—",
-            f"{a['avg_ctx_tokens']:,}",
+            ctx_cell,
             f"{comp:+.0%}" if comp is not None else "—",
-            f"${a['cost_usd']:.2f}",
+            cost_cell,
             f"{costd:+.0%}" if costd is not None else "—",
         )
     console.print(t)
+    # if arms stopped at different depths (an arm hit its budget / error-bailed), say so —
+    # the deltas above use the common steps, but the reader should see who stopped short
+    reach = {arm: a.get("steps_ok", 0) for arm, a in summary["arms"].items() if a.get("by_step")}
+    if reach and len(set(reach.values())) > 1:
+        short = min(reach, key=reach.get)
+        console.print(f"[yellow]note:[/] arms stopped at different depths "
+                      f"({', '.join(f'{k} {v}' for k, v in reach.items())}) — likely a budget/"
+                      f"error cap on [bold]{short}[/]. All vs-control deltas use the "
+                      f"{len(common)} steps every arm reached, so they stay apples-to-apples.")
     if summary.get("judge") == "goal":
-        _render_goal_quality(summary, console)
+        _render_goal_quality(summary, console, common)
     if floor is not None:
         label = "(secondary — structural) " if summary.get("judge") == "goal" else ""
         console.print(f"[dim]{label}control replays the SAME session with NO compaction; its "
@@ -575,7 +635,8 @@ def render_summary(summary: dict, console: Console) -> None:
                           f"no verdict is possible. First error: {a.get('first_error', '?')}")
             continue
         # headline verdict: the arm's vs-original agreement against the control floor
-        agree = a["agree_action"] / a["steps_ok"]
+        _ac = _over(a, common)
+        agree = _ac["agree"] if _ac else a["agree_action"] / a["steps_ok"]
         if floor is not None:
             delta = agree - floor
             if delta >= -0.02:

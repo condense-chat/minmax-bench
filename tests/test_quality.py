@@ -389,3 +389,18 @@ def test_recent_context_finds_the_live_user_question():
     ctx = e.recent_context(msgs, 3)  # decision point = the assistant answer after the read
     assert "explain ZDR" in ctx                       # the live question is surfaced
     assert "class ZDR" in ctx                          # and the latest observation (tool_result)
+
+
+def test_common_step_aggregation_is_fair_when_an_arm_stops_early():
+    from minmax_bench import counterfactual as cf
+    # control hits budget at 2 steps; condense runs 4. Deltas must use the 2 common steps.
+    def bs(n, ctx, cost):
+        return {"by_step": {s: {"ctx": ctx, "cost": cost, "agree": True} for s in range(n)}}
+    arms = {"control": bs(2, 100, 1.0), "condense": bs(4, 40, 0.4)}
+    common = cf._common_steps(arms)
+    assert common == {0, 1}                                  # only the shared steps
+    c = cf._over(arms["condense"], common)
+    assert c["n"] == 2 and c["cost"] == 0.8                  # 2 steps, not all 4
+    ctrl = cf._over(arms["control"], common)
+    # $ vs control over common steps = 1 - 0.8/2.0 = 60% (not 1 - 1.6/2.0 = 20% over own steps)
+    assert abs((1 - c["cost"] / ctrl["cost"]) - 0.6) < 1e-9
