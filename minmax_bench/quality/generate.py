@@ -607,8 +607,9 @@ def main(argv=None):
     ap.add_argument("--strip-thinking", action="store_true")
     ap.add_argument("--cwd-patch", default="/app",
                     help="rewrite the capture cwd in the template system prompt to this")
-    ap.add_argument("--headroom-mode", default="cache", choices=["cache", "token"],
-                    help="proxy mode for the incremental 'headroom' arm")
+    ap.add_argument("--headroom-mode", default="token", choices=["cache", "token"],
+                    help="proxy mode for the incremental 'headroom' arm (token = compression, "
+                         "the meaningful test; cache = ~passthrough)")
     ap.add_argument("--swechat", default=None, help="SWE-chat jsonl (alternative to --session)")
     ap.add_argument("--conv", type=int, default=0, help="conversation index within --swechat")
     args = ap.parse_args(argv)

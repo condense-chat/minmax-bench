@@ -36,7 +36,7 @@ class HeadroomCcrClaudeCode(ClaudeCode):
         # Harbor's agent-setup phase has a hard timeout (360s by default) and a cold
         # apt-get update alone can eat most of it — skip anything already present and
         # pair this agent with --agent-timeout-multiplier (generate.py raises it
-        # automatically for the headroom-ccr arm).
+        # automatically for the headroom arm).
         await super().install(environment)
         await self.exec_as_root(
             environment,

@@ -259,7 +259,7 @@ def _pick_local_sessions(console: Console) -> str:
     This is the COST BACKTEST entry point: replay your own sessions turn-by-turn
     through the selected strategies and see what they would have cost. For the
     quality counterfactual (would it have made the same decisions), see
-    `minmax-bench counterfactual`.
+    `minmax-bench quality incremental`.
     """
     from datetime import datetime
 
@@ -367,11 +367,6 @@ def run_wizard(console: Console) -> WizardResult:
         dataset=dataset, models=models, strategies=strategies, edges=edges,
         session_ids=session_ids, token_limit=token_limit, setup=setup,
     )
-
-
-# ============================================================================
-# Quality / trajectory-preservation bench wizard (minmax-bench quality run)
-# ============================================================================
 
 
 # ============================================================================
@@ -554,10 +549,10 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     # show the session's own model so the inherit default is meaningful
     from .counterfactual import session_meta
     own = session_meta(Path(session)).get("model")
-    # headroom now runs the REAL CCR loop here too: the token proxy compresses and the
-    # retrieve calls are executed via `headroom mcp serve` (injected), so it's a fair
-    # comparison, not the kompress ablation. (Retrieval only fires on sessions with large
-    # compressible tool outputs; short ones fall back to kompress — the summary says which.)
+    # the headroom arm runs the CCR retrieve loop here too: the token proxy compresses and
+    # retrieve calls are executed via `headroom mcp serve` (injected). Retrieval only fires
+    # on sessions with large compressible tool outputs; short ones fall back to kompress —
+    # the summary says which.
     arms = _multiselect(console, "arms (vanilla control always included)", [
         ("condense", "condense — compaction proxy", True, True),
         ("headroom", "headroom — token proxy + injected retrieve loop (CCR)", True, False),
@@ -586,7 +581,6 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     # faithful capture: run the version-matched Claude Code binary once, LOCALLY, to
     # capture the EXACT system prompt + tools + CLAUDE.md your run used — instead of an
     # approximate frozen template. Consent + full transparency, per the user's ask.
-    from .counterfactual import session_meta
     ver = session_meta(Path(session)).get("version") or "newest on disk"
     console.print(Panel.fit(
         f"[bold]capture from your Claude Code binary[/] (recommended)\n"
