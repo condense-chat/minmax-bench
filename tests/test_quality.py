@@ -305,10 +305,11 @@ def test_judge_equivalent_parses_json(monkeypatch):
     import minmax_bench.quality.engine as e
     monkeypatch.setattr(e, "call_api",
                         lambda *a, **k: ({"content": [{"text": '{"equivalent": true}'}]}, None))
-    assert e.judge_equivalent(tool("Bash", command="grep x f"),
-                              tool("Bash", command="rg x f"), {"ANTHROPIC_API_KEY": "k"}) is True
+    v, cost = e.judge_equivalent(tool("Bash", command="grep x f"),
+                                 tool("Bash", command="rg x f"), {"ANTHROPIC_API_KEY": "k"})
+    assert v is True
     monkeypatch.setattr(e, "call_api", lambda *a, **k: (None, "HTTP 500"))
-    assert e.judge_equivalent({}, {}, {}) is None  # error -> None, not a crash
+    assert e.judge_equivalent({}, {}, {})[0] is None  # error -> None, not a crash
 
 
 def test_patch_cwd_rewrites_the_templates_real_advertised_cwd():
@@ -353,10 +354,10 @@ def test_judge_action_quality_parses_verdict(monkeypatch):
     monkeypatch.setattr(e, "call_api",
                         lambda *a, **k: ({"content": [{"text": '{"quality":"degraded"}'}]}, None))
     assert e.judge_action_quality("fix the bug", "",
-                                  tool("Bash", command="ls"), {}) == "degraded"
+                                  tool("Bash", command="ls"), {})[0] == "degraded"
     monkeypatch.setattr(e, "call_api",
                         lambda *a, **k: ({"content": [{"text": 'garbage'}]}, None))
-    assert e.judge_action_quality("t", "", {}, {}) is None  # unparseable -> None, not crash
+    assert e.judge_action_quality("t", "", {}, {})[0] is None  # unparseable -> None, not crash
 
 
 def test_step_verdict_prefers_goal_quality():
@@ -375,7 +376,7 @@ def test_judge_text_match_compares_to_original(monkeypatch):
                         lambda *a, **k: ({"content": [{"text": '{"quality":"good"}'}]}, None))
     orig = {"type": "text", "text": "ZDR keeps customer data out of retention via zdr_store.py"}
     rep = {"type": "text", "text": "Zero-data-retention is implemented in db/zdr_store.py so..."}
-    assert e.judge_text_match(orig, rep, "explain ZDR", {}) == "good"
+    assert e.judge_text_match(orig, rep, "explain ZDR", {})[0] == "good"
 
 
 def test_recent_context_finds_the_live_user_question():

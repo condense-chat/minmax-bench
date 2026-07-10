@@ -901,22 +901,30 @@ def _action_text(a):
     return f"{a.get('name', '?')}: {' '.join(str(tgt).split())[:280]}"
 
 
-def judge_equivalent(orig, replay, env, task_hint=""):
-    """LLM adjudication: are these two next-actions functionally equivalent? Returns
-    True/False (None on error). Meant for structural NEAR-MISSES — it upgrades a
-    replay that chose an equivalent-but-differently-spelled action to 'agrees'."""
-    prompt = _JUDGE_PROMPT.format(task=(task_hint or "")[:400],
-                                  a=_action_text(orig), b=_action_text(replay))
-    req = {"model": JUDGE_MODEL, "max_tokens": 60, "temperature": 0,
+def _judge_call(prompt, env, max_tokens=60):
+    """Send a prompt to the haiku judge; return (parsed_json_obj | None, cost_usd). The
+    cost is returned so callers can bill judge spend against the budget and report it —
+    an LLM judge isn't free. (None, 0.0) on API error; (None, cost) on unparseable output."""
+    req = {"model": JUDGE_MODEL, "max_tokens": max_tokens, "temperature": 0,
            "messages": [{"role": "user", "content": prompt}]}
     resp, err = call_api("control", req, {"anthropic-version": "2023-06-01"}, env)
     if err:
-        return None
+        return None, 0.0
+    cost = cost_usd(resp.get("usage", {}), JUDGE_MODEL)
     t = "".join(b.get("text", "") for b in resp.get("content", [])).strip()
     try:
-        return bool(json.loads(t[t.index("{"): t.rindex("}") + 1]).get("equivalent"))
+        return json.loads(t[t.index("{"): t.rindex("}") + 1]), cost
     except (ValueError, json.JSONDecodeError):
-        return None
+        return None, cost
+
+
+def judge_equivalent(orig, replay, env, task_hint=""):
+    """LLM adjudication: are these two next-actions functionally equivalent? Returns
+    (True/False/None, cost_usd). Meant for structural NEAR-MISSES — it upgrades a replay
+    that chose an equivalent-but-differently-spelled action to 'agrees'."""
+    obj, cost = _judge_call(_JUDGE_PROMPT.format(task=(task_hint or "")[:400],
+                            a=_action_text(orig), b=_action_text(replay)), env)
+    return (bool(obj.get("equivalent")) if obj else None), cost
 
 
 def _situation_text(msg):
@@ -986,22 +994,13 @@ def judge_action_quality(task, situation, action, env):
     """Goal-based per-step judge: is this action a good/degraded/bad move given the task and
     the CURRENT situation (not vs the original)? `situation` is a string (see recent_context)
     — a text reply is judged against the live user question. Returns 'good'|'degraded'|'bad'
-    or None. Robust to valid divergence, so control (no compaction) scores near-100% and the
-    signal is whether an arm takes WORSE moves."""
-    prompt = _GOAL_PROMPT.format(task=(task or "")[:500],
-                                 situation=(situation or "")[:700],
-                                 action=_action_text(action))
-    req = {"model": JUDGE_MODEL, "max_tokens": 40, "temperature": 0,
-           "messages": [{"role": "user", "content": prompt}]}
-    resp, err = call_api("control", req, {"anthropic-version": "2023-06-01"}, env)
-    if err:
-        return None
-    t = "".join(b.get("text", "") for b in resp.get("content", [])).strip()
-    try:
-        q = json.loads(t[t.index("{"): t.rindex("}") + 1]).get("quality")
-        return q if q in ("good", "degraded", "bad") else None
-    except (ValueError, json.JSONDecodeError):
-        return None
+    or None (paired with cost_usd). Robust to valid divergence, so control (no compaction)
+    scores near-100% and the signal is whether an arm takes WORSE moves."""
+    obj, cost = _judge_call(_GOAL_PROMPT.format(task=(task or "")[:500],
+                            situation=(situation or "")[:700], action=_action_text(action)),
+                            env, max_tokens=40)
+    q = obj.get("quality") if obj else None
+    return (q if q in ("good", "degraded", "bad") else None), cost
 
 
 _TEXT_MATCH_PROMPT = (
@@ -1020,17 +1019,8 @@ _TEXT_MATCH_PROMPT = (
 def judge_text_match(orig, replay, task, env):
     """For a TEXT reply, judge the replay against the ORIGINAL text (the reference answer):
     do they convey the same substance? A valid answer that reaches the original's conclusion
-    scores 'good' even if worded differently. Returns 'good'|'degraded'|'bad' or None."""
-    prompt = _TEXT_MATCH_PROMPT.format(a=(orig.get("text", "") or "")[:800],
-                                       b=(replay.get("text", "") or "")[:800])
-    req = {"model": JUDGE_MODEL, "max_tokens": 40, "temperature": 0,
-           "messages": [{"role": "user", "content": prompt}]}
-    resp, err = call_api("control", req, {"anthropic-version": "2023-06-01"}, env)
-    if err:
-        return None
-    t = "".join(b.get("text", "") for b in resp.get("content", [])).strip()
-    try:
-        q = json.loads(t[t.index("{"): t.rindex("}") + 1]).get("quality")
-        return q if q in ("good", "degraded", "bad") else None
-    except (ValueError, json.JSONDecodeError):
-        return None
+    scores 'good' even if worded differently. Returns ('good'|'degraded'|'bad'|None, cost_usd)."""
+    obj, cost = _judge_call(_TEXT_MATCH_PROMPT.format(a=(orig.get("text", "") or "")[:800],
+                            b=(replay.get("text", "") or "")[:800]), env, max_tokens=40)
+    q = obj.get("quality") if obj else None
+    return (q if q in ("good", "degraded", "bad") else None), cost

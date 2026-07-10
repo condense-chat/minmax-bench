@@ -386,6 +386,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         spent, n_ok, n_action, n_exact, ctx_total = 0.0, 0, 0, 0, 0
         n_err, first_err, ctx_series = 0, None, []
         qual = {"good": 0, "degraded": 0, "bad": 0}  # goal-judge tally
+        judge_spent = 0.0  # LLM-judge cost, billed into the budget and reported separately
         by_step = {}  # step-index -> {ctx, cost, agree} for common-step fair aggregation
         # CCR injection: for the headroom arm, execute headroom_retrieve calls via
         # `headroom mcp serve` so the real Compress-Cache-Retrieve loop engages (else the
@@ -440,7 +441,10 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                     # judge disagreements — matches already agree.
                     agree_sem = action
                     if judge == "equivalence" and not action:
-                        agree_sem = bool(eng.judge_equivalent(orig, rep, env, task_hint))
+                        eq, jc = eng.judge_equivalent(orig, rep, env, task_hint)
+                        agree_sem = bool(eq)
+                        judge_spent += jc
+                        spent += jc
                     usage = resp.get("usage", {})
                     # bill the CCR retrieve round-trips as part of this decision's cost —
                     # else headroom-CCR looks artificially cheap (it pays for extra calls)
@@ -468,10 +472,12 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                         # reference answer — same conclusion = good); a TOOL action is judged
                         # on its own merits toward the task (robust to valid path divergence)
                         if rep.get("type") == "text" and orig.get("type") == "text":
-                            q = eng.judge_text_match(orig, rep, task_hint, env)
+                            q, jc = eng.judge_text_match(orig, rep, task_hint, env)
                         else:
-                            q = eng.judge_action_quality(
+                            q, jc = eng.judge_action_quality(
                                 task_hint, eng.recent_context(msgs, i), rep, env)
+                        judge_spent += jc
+                        spent += jc
                         rec["quality"] = q
                         by_step[step]["quality"] = q
                         if q in qual:
@@ -488,7 +494,11 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
             "avg_ctx_tokens": (ctx_total // n_ok) if n_ok else 0,
             "ctx_series": ctx_series, "quality": qual, "by_step": by_step,
             "ccr_retrieves": n_retrieves, "ccr": bool(ccr_active and mcp and mcp.ok),
-            "cost_usd": round(spent, 4), "file": str(path),
+            "judge_usd": round(judge_spent, 4),
+            # cost_usd is the arm's REPLAY spend only (judge cost is a measurement overhead,
+            # reported separately) so the arm-vs-control $ comparison stays clean; the budget
+            # cap during the run used spent = replay + judge.
+            "cost_usd": round(spent - judge_spent, 4), "file": str(path),
         }
     summary["judge"] = judge
     # backtest anchor: what these same turns ACTUALLY consumed when the session ran
@@ -671,6 +681,11 @@ def render_summary(summary: dict, console: Console) -> None:
             console.print("[yellow]headroom ran as kompress[/] (retrieve loop unavailable) — "
                           "compression without retrieval. For headroom with CCR, use full mode "
                           "(`quality run`), or check the mcp serve log.")
+    judge_total = sum(a.get("judge_usd", 0.0) for a in summary["arms"].values())
+    if judge_total:
+        console.print(f"[dim]LLM judge ({summary.get('judge')}): [bold]${judge_total:.2f}[/] "
+                      f"total across arms (haiku, per step) — billed against the budget cap, "
+                      f"excluded from the arm cost columns above.[/]")
     if summary.get("judge") == "goal":
         _render_goal_quality(summary, console, common)
     if floor is not None:
