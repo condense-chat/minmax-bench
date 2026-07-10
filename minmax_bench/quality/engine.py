@@ -768,7 +768,9 @@ _JUDGE_PROMPT = (
 
 def _action_text(a):
     if a.get("type") == "text":
-        return f"(final answer) {a.get('text', '')[:280]}"
+        # NOT necessarily a "final answer" — a mid-task text turn is often the agent
+        # explaining findings or replying to a question, which is legitimate work.
+        return f"(text reply to the user) {a.get('text', '')[:400]}"
     inp = a.get("input", {})
     tgt = (inp.get("command") or inp.get("file_path") or inp.get("pattern")
            or json.dumps(inp, sort_keys=True))
@@ -794,8 +796,7 @@ def judge_equivalent(orig, replay, env, task_hint=""):
 
 
 def _situation_text(msg):
-    """Short digest of the message the agent is reacting to (the last tool_result /
-    user turn) — the situation context the goal judge needs."""
+    """Short digest of one message's content (tool_result output and/or text)."""
     if not isinstance(msg, dict):
         return ""
     c = msg.get("content")
@@ -813,27 +814,91 @@ def _situation_text(msg):
     return " ".join(parts)
 
 
+def recent_context(msgs, i):
+    """What the agent is reacting to at decision point i, for the goal judge: the most
+    recent real USER message (the live question/instruction — a text answer is judged
+    against THIS, not the first task) plus the immediately preceding observation."""
+    question = ""
+    for m in reversed(msgs[:i]):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            question = c
+            break
+        txt = next((b.get("text", "") for b in c or [] if isinstance(b, dict)
+                    and b.get("type") == "text"
+                    and not b.get("text", "").lstrip().startswith("<")), "")
+        if txt:  # a genuine user turn, not a tool_result or a <system-reminder>
+            question = txt
+            break
+    obs = _situation_text(msgs[i - 1]) if i > 0 else ""
+    out = []
+    if question:
+        out.append("MOST RECENT USER MESSAGE: " + " ".join(question.split())[:400])
+    if obs and obs != question:
+        out.append("MOST RECENT OBSERVATION/RESULT: " + " ".join(obs.split())[:300])
+    return "\n".join(out)
+
+
 _GOAL_PROMPT = (
-    "You are rating whether a coding agent's NEXT ACTION is a good step toward its task, "
-    "given the situation. Judge the action ON ITS OWN MERITS — a valid alternative to what "
-    "some other agent might do is still 'good'. Do NOT compare it to any reference action.\n"
-    "  good     = a sensible, productive step toward the task\n"
-    "  degraded = works but is redundant, suboptimal, or slightly confused\n"
-    "  bad      = wrong target, unproductive, hallucinated, or gives up prematurely\n"
-    "TASK:\n{task}\n"
-    "SITUATION (what it is reacting to):\n{situation}\n"
+    "You rate whether a coding agent's NEXT ACTION is a good move, given the situation. "
+    "Judge it ON ITS OWN MERITS — a valid alternative to what some other agent might do is "
+    "still 'good'. Do NOT compare it to any reference action.\n"
+    "An action can be a TOOL CALL (running a command, reading/editing a file) OR a TEXT "
+    "REPLY to the user. Both are legitimate: a substantive, on-topic text reply that answers "
+    "the user's question or explains findings is GOOD — it is NOT 'giving up'.\n"
+    "  good     = a sensible, productive move: a useful tool call, OR a correct/on-topic reply\n"
+    "  degraded = works but redundant, suboptimal, or slightly off\n"
+    "  bad      = wrong target, off-topic, hallucinated, refuses, or a content-free stall "
+    "(e.g. a bare greeting or 'how can I help?' mid-task)\n"
+    "TASK (first instruction of the session):\n{task}\n"
+    "SITUATION (what the agent is reacting to right now):\n{situation}\n"
     "PROPOSED NEXT ACTION:\n{action}\n"
     'Return ONLY JSON {{"quality":"good"|"degraded"|"bad"}}.')
 
 
 def judge_action_quality(task, situation, action, env):
-    """Goal-based per-step judge: is this action a good/degraded/bad step toward the TASK,
-    on its own merits (not vs the original)? Returns 'good'|'degraded'|'bad' or None. This
-    is robust to valid divergence — a different-but-fine action scores 'good' — so control
-    (no compaction) scores near-100% and the signal is whether an arm takes WORSE steps."""
+    """Goal-based per-step judge: is this action a good/degraded/bad move given the task and
+    the CURRENT situation (not vs the original)? `situation` is a string (see recent_context)
+    — a text reply is judged against the live user question. Returns 'good'|'degraded'|'bad'
+    or None. Robust to valid divergence, so control (no compaction) scores near-100% and the
+    signal is whether an arm takes WORSE moves."""
     prompt = _GOAL_PROMPT.format(task=(task or "")[:500],
-                                 situation=_situation_text(situation)[:600],
+                                 situation=(situation or "")[:700],
                                  action=_action_text(action))
+    req = {"model": JUDGE_MODEL, "max_tokens": 40, "temperature": 0,
+           "messages": [{"role": "user", "content": prompt}]}
+    resp, err = call_api("control", req, {"anthropic-version": "2023-06-01"}, env)
+    if err:
+        return None
+    t = "".join(b.get("text", "") for b in resp.get("content", [])).strip()
+    try:
+        q = json.loads(t[t.index("{"): t.rindex("}") + 1]).get("quality")
+        return q if q in ("good", "degraded", "bad") else None
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+
+_TEXT_MATCH_PROMPT = (
+    "Two TEXT replies a coding agent gave at the same point in a session. A = what it "
+    "ORIGINALLY said (the reference); B = the replay under a compressed context. Do they "
+    "convey the SAME substance — same conclusion, answer, or information — allowing different "
+    "wording and more/less detail?\n"
+    "  good     = same conclusion/substance (wording may differ)\n"
+    "  degraded = partially overlapping, or B is noticeably thinner / vaguer / hedged\n"
+    "  bad      = different conclusion, off-topic, contradicts A, or a content-free stall\n"
+    "A (original):\n{a}\n"
+    "B (replay):\n{b}\n"
+    'Return ONLY JSON {{"quality":"good"|"degraded"|"bad"}}.')
+
+
+def judge_text_match(orig, replay, task, env):
+    """For a TEXT reply, judge the replay against the ORIGINAL text (the reference answer):
+    do they convey the same substance? A valid answer that reaches the original's conclusion
+    scores 'good' even if worded differently. Returns 'good'|'degraded'|'bad' or None."""
+    prompt = _TEXT_MATCH_PROMPT.format(a=(orig.get("text", "") or "")[:800],
+                                       b=(replay.get("text", "") or "")[:800])
     req = {"model": JUDGE_MODEL, "max_tokens": 40, "temperature": 0,
            "messages": [{"role": "user", "content": prompt}]}
     resp, err = call_api("control", req, {"anthropic-version": "2023-06-01"}, env)

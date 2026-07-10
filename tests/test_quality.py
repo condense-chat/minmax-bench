@@ -352,11 +352,11 @@ def test_judge_action_quality_parses_verdict(monkeypatch):
     import minmax_bench.quality.engine as e
     monkeypatch.setattr(e, "call_api",
                         lambda *a, **k: ({"content": [{"text": '{"quality":"degraded"}'}]}, None))
-    assert e.judge_action_quality("fix the bug", None,
+    assert e.judge_action_quality("fix the bug", "",
                                   tool("Bash", command="ls"), {}) == "degraded"
     monkeypatch.setattr(e, "call_api",
                         lambda *a, **k: ({"content": [{"text": 'garbage'}]}, None))
-    assert e.judge_action_quality("t", None, {}, {}) is None  # unparseable -> None, not crash
+    assert e.judge_action_quality("t", "", {}, {}) is None  # unparseable -> None, not crash
 
 
 def test_step_verdict_prefers_goal_quality():
@@ -367,3 +367,24 @@ def test_step_verdict_prefers_goal_quality():
     assert cf._step_verdict(rec) == "good"
     rec["quality"] = "bad"
     assert cf._step_verdict(rec) == "bad"
+
+
+def test_judge_text_match_compares_to_original(monkeypatch):
+    import minmax_bench.quality.engine as e
+    monkeypatch.setattr(e, "call_api",
+                        lambda *a, **k: ({"content": [{"text": '{"quality":"good"}'}]}, None))
+    orig = {"type": "text", "text": "ZDR keeps customer data out of retention via zdr_store.py"}
+    rep = {"type": "text", "text": "Zero-data-retention is implemented in db/zdr_store.py so..."}
+    assert e.judge_text_match(orig, rep, "explain ZDR", {}) == "good"
+
+
+def test_recent_context_finds_the_live_user_question():
+    import minmax_bench.quality.engine as e
+    msgs = [
+        {"role": "user", "content": [{"type": "text", "text": "explain ZDR"}]},
+        {"role": "assistant", "content": [tool("Read", file_path="/zdr.py")]},
+        {"role": "user", "content": [{"type": "tool_result", "content": "class ZDR: ..."}]},
+    ]
+    ctx = e.recent_context(msgs, 2)  # the assistant is about to answer
+    assert "explain ZDR" in ctx                       # the live question is surfaced
+    assert "class ZDR" in ctx                          # and the latest observation

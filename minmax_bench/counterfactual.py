@@ -431,8 +431,14 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                     # goal-based per-step quality: is the arm's action a good/degraded/bad
                     # step toward the TASK, on its own merits (robust to valid divergence)
                     if judge == "goal":
-                        q = eng.judge_action_quality(
-                            task_hint, msgs[i - 1] if i > 0 else None, rep, env)
+                        # hybrid: a TEXT reply is judged against the ORIGINAL's text (the
+                        # reference answer — same conclusion = good); a TOOL action is judged
+                        # on its own merits toward the task (robust to valid path divergence)
+                        if rep.get("type") == "text" and orig.get("type") == "text":
+                            q = eng.judge_text_match(orig, rep, task_hint, env)
+                        else:
+                            q = eng.judge_action_quality(
+                                task_hint, eng.recent_context(msgs, i), rep, env)
                         rec["quality"] = q
                         if q in qual:
                             qual[q] += 1
