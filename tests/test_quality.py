@@ -170,8 +170,8 @@ def test_faithful_step_backward_compatible():
 
 
 def test_report_shows_incremental_only_tasks(tmp_path):
-    """A task with ONLY replay data (no full run — e.g. a session-labelled incremental) still
-    gets a row, with method 'replay' and a faithfulness number, not blanked to '—'."""
+    """A task with ONLY incremental data (no full run — e.g. a session-labelled run) still
+    gets a row with a faithfulness number, and its scoring method is inferred."""
     d = tmp_path / "incremental"
     d.mkdir()
 
@@ -190,9 +190,20 @@ def test_report_shows_incremental_only_tasks(tmp_path):
     row = next((r for r in built["rows"] if r["task"] == "sess"), None)
     assert row is not None                                   # incremental-only task got a row
     a = row["arms"]["condense"]
-    assert a["n"] == 0 and report._method(a) == "incremental"  # no full run, still shows it
+    assert a["n"] == 0                                       # no full run
+    assert a["incr"]["scoring"] == "structural"             # inferred: no LLM judge in records
     faith, _cost = report._faithful_cost(a, report._floor_for(row, ["condense"]))
     assert "%" in faith                                      # a real number, not '—'
+
+
+def test_scoring_infers_llm_judge():
+    """The scoring label distinguishes a structural match from an LLM goal/equivalence judge."""
+    structural = {0: {"agree_action": True, "agree_semantic": True}}
+    goal = {0: {"agree_action": True, "quality": "good"}}
+    equiv = {0: {"agree_action": False, "agree_semantic": True}}  # upgraded a near-miss
+    assert report._scoring(structural) == "structural"
+    assert report._scoring(goal) == "LLM · goal"
+    assert report._scoring(equiv) == "LLM · equivalence"
 
 
 def test_check_arms_catches_unknown_arm_and_missing_keys():

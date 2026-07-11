@@ -295,9 +295,21 @@ def _load_incremental(root, arms):
                 "fid": sum(_faithful_step(A[s]) for s in common) / len(common),
                 "fid_ctrl": sum(_faithful_step(C[s]) for s in common) / len(common),
                 "redund": sum(bool(A[s].get("redundant")) for s in common),
-                "steps": len(common),
+                "scoring": _scoring(A), "steps": len(common),
             }
     return out
+
+
+def _scoring(recset):
+    """Infer per-step scoring from the stored records: an LLM goal judge (each action rated
+    good/degraded/bad toward the task), an LLM equivalence judge (structural near-misses
+    upgraded), or plain structural agreement (exact/action match, no LLM)."""
+    vals = list(recset.values())
+    if any("quality" in r for r in vals):
+        return "LLM · goal"
+    if any(r.get("agree_semantic") not in (None, r.get("agree_action")) for r in vals):
+        return "LLM · equivalence"
+    return "structural"
 
 
 def _faithful_step(r):
@@ -436,21 +448,24 @@ def main(argv=None):
 
 
 # The wide table() view (all axes as separate columns) is the HTML/md layout. The terminal
-# gets a headline projection with control on its own row: method, solve%, length vs control,
-# and a single faithfulness score (per-step agreement docked for redundant re-work). A task
-# whose context never crossed the compaction gate is nulled — nothing was compacted, so the
-# arms aren't worth comparing on it. rework/milestone/ctx detail stays in report.html.
-_LEGEND = (
-    "control = the vanilla baseline (its own row); every arm is measured against it. "
-    "solve = trials solved / attempted (⚠ = some crashed; — = not run in this pass). "
-    "method = how the row was measured — N× full trajectories, +incremental = teacher-forced "
-    "per-step. length = arm trajectory length vs control's median (+longer / −shorter; ✓/✗ = "
-    "within control's noise band, needs ≥2 runs/arm; ⊘ short = control never crossed the "
-    "compaction gate so nothing compacted). faithful = incremental per-step agreement with the "
-    "original (docked for redundant re-work), coloured vs the control floor (control's own "
-    "incremental noise) — green ≥ floor (no measurable loss), red below; ⊘ n/a = nothing "
-    "compressed, so agreement would be noise. cost = $ vs control (incremental; a negative "
-    "value means the arm cost MORE — a cache-bust). No model was called.")
+# shows two focused tables so the modes aren't confounded — FULL trajectories (solve, length)
+# and INCREMENTAL teacher-forced per-step (scoring, compression, faithfulness, cost) — each
+# with control on its own row. rework/milestone/ctx detail stays in report.html.
+_FULL_LEGEND = (
+    "control = the vanilla baseline (its own row); each arm is measured against it. "
+    "runs = finished trials. solve = % of trials that passed the task's verifier (⚠ = some "
+    "crashed; — = not run in this pass). length = arm trajectory length vs control's median "
+    "(+longer / −shorter; ✓/✗ = within control's noise band, needs ≥2 runs/arm; ⊘ short = "
+    "control never crossed the compaction gate, so nothing compacted and any change is "
+    "behavioural). No model was called.")
+_INCR_LEGEND = (
+    "teacher-forced per-step run of a recorded session. control = the baseline (its own row); "
+    "its faithful is the noise floor. scoring = how each step was judged — structural "
+    "(exact/action match, no LLM) or an LLM judge (goal = rate each action toward the task; "
+    "equivalence = upgrade grep-vs-rg near-misses). comp = context compressed. faithful = "
+    "per-step agreement with the original (docked for redundant re-work), coloured vs the "
+    "floor — green ≥ floor (no measurable loss), red below; ⊘ n/a = nothing compressed. "
+    "cost = $ vs control (a negative value means the arm cost MORE — a cache-bust).")
 _SHORT = "[dim]⊘ short[/]"
 _DASH = "[dim]—[/]"
 
@@ -471,13 +486,11 @@ def _solve_pct(c):
     return f"[yellow]{pct} ⚠{c['lost']}[/]" if c["lost"] else pct
 
 
-def _method(c):
-    """How the row was measured: N full-trajectory trials and/or the incremental
-    (teacher-forced per-step) mode. '—' only when neither exists."""
-    m = f"{c['n']}× full" if c["n"] else ""
-    if (c.get("incr") or {}).get("fid") is not None:
-        m = f"{m} +incremental" if m else "incremental"
-    return m or _DASH
+def _runs(c):
+    """Finished-trial count (0× when trials opened but all crashed; — when never run)."""
+    if c["n"] == 0 and c.get("started", 0) == 0:
+        return _DASH
+    return f"{c['n']}×"
 
 
 def _len_delta(v, a, sub_gate):
@@ -495,10 +508,9 @@ def _len_delta(v, a, sub_gate):
 
 
 def _faithful_cost(a, floor):
-    """(faithfulness, cost) — pure incremental metrics, independent of the full run.
-    Faithfulness is the per-step score (agreement AND no redundant re-fetch), coloured against
-    the control floor (same-run reconstruction noise): green ≥ floor (no measurable loss), red
-    below. ⊘ n/a when nothing was compressed; — when there is no incremental data."""
+    """(faithfulness, cost) — incremental metrics. Faithfulness is the per-step score (agreement
+    AND no redundant re-fetch), coloured against the control floor (same-run reconstruction
+    noise): green ≥ floor (no measurable loss), red below. ⊘ n/a when nothing was compressed."""
     inc = a.get("incr") or {}
     fid = inc.get("fid")
     if fid is None:
@@ -512,37 +524,91 @@ def _faithful_cost(a, floor):
     return txt, cost
 
 
-def render_console(d):
-    """Headline terminal view: control + each arm as rows, scored on solve% · length ·
-    faithfulness · cost. The full axis grid (rework, milestone, ctx) lives in report.html."""
-    console = Console()
-    model = d.get("model")
-    title = "[bold]quality — trajectory preservation" + (f" · {model}" if model else "") + "[/]"
-    t = Table(title=title, caption=_LEGEND, caption_justify="left", caption_style="dim")
-    t.add_column("task", no_wrap=True)
-    t.add_column("arm", no_wrap=True)
-    t.add_column("method", no_wrap=True)
-    t.add_column("solve", justify="right")
-    t.add_column("length", justify="right")
-    t.add_column("faithful", justify="center")
-    t.add_column("cost", justify="right")
-    for ri, r in enumerate(d["rows"]):
+def _has_full(r, arms):
+    """A task has full-run data if control or any arm opened at least one trial."""
+    return any(c["n"] or c.get("started", 0)
+               for c in [r["vanilla"]] + [r["arms"][a] for a in arms])
+
+
+def _has_incr(r, arms):
+    return any((r["arms"][a].get("incr") or {}).get("fid") is not None for a in arms)
+
+
+def _scoring_for(r, arms):
+    """The scoring method used for a task's incremental run (uniform across its arms)."""
+    return next((r["arms"][a]["incr"]["scoring"] for a in arms
+                 if (r["arms"][a].get("incr") or {}).get("scoring")), None)
+
+
+def _grouped(t, rows, render_row):
+    """Add task-grouped rows to a table: a section divider between tasks, the task name on
+    the control row, blank on the arm rows (render_row yields cell tuples per arm)."""
+    for ri, r in enumerate(rows):
         if ri:
             t.add_section()
+        for first, arm, cells in render_row(r):
+            t.add_row(r["task"] if first else "", arm, *cells)
+
+
+def _full_table(console, d, model):
+    rows = [r for r in d["rows"] if _has_full(r, d["arms"])]
+    if not rows:
+        return
+    title = "[bold]quality — full trajectories" + (f" · {model}" if model else "") + "[/]"
+    t = Table(title=title, caption=_FULL_LEGEND, caption_justify="left", caption_style="dim")
+    for col in ("task", "arm"):
+        t.add_column(col, no_wrap=True)
+    for col in ("runs", "solve", "length"):
+        t.add_column(col, justify="right")
+
+    def render_row(r):
         v, sub = r["vanilla"], r["sub_gate"]
-        # control's incremental fidelity floor for this task (same-run reconstruction noise); the
-        # arms are coloured against it, and the control row shows it.
-        floor = _floor_for(r, d["arms"])
-        # control is the baseline: its own row, length shown absolute, faithfulness = the floor
         base = f"{v['length'][1]:.0f}" if v["length"] else _DASH
-        ctrl_faith = f"[dim]{floor:.0%} floor[/]" if floor is not None else _DASH
-        t.add_row(r["task"], "control", _method(v), _solve_pct(v), f"[dim]{base}[/]",
-                  ctrl_faith, _DASH)
+        yield True, "control", (_runs(v), _solve_pct(v), f"[dim]{base}[/]")
         for arm in d["arms"]:
             a = r["arms"][arm]
-            faith, cost = _faithful_cost(a, floor)
-            t.add_row("", arm, _method(a), _solve_pct(a), _len_delta(v, a, sub), faith, cost)
+            yield False, arm, (_runs(a), _solve_pct(a), _len_delta(v, a, sub))
+
+    _grouped(t, rows, render_row)
     console.print(t)
+
+
+def _incremental_table(console, d, model):
+    rows = [r for r in d["rows"] if _has_incr(r, d["arms"])]
+    if not rows:
+        return
+    title = ("[bold]quality — incremental (teacher-forced per-step)"
+             + (f" · {model}" if model else "") + "[/]")
+    t = Table(title=title, caption=_INCR_LEGEND, caption_justify="left", caption_style="dim")
+    for col in ("task", "arm", "scoring"):
+        t.add_column(col, no_wrap=True)
+    for col in ("comp", "faithful", "cost"):
+        t.add_column(col, justify="right" if col != "faithful" else "center")
+
+    def render_row(r):
+        floor = _floor_for(r, d["arms"])
+        scoring = _scoring_for(r, d["arms"]) or _DASH
+        ctrl_faith = f"[dim]{floor:.0%} floor[/]" if floor is not None else _DASH
+        yield True, "control", (scoring, _DASH, ctrl_faith, _DASH)
+        for arm in d["arms"]:
+            inc = r["arms"][arm].get("incr") or {}
+            if inc.get("fid") is None:
+                yield False, arm, ("", _DASH, _DASH, _DASH)
+                continue
+            faith, cost = _faithful_cost(r["arms"][arm], floor)
+            yield False, arm, ("", _pct(inc.get("comp")), faith, cost)
+
+    _grouped(t, rows, render_row)
+    console.print(t)
+
+
+def render_console(d):
+    """Terminal view: two focused tables (full trajectories, then incremental) so the two
+    measurement modes aren't confounded, followed by a one-glance takeaway."""
+    console = Console()
+    model = d.get("model")
+    _full_table(console, d, model)
+    _incremental_table(console, d, model)
     _takeaway(console, d)
 
 
