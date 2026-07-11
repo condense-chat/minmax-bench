@@ -424,18 +424,16 @@ def main(argv=None):
 
 
 # The wide table() view (all axes as separate columns) is the HTML/md layout. The terminal
-# gets a narrow projection: the two length bands collapse into one "v→a" cell, verdicts show
-# as bare ✓/✗ icons, and the incremental-replay metrics move to their own second table.
+# gets a headline projection: solve, length as a % vs vanilla, faithfulness (per-step
+# agreement from the incremental replay), and cost. rework/milestone/ctx stay in report.html.
 _LEGEND = (
     "solve = vanilla·arm finished/attempted (⚠ = trials crashed, — = not run in this pass). "
-    "ctx = vanilla peak context; ⊘ = below the compaction gate, so compaction can't have "
-    "fired and any divergence is behavioural, not compaction damage. length v→a = vanilla→arm "
-    "step-count medians[min-max]; ✓/✗ = the arm's band overlaps vanilla's noise floor "
-    "(needs ≥2 runs/arm) — same for rework and milestone. No model was called.")
-_INCR_LEGEND = (
-    "incremental = teacher-forced per-step replay. comp = context compressed · fid a·c = "
-    "per-step action agreement (arm·control) · $Δ = cost delta. ⊘ passthrough = no compression "
-    "happened, so agreement deltas would be noise.")
+    "length = arm trajectory length vs vanilla's median (+longer / −shorter); ✓/✗ = still "
+    "within vanilla's noise band, needs ≥2 runs/arm; ⊘ = vanilla stayed below the compaction "
+    "gate, so any change is behavioural, not compaction damage. faithful = per-step action "
+    "agreement with the original trajectory (incremental replay; ⊘ = nothing was compressed, "
+    "so it isn't measured). cost = $ delta vs control (incremental replay). "
+    "rework, milestone and peak context are in report.html. No model was called.")
 
 
 def _icon(ok):
@@ -453,70 +451,52 @@ def _solve_c(c):
     return f"{c['solve']}/{c['attempted']}" + (f"⚠{c['lost']}" if c["lost"] else "")
 
 
+def _len_pct(v, a, sub_gate):
+    """Arm trajectory length as a signed % of vanilla's median, + verdict icon + ⊘ gate mark."""
+    vm = v["length"][1] if v["length"] else None
+    am = a["length"][1] if a["length"] else None
+    if am is None or not vm:
+        return "[dim]—[/]"
+    core = f"{(am / vm - 1) * 100:+.0f}%"
+    if a["length_ok"] is not None:
+        core += f" {_icon(a['length_ok'])}"
+    return _colok(core, a["length_ok"]) + (" [dim]⊘[/]" if sub_gate else "")
+
+
+def _incr_cells(inc):
+    """(faithfulness, cost) from an incremental-replay record; ⊘/— when it doesn't apply."""
+    if not inc or inc.get("fid") is None:
+        return "[dim]—[/]", "[dim]—[/]"
+    passthrough = abs(inc.get("comp") or 0) < 0.02  # nothing compressed -> fidelity is noise
+    faith = "[dim]⊘[/]" if passthrough else f"{inc['fid']:.0%}"
+    return faith, _pct(inc.get("costd"))
+
+
 def render_console(d):
-    """Narrow terminal projection of the quality bench: ≤7 columns for the offline axes,
-    then a separate incremental-replay table when that data exists."""
+    """Headline terminal view: solve · length% · faithfulness · cost. The full axis grid
+    (rework, milestone, context, bands) lives in report.html."""
     console = Console()
     model = d.get("model")
     title = "[bold]quality — trajectory preservation" + (f" · {model}" if model else "") + "[/]"
     t = Table(title=title, caption=_LEGEND, caption_justify="left", caption_style="dim")
-    for h in ("task", "arm", "solve v·a", "ctx", "length v→a"):
-        t.add_column(h, no_wrap=True)
-    t.add_column("rwk", justify="center")
-    if d["has_milestone"]:
-        t.add_column("mile", justify="center")
+    t.add_column("task", no_wrap=True)
+    t.add_column("arm", no_wrap=True)
+    t.add_column("solve v·a", no_wrap=True)
+    t.add_column("length", justify="right")
+    t.add_column("faithful", justify="center")
+    t.add_column("cost", justify="right")
     for r in d["rows"]:
         v = r["vanilla"]
-        pk = v["peak_ctx"]
-        ctx = "—" if not pk else f"{pk / 1000:.0f}k" + (" ⊘" if r["sub_gate"] else "")
         for arm in d["arms"]:
             a = r["arms"][arm]
             sv, sa = _solve_c(v), _solve_c(a)
             solve = "—" if sv == "—" and sa == "—" else f"{sv}·{sa}"
             solve = "[dim]—[/]" if solve == "—" else (f"[yellow]{solve}[/]" if "⚠" in solve
                                                       else solve)
-            lv, la = _b(v["length"]), _b(a["length"])
-            ltxt = "—" if lv == "—" and la == "—" else f"{lv}→{la}"
-            if a["length_ok"] is not None:
-                ltxt = f"{ltxt} {_icon(a['length_ok'])}"
-            cells = [r["task"], arm, solve,
-                     f"[dim]{ctx}[/]" if "⊘" in ctx else ctx,
-                     _colok(ltxt, a["length_ok"]),
-                     _colok(_icon(a["rework_ok"]), a["rework_ok"])]
-            if d["has_milestone"]:
-                cells.append(_colok(_icon(a["milestone_ok"]), a["milestone_ok"]))
-            t.add_row(*cells)
+            faith, cost = _incr_cells(a.get("incr"))
+            t.add_row(r["task"], arm, solve, _len_pct(v, a, r["sub_gate"]), faith, cost)
     console.print(t)
-    _incr_table(console, d)
     _takeaway(console, d)
-
-
-def _incr_table(console, d):
-    """The incremental-replay metrics as their own compact table (only when present)."""
-    rows = []
-    for r in d["rows"]:
-        for arm in d["arms"]:
-            inc = r["arms"][arm].get("incr")
-            if not inc:
-                continue
-            if inc.get("fid") is None:
-                fid = "—"
-            elif abs(inc.get("comp") or 0) < 0.02:
-                fid = "[dim]⊘ passthrough[/]"
-            else:
-                fid = f"{inc['fid']:.0%}·{inc['fid_ctrl']:.0%}"
-            rows.append((r["task"], arm, _pct(inc.get("comp")), fid, _pct(inc.get("costd"))))
-    if not rows:
-        return
-    t = Table(title="[bold]incremental replay[/]", caption=_INCR_LEGEND,
-              caption_justify="left", caption_style="dim")
-    for h in ("task", "arm"):
-        t.add_column(h, no_wrap=True)
-    for h in ("comp", "fid a·c", "$Δ"):
-        t.add_column(h, justify="center")
-    for row in rows:
-        t.add_row(*row)
-    console.print(t)
 
 
 _AXES = (("length", "length_ok"), ("rework", "rework_ok"), ("milestone", "milestone_ok"))
