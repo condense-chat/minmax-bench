@@ -424,16 +424,21 @@ def main(argv=None):
 
 
 # The wide table() view (all axes as separate columns) is the HTML/md layout. The terminal
-# gets a headline projection: solve, length as a % vs vanilla, faithfulness (per-step
-# agreement from the incremental replay), and cost. rework/milestone/ctx stay in report.html.
+# gets a headline projection with control on its own row: method, solve%, length vs control,
+# and a single faithfulness score (per-step agreement docked for redundant re-work). A task
+# whose context never crossed the compaction gate is nulled — nothing was compacted, so the
+# arms aren't worth comparing on it. rework/milestone/ctx detail stays in report.html.
 _LEGEND = (
-    "solve = vanilla·arm finished/attempted (⚠ = trials crashed, — = not run in this pass). "
-    "length = arm trajectory length vs vanilla's median (+longer / −shorter); ✓/✗ = still "
-    "within vanilla's noise band, needs ≥2 runs/arm; ⊘ = vanilla stayed below the compaction "
-    "gate, so any change is behavioural, not compaction damage. faithful = per-step action "
-    "agreement with the original trajectory (incremental replay; ⊘ = nothing was compressed, "
-    "so it isn't measured). cost = $ delta vs control (incremental replay). "
-    "rework, milestone and peak context are in report.html. No model was called.")
+    "control = the vanilla baseline (its own row); every arm is measured against it. "
+    "solve = trials solved / attempted (⚠ = some crashed; — = not run in this pass). "
+    "method = how the row was measured — N× full trials, +replay = teacher-forced per-step. "
+    "length = arm trajectory length vs control's median (+longer / −shorter; ✓/✗ = within "
+    "control's noise band, needs ≥2 runs/arm). faithful = per-step action agreement with the "
+    "original trajectory, docked for redundant re-work (replay only). cost = $ vs control "
+    "(replay). ⊘ too short = control's context never crossed the compaction gate, so nothing "
+    "was compacted and the arm isn't comparable on this task. No model was called.")
+_SHORT = "[dim]⊘ short[/]"
+_DASH = "[dim]—[/]"
 
 
 def _icon(ok):
@@ -444,80 +449,112 @@ def _colok(text, ok):
     return f"[green]{text}[/]" if ok is True else (f"[red]{text}[/]" if ok is False else text)
 
 
-def _solve_c(c):
-    """Compact solve: 'finished/attempted' + '⚠lost'; '—' when never run."""
+def _solve_pct(c):
+    """Solve rate as a %, yellow with ⚠lost when some trials crashed; — when never run."""
     if c["n"] == 0 and c.get("started", 0) == 0:
-        return "—"
-    return f"{c['solve']}/{c['attempted']}" + (f"⚠{c['lost']}" if c["lost"] else "")
+        return _DASH
+    pct = f"{c['solve'] / c['attempted'] * 100:.0f}%" if c["attempted"] else "0%"
+    return f"[yellow]{pct} ⚠{c['lost']}[/]" if c["lost"] else pct
 
 
-def _len_pct(v, a, sub_gate):
-    """Arm trajectory length as a signed % of vanilla's median, + verdict icon + ⊘ gate mark."""
+def _method(c):
+    """How the row was measured: N full trials, + replay when teacher-forced data exists."""
+    if c["n"] == 0 and c.get("started", 0) == 0:
+        return _DASH
+    m = f"{c['n']}× full"
+    return m + " +replay" if (c.get("incr") or {}).get("fid") is not None else m
+
+
+def _len_delta(v, a, sub_gate):
+    """Arm length vs control's median as a signed %, + ✓/✗ verdict; nulled when too short."""
     vm = v["length"][1] if v["length"] else None
     am = a["length"][1] if a["length"] else None
     if am is None or not vm:
-        return "[dim]—[/]"
+        return _DASH
+    if sub_gate:
+        return _SHORT
     core = f"{(am / vm - 1) * 100:+.0f}%"
     if a["length_ok"] is not None:
         core += f" {_icon(a['length_ok'])}"
-    return _colok(core, a["length_ok"]) + (" [dim]⊘[/]" if sub_gate else "")
+    return _colok(core, a["length_ok"])
 
 
-def _incr_cells(inc):
-    """(faithfulness, cost) from an incremental-replay record; ⊘/— when it doesn't apply."""
-    if not inc or inc.get("fid") is None:
-        return "[dim]—[/]", "[dim]—[/]"
-    passthrough = abs(inc.get("comp") or 0) < 0.02  # nothing compressed -> fidelity is noise
-    faith = "[dim]⊘[/]" if passthrough else f"{inc['fid']:.0%}"
-    return faith, _pct(inc.get("costd"))
+def _faithful_cost(v, a, sub_gate):
+    """(faithfulness, cost). Faithfulness = per-step agreement (replay) docked for the arm's
+    excess redundant re-work over control. Nulled when the task is too short or nothing was
+    actually compressed (agreement would be measuring noise)."""
+    if a["n"] == 0 and a.get("started", 0) == 0:   # arm never ran -> no data, not "too short"
+        return _DASH, _DASH
+    if sub_gate:
+        return _SHORT, _SHORT
+    inc = a.get("incr") or {}
+    fid = inc.get("fid")
+    if fid is None:
+        return _DASH, _DASH
+    cost = _pct(inc.get("costd"))
+    if abs(inc.get("comp") or 0) < 0.02:  # nothing compressed -> not comparable
+        return "[dim]⊘ n/a[/]", cost
+    vr = v["rework"][1] if v["rework"] else 0.0
+    ar = a["rework"][1] if a["rework"] else 0.0
+    al = a["length"][1] if a["length"] else 1.0
+    penalty = max(0.0, ar - vr) / max(al, 1.0)   # extra re-fetches per step
+    return f"{max(0.0, min(1.0, fid - penalty)):.0%}", cost
 
 
 def render_console(d):
-    """Headline terminal view: solve · length% · faithfulness · cost. The full axis grid
-    (rework, milestone, context, bands) lives in report.html."""
+    """Headline terminal view: control + each arm as rows, scored on solve% · length ·
+    faithfulness · cost. The full axis grid (rework, milestone, ctx) lives in report.html."""
     console = Console()
     model = d.get("model")
     title = "[bold]quality — trajectory preservation" + (f" · {model}" if model else "") + "[/]"
     t = Table(title=title, caption=_LEGEND, caption_justify="left", caption_style="dim")
     t.add_column("task", no_wrap=True)
     t.add_column("arm", no_wrap=True)
-    t.add_column("solve v·a", no_wrap=True)
+    t.add_column("method", no_wrap=True)
+    t.add_column("solve", justify="right")
     t.add_column("length", justify="right")
     t.add_column("faithful", justify="center")
     t.add_column("cost", justify="right")
-    for r in d["rows"]:
-        v = r["vanilla"]
+    for ri, r in enumerate(d["rows"]):
+        if ri:
+            t.add_section()
+        v, sub = r["vanilla"], r["sub_gate"]
+        # control is the baseline: its own row, length shown absolute, nothing to score against
+        base = f"{v['length'][1]:.0f}" if v["length"] else _DASH
+        t.add_row(r["task"], "control", _method(v), _solve_pct(v), f"[dim]{base}[/]",
+                  _DASH, _DASH)
         for arm in d["arms"]:
             a = r["arms"][arm]
-            sv, sa = _solve_c(v), _solve_c(a)
-            solve = "—" if sv == "—" and sa == "—" else f"{sv}·{sa}"
-            solve = "[dim]—[/]" if solve == "—" else (f"[yellow]{solve}[/]" if "⚠" in solve
-                                                      else solve)
-            faith, cost = _incr_cells(a.get("incr"))
-            t.add_row(r["task"], arm, solve, _len_pct(v, a, r["sub_gate"]), faith, cost)
+            faith, cost = _faithful_cost(v, a, sub)
+            t.add_row("", arm, _method(a), _solve_pct(a), _len_delta(v, a, sub), faith, cost)
     console.print(t)
     _takeaway(console, d)
 
 
-_AXES = (("length", "length_ok"), ("rework", "rework_ok"), ("milestone", "milestone_ok"))
-
-
 def _takeaway(console, d):
-    """A one-glance summary under the table: how much of the matrix actually graded, and
-    every arm×axis that DIVERGED from the vanilla noise floor (the whole point of the run)."""
-    cells = [(r, arm, r["arms"][arm]) for r in d["rows"] for arm in d["arms"]]
-    graded = {r["task"] for r, _, a in cells if any(a.get(k) is not None for _, k in _AXES)}
-    notrun = [1 for _, _, a in cells if a["n"] == 0 and a.get("started", 0) == 0]
-    diverge = [f"{r['task']}/{arm} {axis}" for r, arm, a in cells
-               for axis, k in _AXES if a.get(k) is False]
-    parts = [f"{len(graded)}/{len(d['rows'])} tasks graded"]
+    """One-glance summary: how many tasks are actually comparable (graded AND compaction
+    could fire), how many were too short, how many arm-cells never ran, and any divergence."""
+    total = len(d["rows"])
+    comparable, tooshort = set(), set()
+    for r in d["rows"]:
+        graded = (len(r["vanilla"]["_lens"]) >= 2
+                  and any(len(r["arms"][arm]["_lens"]) >= 2 for arm in d["arms"]))
+        if graded:
+            (tooshort if r["sub_gate"] else comparable).add(r["task"])
+    notrun = sum(1 for r in d["rows"] for arm in d["arms"]
+                 if r["arms"][arm]["n"] == 0 and r["arms"][arm].get("started", 0) == 0)
+    diverge = [f"{r['task']}/{arm}" for r in d["rows"] if not r["sub_gate"]
+               for arm in d["arms"] if r["arms"][arm].get("length_ok") is False]
+    parts = [f"{len(comparable)}/{total} tasks comparable"]
+    if tooshort:
+        parts.append(f"[dim]{len(tooshort)} too short (compaction never fired)[/]")
     if notrun:
-        parts.append(f"[dim]{len(notrun)} arm-cells not run in this pass[/]")
+        parts.append(f"[dim]{notrun} arm-cells not run[/]")
     console.print("[bold]takeaway[/]  " + " · ".join(parts))
     if diverge:
-        console.print("[red]  ✗ diverges vs vanilla:[/] " + ", ".join(diverge))
-    elif graded:
-        console.print("[green]  ✓ no divergence from the vanilla noise floor[/]")
+        console.print("[red]  ✗ length diverges vs control:[/] " + ", ".join(diverge))
+    elif comparable:
+        console.print("[green]  ✓ no divergence on comparable tasks[/]")
 
 
 if __name__ == "__main__":
