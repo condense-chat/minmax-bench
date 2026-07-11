@@ -197,14 +197,16 @@ def test_report_shows_incremental_only_tasks(tmp_path):
 
 
 def test_faithful_engagement_counts_ccr_retrieves():
-    """Headroom's NET compression can be ~0 while it still engaged CCR (compressed a tool
-    output to a marker, then the agent retrieved it back). Faithfulness is ⊘ passthrough only
-    when the arm neither compressed NOR retrieved — a CCR retrieve alone makes it comparable."""
+    """Headroom's NET compression can be ~0 while it still engaged CCR (compressed a tool output
+    to a marker, then the agent retrieved it back). The score is always shown, but only carries a
+    green/red verdict when the arm actually engaged (compressed OR retrieved)."""
     floor = 0.5
     low_no_ccr = {"incr": {"fid": 0.4, "comp": 0.01, "retrieves": 0, "costd": 0.0}}
     low_with_ccr = {"incr": {"fid": 0.4, "comp": 0.01, "retrieves": 5, "costd": 0.0}}
-    assert "passthrough" in report._faithful_cost(low_no_ccr, floor)[0]  # ran, but did nothing
-    assert "40%" in report._faithful_cost(low_with_ccr, floor)[0]   # CCR engaged -> comparable
+    passthrough = report._faithful_cost(low_no_ccr, floor)[0]
+    engaged = report._faithful_cost(low_with_ccr, floor)[0]
+    assert "40%" in passthrough and "green" not in passthrough and "red" not in passthrough
+    assert "40%" in engaged and ("green" in engaged or "red" in engaged)  # verdict colour
     assert report._engaged({"comp": 0.01, "retrieves": 3}) is True
     assert report._engaged({"comp": 0.01, "retrieves": 0}) is False
     assert report._engaged({"comp": 0.20, "retrieves": 0}) is True  # compression alone counts
