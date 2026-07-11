@@ -169,6 +169,32 @@ def test_faithful_step_backward_compatible():
     assert report._faithful_step({"agree_action": False}) is False
 
 
+def test_report_shows_incremental_only_tasks(tmp_path):
+    """A task with ONLY replay data (no full run — e.g. a session-labelled incremental) still
+    gets a row, with method 'replay' and a faithfulness number, not blanked to '—'."""
+    d = tmp_path / "incremental"
+    d.mkdir()
+
+    def write(arm, recs):
+        (d / f"sess-{arm}.jsonl").write_text("\n".join(json.dumps(r) for r in recs))
+
+    def rec(step, agree, ctx):
+        return {"step": step, "agree_action": agree, "redundant": False,
+                "cost_usd": 1.0, "usage": {"input_tokens": ctx}}
+
+    write("control", [rec(0, True, 100), rec(1, True, 100), rec(2, True, 100)])
+    write("condense", [rec(0, True, 60), rec(1, True, 60), rec(2, False, 60)])  # comp 40%
+    args = SimpleNamespace(arms="condense", tasks="kv-store-grpc", agent="claude-code",
+                           ctx_gate=50_000, **{"from": str(tmp_path)})
+    built = report.build(args)
+    row = next((r for r in built["rows"] if r["task"] == "sess"), None)
+    assert row is not None                                   # incremental-only task got a row
+    a = row["arms"]["condense"]
+    assert a["n"] == 0 and report._method(a) == "replay"     # no full run, still 'replay'
+    faith, _cost = report._faithful_cost(a, report._floor_for(row, ["condense"]))
+    assert "%" in faith                                      # a real number, not '—'
+
+
 def test_check_arms_catches_unknown_arm_and_missing_keys():
     # headroom-kompress is a full-mode-only arm — not a valid teacher-forced replay arm
     problems = eng.check_arms(["control", "headroom-kompress", "condense"], {})

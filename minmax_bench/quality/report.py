@@ -220,7 +220,11 @@ def build(args):
     incr = _load_incremental(root, arms)
     rows = []
     gate = getattr(args, "ctx_gate", 50_000)
-    for task in resolve_tasks(args.tasks):
+    # curated full-run tasks first, then any task that only has incremental-replay data
+    # (replays labelled by session, e.g. `swe-long` or a uuid) so those still get a row
+    curated = list(resolve_tasks(args.tasks))
+    extra = sorted({t for t, _a in incr} - set(curated))
+    for task in curated + extra:
         v = _cell_stats(idx.get(f"vanilla-{task}"))
         row = {"task": task, "vanilla": v, "arms": {},
                "sub_gate": bool(v["peak_ctx"]) and v["peak_ctx"] < gate}
@@ -441,10 +445,12 @@ _LEGEND = (
     "solve = trials solved / attempted (⚠ = some crashed; — = not run in this pass). "
     "method = how the row was measured — N× full trials, +replay = teacher-forced per-step. "
     "length = arm trajectory length vs control's median (+longer / −shorter; ✓/✗ = within "
-    "control's noise band, needs ≥2 runs/arm). faithful = per-step action agreement with the "
-    "original trajectory, docked for redundant re-work (replay only). cost = $ vs control "
-    "(replay). ⊘ too short = control's context never crossed the compaction gate, so nothing "
-    "was compacted and the arm isn't comparable on this task. No model was called.")
+    "control's noise band, needs ≥2 runs/arm; ⊘ short = control never crossed the compaction "
+    "gate so nothing compacted). faithful = per-step agreement with the original (docked for "
+    "redundant re-work), coloured vs the control replay floor — green ≥ floor (no measurable "
+    "loss), red below; ⊘ n/a = nothing compressed, so agreement would be noise. cost = $ vs "
+    "control (replay; a negative value means the arm cost MORE — a cache-bust). "
+    "No model was called.")
 _SHORT = "[dim]⊘ short[/]"
 _DASH = "[dim]—[/]"
 
@@ -466,11 +472,12 @@ def _solve_pct(c):
 
 
 def _method(c):
-    """How the row was measured: N full trials, + replay when teacher-forced data exists."""
-    if c["n"] == 0 and c.get("started", 0) == 0:
-        return _DASH
-    m = f"{c['n']}× full"
-    return m + " +replay" if (c.get("incr") or {}).get("fid") is not None else m
+    """How the row was measured: N full trials and/or teacher-forced replay. '—' only when
+    neither exists (incremental-only rows still show 'replay' with no full trials)."""
+    m = f"{c['n']}× full" if c["n"] else ""
+    if (c.get("incr") or {}).get("fid") is not None:
+        m = f"{m} +replay" if m else "replay"
+    return m or _DASH
 
 
 def _len_delta(v, a, sub_gate):
@@ -487,14 +494,11 @@ def _len_delta(v, a, sub_gate):
     return _colok(core, a["length_ok"])
 
 
-def _faithful_cost(a, sub_gate):
-    """(faithfulness, cost). Faithfulness is the replay's per-step score — agreement with the
-    original AND no redundant re-fetch — already docked for re-work at its source. Nulled when
-    the arm didn't run, the task is too short, or nothing was compressed (would be noise)."""
-    if a["n"] == 0 and a.get("started", 0) == 0:   # arm never ran -> no data, not "too short"
-        return _DASH, _DASH
-    if sub_gate:
-        return _SHORT, _SHORT
+def _faithful_cost(a, floor):
+    """(faithfulness, cost) — pure replay metrics, independent of the full run. Faithfulness
+    is the per-step score (agreement AND no redundant re-fetch), coloured against the control
+    floor (same-run reconstruction noise): green ≥ floor (no measurable loss), red below.
+    ⊘ n/a when nothing was compressed (agreement would be measuring noise); — when no replay."""
     inc = a.get("incr") or {}
     fid = inc.get("fid")
     if fid is None:
@@ -502,7 +506,10 @@ def _faithful_cost(a, sub_gate):
     cost = _pct(inc.get("costd"))
     if abs(inc.get("comp") or 0) < 0.02:  # nothing compressed -> not comparable
         return "[dim]⊘ n/a[/]", cost
-    return f"{fid:.0%}", cost
+    txt = f"{fid:.0%}"
+    if floor is not None:
+        txt = f"[green]{txt}[/]" if fid >= floor - 0.02 else f"[red]{txt}[/]"
+    return txt, cost
 
 
 def render_console(d):
@@ -523,42 +530,64 @@ def render_console(d):
         if ri:
             t.add_section()
         v, sub = r["vanilla"], r["sub_gate"]
-        # control is the baseline: its own row, length shown absolute, nothing to score against
+        # control's replay fidelity floor for this task (same-run reconstruction noise); the
+        # arms are coloured against it, and the control row shows it.
+        floor = _floor_for(r, d["arms"])
+        # control is the baseline: its own row, length shown absolute, faithfulness = the floor
         base = f"{v['length'][1]:.0f}" if v["length"] else _DASH
+        ctrl_faith = f"[dim]{floor:.0%} floor[/]" if floor is not None else _DASH
         t.add_row(r["task"], "control", _method(v), _solve_pct(v), f"[dim]{base}[/]",
-                  _DASH, _DASH)
+                  ctrl_faith, _DASH)
         for arm in d["arms"]:
             a = r["arms"][arm]
-            faith, cost = _faithful_cost(a, sub)
+            faith, cost = _faithful_cost(a, floor)
             t.add_row("", arm, _method(a), _solve_pct(a), _len_delta(v, a, sub), faith, cost)
     console.print(t)
     _takeaway(console, d)
 
 
+def _floor_for(r, arms):
+    """The control replay fidelity floor for a task (fid_ctrl, ≈equal across arms)."""
+    return next((r["arms"][a]["incr"]["fid_ctrl"] for a in arms
+                 if (r["arms"][a].get("incr") or {}).get("fid_ctrl") is not None), None)
+
+
 def _takeaway(console, d):
-    """One-glance summary: how many tasks are actually comparable (graded AND compaction
-    could fire), how many were too short, how many arm-cells never ran, and any divergence."""
-    total = len(d["rows"])
+    """One-glance summary across both measurement modes: full-run comparability (graded AND
+    compaction could fire) and replay coverage, plus divergences — length (full) or fidelity
+    below the control floor (replay)."""
     comparable, tooshort = set(), set()
     for r in d["rows"]:
         graded = (len(r["vanilla"]["_lens"]) >= 2
                   and any(len(r["arms"][arm]["_lens"]) >= 2 for arm in d["arms"]))
         if graded:
             (tooshort if r["sub_gate"] else comparable).add(r["task"])
-    notrun = sum(1 for r in d["rows"] for arm in d["arms"]
-                 if r["arms"][arm]["n"] == 0 and r["arms"][arm].get("started", 0) == 0)
-    diverge = [f"{r['task']}/{arm}" for r in d["rows"] if not r["sub_gate"]
+    replayed = {r["task"] for r in d["rows"] for arm in d["arms"]
+                if (r["arms"][arm].get("incr") or {}).get("fid") is not None}
+    diverge = [f"{r['task']}/{arm} length" for r in d["rows"] if not r["sub_gate"]
                for arm in d["arms"] if r["arms"][arm].get("length_ok") is False]
-    parts = [f"{len(comparable)}/{total} tasks comparable"]
-    if tooshort:
-        parts.append(f"[dim]{len(tooshort)} too short (compaction never fired)[/]")
-    if notrun:
-        parts.append(f"[dim]{notrun} arm-cells not run[/]")
-    console.print("[bold]takeaway[/]  " + " · ".join(parts))
+    for r in d["rows"]:                                   # fidelity meaningfully below floor
+        floor = _floor_for(r, d["arms"])
+        if floor is None:
+            continue
+        for arm in d["arms"]:
+            inc = r["arms"][arm].get("incr") or {}
+            if (inc.get("fid") is not None and abs(inc.get("comp") or 0) >= 0.02
+                    and inc["fid"] < floor - 0.1):
+                diverge.append(f"{r['task']}/{arm} fidelity ({inc['fid']:.0%} vs {floor:.0%})")
+    parts = []
+    if comparable or tooshort:
+        full = f"full: {len(comparable)} comparable"
+        if tooshort:
+            full += f", {len(tooshort)} too short"
+        parts.append(full)
+    if replayed:
+        parts.append(f"replay: {len(replayed)} tasks")
+    console.print("[bold]takeaway[/]  " + " · ".join(parts or ["nothing comparable yet"]))
     if diverge:
-        console.print("[red]  ✗ length diverges vs control:[/] " + ", ".join(diverge))
-    elif comparable:
-        console.print("[green]  ✓ no divergence on comparable tasks[/]")
+        console.print("[red]  ✗ diverges vs control:[/] " + ", ".join(diverge))
+    elif comparable or replayed:
+        console.print("[green]  ✓ no divergence detected[/]")
 
 
 if __name__ == "__main__":
