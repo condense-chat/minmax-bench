@@ -141,6 +141,34 @@ def test_load_incremental_joins_and_reports_fidelity_vs_control(tmp_path):
     assert inc["fid"] == 0.5 and inc["fid_ctrl"] == 1.0
 
 
+def test_incremental_faithfulness_docks_redundant_refetch(tmp_path):
+    """A step that agrees with the original but redundantly re-fetches already-seen info is
+    NOT faithful — faithfulness must fall below raw agreement (rework folded in at source)."""
+    d = tmp_path / "incremental"
+    d.mkdir()
+
+    def write(arm, recs):
+        (d / f"kv-{arm}.jsonl").write_text("\n".join(json.dumps(r) for r in recs))
+
+    def rec(step, agree, redundant):
+        return {"arm": "x", "step": step, "agree_action": agree, "redundant": redundant,
+                "cost_usd": 1.0, "usage": {"input_tokens": 100}}
+
+    write("control", [rec(0, True, False), rec(1, True, False), rec(2, True, False)])
+    # step 2 agrees with the original but re-fetches -> agreement 2/2 but faithful only 1/2
+    write("condense", [rec(0, True, False), rec(1, True, False), rec(2, True, True)])
+    inc = report._load_incremental(str(tmp_path), ["condense"])[("kv", "condense")]
+    assert inc["fid"] == 0.5 and inc["fid_ctrl"] == 1.0
+    assert inc["redund"] == 1
+
+
+def test_faithful_step_backward_compatible():
+    # old artifacts have no 'redundant' key -> degrade gracefully to plain agreement
+    assert report._faithful_step({"agree_action": True}) is True
+    assert report._faithful_step({"agree_action": True, "redundant": True}) is False
+    assert report._faithful_step({"agree_action": False}) is False
+
+
 def test_check_arms_catches_unknown_arm_and_missing_keys():
     # headroom-kompress is a full-mode-only arm — not a valid teacher-forced replay arm
     problems = eng.check_arms(["control", "headroom-kompress", "condense"], {})

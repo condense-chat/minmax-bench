@@ -209,7 +209,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,
            model: str | None = None, auth: str = "auto", task: str = "session",
            judge: str = "off", capture: bool = False, headroom_mode: str = "token",
-           ccr: bool = True) -> dict:
+           ccr: bool = True, ctx_gate: int = 50_000) -> dict:
     env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
     if auth == "subscription":
         # force the Claude Code login path even when an API key is configured
@@ -242,6 +242,20 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         console.print("[red]no assistant decision points in this session[/]")
         raise SystemExit(1)
     meta = session_meta(session)
+
+    # skip too-short sessions early: if the session's peak context never crossed the
+    # compaction gate, no arm would ever compact anything — the replay is a guaranteed
+    # passthrough, so spending on it buys nothing. --ctx-gate 0 forces it anyway.
+    peak = max((u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                + u.get("cache_creation_input_tokens", 0)
+                for u in eng.recorded_usage(str(session))), default=0)
+    if ctx_gate and peak < ctx_gate:
+        console.print(Panel.fit(
+            f"[yellow]{session.name}[/] peaks at [bold]{peak / 1000:.0f}k[/] context — below the "
+            f"[bold]{ctx_gate / 1000:.0f}k[/] compaction gate.\nNothing would be compacted, so "
+            f"there is nothing to compare. [dim]Skipped (use --ctx-gate 0 to force).[/]",
+            title="too short — not comparable", border_style="yellow"))
+        raise SystemExit(0)
 
     # patch the template's capture cwd to this session's real cwd
     if meta["cwd"]:
@@ -388,6 +402,10 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         qual = {"good": 0, "degraded": 0, "bad": 0}  # goal-judge tally
         judge_spent = 0.0  # LLM-judge cost, billed into the budget and reported separately
         by_step = {}  # step-index -> {ctx, cost, agree} for common-step fair aggregation
+        # per-step redundant re-fetch tracking (compaction amnesia): a FAITHFUL step both
+        # agrees with the original AND doesn't re-fetch info an earlier original step held.
+        # This folds "was redundant re-work done?" into the fidelity score at its source.
+        seen_files, seen_cmds, n_faithful, n_redund = set(), set(), 0, 0
         # CCR injection: for the headroom arm, execute headroom_retrieve calls via
         # `headroom mcp serve` so the real Compress-Cache-Retrieve loop engages (else the
         # arm is only kompress). Retrieves are counted as CCR's step overhead.
@@ -456,6 +474,11 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                         n_ok += 1
                         n_action += action
                         n_exact += exact
+                        # did the arm re-fetch something an earlier ORIGINAL step already had?
+                        # (the ↻ compaction-amnesia signal) — a faithful step avoids it
+                        redundant = _is_refetch(rep, seen_files, seen_cmds)
+                        n_redund += redundant
+                        n_faithful += bool(action and not redundant)
                         step_ctx = (usage.get("input_tokens", 0)
                                     + usage.get("cache_read_input_tokens", 0)
                                     + usage.get("cache_creation_input_tokens", 0))
@@ -465,10 +488,10 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                         # deltas can be computed over the COMMON steps all arms reached (an arm
                         # that hits its budget early must not be compared over a longer step set)
                         by_step[step] = {"ctx": step_ctx, "cost": round(c, 4),
-                                         "agree": bool(action)}
+                                         "agree": bool(action), "redundant": bool(redundant)}
                         rec.update(replay=rep, agree_exact=exact, agree_action=action,
                                    agree_semantic=agree_sem, sim=round(sim, 3),
-                                   usage=usage, cost_usd=round(c, 4))
+                                   redundant=bool(redundant), usage=usage, cost_usd=round(c, 4))
                         # goal-based per-step quality: is the arm's action good/degraded/bad
                         # toward the TASK, on its own merits (robust to valid divergence)
                         if judge == "goal":
@@ -492,12 +515,17 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                     first_err = first_err or rec["error"]
                 if ccr_active and mcp and mcp.ok:
                     rec["ccr_retrieves"] = nr
+                # accumulate what the ORIGINAL trajectory has now seen, so a later step that
+                # re-fetches it counts as redundant (compaction amnesia the arm should avoid)
+                _mark_seen(rec.get("orig"), seen_files, seen_cmds)
                 f.write(json.dumps(rec) + "\n")
                 f.flush()
                 prog.update(tid, advance=1,
                             stat=f"agree {n_action}/{n_ok or 1} ${spent:.2f}")
         summary["arms"][arm] = {
             "steps_ok": n_ok, "agree_action": n_action, "agree_exact": n_exact,
+            # faithful = agreed AND not a redundant re-fetch; redundant = the ↻ count
+            "faithful": n_faithful, "redundant": n_redund,
             "errors": n_err, "first_error": (first_err or "")[:300],
             "avg_ctx_tokens": (ctx_total // n_ok) if n_ok else 0,
             "ctx_series": ctx_series, "quality": qual, "by_step": by_step,

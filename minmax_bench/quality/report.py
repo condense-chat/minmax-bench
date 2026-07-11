@@ -288,11 +288,19 @@ def _load_incremental(root, arms):
             zc = sum(A[s].get("cost_usd", 0) for s in common)
             out[(task, arm)] = {
                 "comp": round(1 - ac / cc, 4), "costd": round(1 - zc / oc, 4),
-                "fid": sum(bool(A[s].get("agree_action")) for s in common) / len(common),
-                "fid_ctrl": sum(bool(C[s].get("agree_action")) for s in common) / len(common),
+                "fid": sum(_faithful_step(A[s]) for s in common) / len(common),
+                "fid_ctrl": sum(_faithful_step(C[s]) for s in common) / len(common),
+                "redund": sum(bool(A[s].get("redundant")) for s in common),
                 "steps": len(common),
             }
     return out
+
+
+def _faithful_step(r):
+    """A faithful replayed step agrees with the original AND doesn't redundantly re-fetch
+    info an earlier step already held. Pre-redundant artifacts have no 'redundant' key, so
+    they degrade gracefully to plain agreement."""
+    return bool(r.get("agree_action")) and not r.get("redundant")
 
 
 # ---------------------------------------------------------------- rendering
@@ -479,10 +487,10 @@ def _len_delta(v, a, sub_gate):
     return _colok(core, a["length_ok"])
 
 
-def _faithful_cost(v, a, sub_gate):
-    """(faithfulness, cost). Faithfulness = per-step agreement (replay) docked for the arm's
-    excess redundant re-work over control. Nulled when the task is too short or nothing was
-    actually compressed (agreement would be measuring noise)."""
+def _faithful_cost(a, sub_gate):
+    """(faithfulness, cost). Faithfulness is the replay's per-step score — agreement with the
+    original AND no redundant re-fetch — already docked for re-work at its source. Nulled when
+    the arm didn't run, the task is too short, or nothing was compressed (would be noise)."""
     if a["n"] == 0 and a.get("started", 0) == 0:   # arm never ran -> no data, not "too short"
         return _DASH, _DASH
     if sub_gate:
@@ -494,11 +502,7 @@ def _faithful_cost(v, a, sub_gate):
     cost = _pct(inc.get("costd"))
     if abs(inc.get("comp") or 0) < 0.02:  # nothing compressed -> not comparable
         return "[dim]⊘ n/a[/]", cost
-    vr = v["rework"][1] if v["rework"] else 0.0
-    ar = a["rework"][1] if a["rework"] else 0.0
-    al = a["length"][1] if a["length"] else 1.0
-    penalty = max(0.0, ar - vr) / max(al, 1.0)   # extra re-fetches per step
-    return f"{max(0.0, min(1.0, fid - penalty)):.0%}", cost
+    return f"{fid:.0%}", cost
 
 
 def render_console(d):
@@ -525,7 +529,7 @@ def render_console(d):
                   _DASH, _DASH)
         for arm in d["arms"]:
             a = r["arms"][arm]
-            faith, cost = _faithful_cost(v, a, sub)
+            faith, cost = _faithful_cost(a, sub)
             t.add_row("", arm, _method(a), _solve_pct(a), _len_delta(v, a, sub), faith, cost)
     console.print(t)
     _takeaway(console, d)
