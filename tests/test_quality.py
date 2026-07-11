@@ -207,6 +207,7 @@ def test_faithful_engagement_counts_ccr_retrieves():
     engaged = report._faithful_cost(low_with_ccr, floor)[0]
     assert "40%" in passthrough and "green" not in passthrough and "red" not in passthrough
     assert "40%" in engaged and ("green" in engaged or "red" in engaged)  # verdict colour
+    assert "-10pt" in engaged and "-10pt" in passthrough  # gap vs the 50% floor, both cases
     assert report._engaged({"comp": 0.01, "retrieves": 3}) is True
     assert report._engaged({"comp": 0.01, "retrieves": 0}) is False
     assert report._engaged({"comp": 0.20, "retrieves": 0}) is True  # compression alone counts

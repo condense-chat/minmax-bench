@@ -469,12 +469,12 @@ _INCR_LEGEND = (
     "equivalence = upgrade grep-vs-rg near-misses). comp = context compressed; ↻N = CCR "
     "retrieve calls a headroom arm made (it fetched a compressed output back, so net comp can "
     "be ~0 yet still engaged). faithful = per-step agreement with the original (docked for "
-    "redundant re-work). When the arm engaged (compressed, or made a CCR retrieve) it is "
-    "coloured vs the floor — green ≥ floor (no measurable loss), red below. When it barely "
-    "touched the context (comp <2%, no CCR — see comp) the score is still shown but DIM/"
-    "un-coloured: fid ≈ the floor there by construction, so a verdict would over-claim. "
-    "— = no incremental data at all. cost = $ vs control (a negative value means the arm cost "
-    "MORE — a cache-bust).")
+    "redundant re-work), with its gap from the control floor in percentage points (±pt). When "
+    "the arm engaged (compressed, or made a CCR retrieve) it is coloured vs the floor — green "
+    "≥ floor (no measurable loss), red below. When it barely touched the context (comp <2%, no "
+    "CCR — see comp) the score is still shown but DIM/un-coloured: fid ≈ the floor there by "
+    "construction, so a verdict would over-claim. — = no incremental data at all. cost = $ vs "
+    "control (a negative value means the arm cost MORE — a cache-bust).")
 _SHORT = "[dim]⊘ short[/]"
 _DASH = "[dim]—[/]"
 
@@ -544,6 +544,8 @@ def _faithful_cost(a, floor):
         return _DASH, _DASH
     cost = _pct(inc.get("costd"))
     txt = f"{fid:.0%}"
+    if floor is not None:  # the comparison vs the control floor, in percentage points
+        txt += f" ({(fid - floor) * 100:+.0f}pt)"
     if not _engaged(inc):
         return f"[dim]{txt}[/]", cost
     if floor is not None:
