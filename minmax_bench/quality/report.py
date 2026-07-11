@@ -470,8 +470,10 @@ _INCR_LEGEND = (
     "retrieve calls a headroom arm made (it fetched a compressed output back, so net comp can "
     "be ~0 yet still engaged). faithful = per-step agreement with the original (docked for "
     "redundant re-work), coloured vs the floor — green ≥ floor (no measurable loss), red below; "
-    "⊘ n/a = the arm neither compressed nor retrieved, so agreement would be noise. cost = $ vs "
-    "control (a negative value means the arm cost MORE — a cache-bust).")
+    "⊘ passthrough = the arm RAN but barely touched the context (comp <2%, no CCR retrieve), so "
+    "agreement would just be ≈ the floor — not a meaningful fidelity test, distinct from — "
+    "(no incremental data). cost = $ vs control (a negative value means the arm cost MORE — a "
+    "cache-bust).")
 _SHORT = "[dim]⊘ short[/]"
 _DASH = "[dim]—[/]"
 
@@ -532,15 +534,17 @@ def _comp_cell(inc):
 def _faithful_cost(a, floor):
     """(faithfulness, cost) — incremental metrics. Faithfulness is the per-step score (agreement
     AND no redundant re-fetch), coloured against the control floor (same-run reconstruction
-    noise): green ≥ floor (no measurable loss), red below. ⊘ n/a when the arm neither compressed
-    nor made a CCR retrieve, so agreement would just be noise."""
+    noise): green ≥ floor (no measurable loss), red below. ⊘ passthrough when the arm ran but
+    barely touched the context (comp <2%, no CCR retrieve), so agreement would just be ≈ floor."""
     inc = a.get("incr") or {}
     fid = inc.get("fid")
     if fid is None:
         return _DASH, _DASH
     cost = _pct(inc.get("costd"))
     if not _engaged(inc):
-        return "[dim]⊘ n/a[/]", cost
+        # the arm RAN but barely touched the context (comp <2%, no CCR retrieve) — its
+        # agreement would just be ≈ the floor, so it's not a meaningful fidelity test
+        return "[dim]⊘ passthrough[/]", cost
     txt = f"{fid:.0%}"
     if floor is not None:
         txt = f"[green]{txt}[/]" if fid >= floor - 0.02 else f"[red]{txt}[/]"

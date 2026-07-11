@@ -198,12 +198,12 @@ def test_report_shows_incremental_only_tasks(tmp_path):
 
 def test_faithful_engagement_counts_ccr_retrieves():
     """Headroom's NET compression can be ~0 while it still engaged CCR (compressed a tool
-    output to a marker, then the agent retrieved it back). Faithfulness is ⊘ n/a only when the
-    arm neither compressed NOR retrieved — a CCR retrieve alone makes it comparable."""
+    output to a marker, then the agent retrieved it back). Faithfulness is ⊘ passthrough only
+    when the arm neither compressed NOR retrieved — a CCR retrieve alone makes it comparable."""
     floor = 0.5
     low_no_ccr = {"incr": {"fid": 0.4, "comp": 0.01, "retrieves": 0, "costd": 0.0}}
     low_with_ccr = {"incr": {"fid": 0.4, "comp": 0.01, "retrieves": 5, "costd": 0.0}}
-    assert "n/a" in report._faithful_cost(low_no_ccr, floor)[0]     # nothing happened
+    assert "passthrough" in report._faithful_cost(low_no_ccr, floor)[0]  # ran, but did nothing
     assert "40%" in report._faithful_cost(low_with_ccr, floor)[0]   # CCR engaged -> comparable
     assert report._engaged({"comp": 0.01, "retrieves": 3}) is True
     assert report._engaged({"comp": 0.01, "retrieves": 0}) is False
