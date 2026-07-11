@@ -295,6 +295,10 @@ def _load_incremental(root, arms):
                 "fid": sum(_faithful_step(A[s]) for s in common) / len(common),
                 "fid_ctrl": sum(_faithful_step(C[s]) for s in common) / len(common),
                 "redund": sum(bool(A[s].get("redundant")) for s in common),
+                # CCR engagement (headroom): retrieves the agent made, and whether the arm ran
+                # with the retrieve loop wired at all (the field is only written when it is)
+                "retrieves": sum(r.get("ccr_retrieves", 0) for r in A.values()),
+                "ccr": any("ccr_retrieves" in r for r in A.values()),
                 "scoring": _scoring(A), "steps": len(common),
             }
     return out
@@ -462,10 +466,12 @@ _INCR_LEGEND = (
     "teacher-forced per-step run of a recorded session. control = the baseline (its own row); "
     "its faithful is the noise floor. scoring = how each step was judged — structural "
     "(exact/action match, no LLM) or an LLM judge (goal = rate each action toward the task; "
-    "equivalence = upgrade grep-vs-rg near-misses). comp = context compressed. faithful = "
-    "per-step agreement with the original (docked for redundant re-work), coloured vs the "
-    "floor — green ≥ floor (no measurable loss), red below; ⊘ n/a = nothing compressed. "
-    "cost = $ vs control (a negative value means the arm cost MORE — a cache-bust).")
+    "equivalence = upgrade grep-vs-rg near-misses). comp = context compressed; ↻N = CCR "
+    "retrieve calls a headroom arm made (it fetched a compressed output back, so net comp can "
+    "be ~0 yet still engaged). faithful = per-step agreement with the original (docked for "
+    "redundant re-work), coloured vs the floor — green ≥ floor (no measurable loss), red below; "
+    "⊘ n/a = the arm neither compressed nor retrieved, so agreement would be noise. cost = $ vs "
+    "control (a negative value means the arm cost MORE — a cache-bust).")
 _SHORT = "[dim]⊘ short[/]"
 _DASH = "[dim]—[/]"
 
@@ -507,16 +513,33 @@ def _len_delta(v, a, sub_gate):
     return _colok(core, a["length_ok"])
 
 
+def _engaged(inc):
+    """Did the arm actually do something to the context? Compression that moved the context
+    (condense, headroom-kompress) OR a CCR retrieve (headroom fetched a compressed output back).
+    If neither, faithfulness is just measuring reconstruction noise."""
+    return abs(inc.get("comp") or 0) >= 0.02 or inc.get("retrieves", 0) > 0
+
+
+def _comp_cell(inc):
+    """Context compression %, with the CCR retrieve count (↻) appended for a headroom arm so
+    engagement is visible even when net compression is ~0 (it retrieved content back)."""
+    txt = _pct(inc.get("comp"))
+    if inc.get("ccr"):
+        txt += f" [magenta]↻{inc.get('retrieves', 0)}[/]"
+    return txt
+
+
 def _faithful_cost(a, floor):
     """(faithfulness, cost) — incremental metrics. Faithfulness is the per-step score (agreement
     AND no redundant re-fetch), coloured against the control floor (same-run reconstruction
-    noise): green ≥ floor (no measurable loss), red below. ⊘ n/a when nothing was compressed."""
+    noise): green ≥ floor (no measurable loss), red below. ⊘ n/a when the arm neither compressed
+    nor made a CCR retrieve, so agreement would just be noise."""
     inc = a.get("incr") or {}
     fid = inc.get("fid")
     if fid is None:
         return _DASH, _DASH
     cost = _pct(inc.get("costd"))
-    if abs(inc.get("comp") or 0) < 0.02:  # nothing compressed -> not comparable
+    if not _engaged(inc):
         return "[dim]⊘ n/a[/]", cost
     txt = f"{fid:.0%}"
     if floor is not None:
@@ -596,7 +619,7 @@ def _incremental_table(console, d, model):
                 yield False, arm, ("", _DASH, _DASH, _DASH)
                 continue
             faith, cost = _faithful_cost(r["arms"][arm], floor)
-            yield False, arm, ("", _pct(inc.get("comp")), faith, cost)
+            yield False, arm, ("", _comp_cell(inc), faith, cost)
 
     _grouped(t, rows, render_row)
     console.print(t)
@@ -638,8 +661,7 @@ def _takeaway(console, d):
             continue
         for arm in d["arms"]:
             inc = r["arms"][arm].get("incr") or {}
-            if (inc.get("fid") is not None and abs(inc.get("comp") or 0) >= 0.02
-                    and inc["fid"] < floor - 0.1):
+            if inc.get("fid") is not None and _engaged(inc) and inc["fid"] < floor - 0.1:
                 diverge.append(f"{r['task']}/{arm} fidelity ({inc['fid']:.0%} vs {floor:.0%})")
     parts = []
     if comparable or tooshort:
