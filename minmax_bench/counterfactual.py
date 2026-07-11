@@ -1,4 +1,4 @@
-"""Rich incremental replay of a *local* session — the engine behind
+"""Rich incremental (teacher-forced, per-step) run of a *local* session — the engine behind
 ``minmax-bench quality incremental`` (formerly the ``counterfactual`` command).
 
 Answers "how would my session have played out under condense/headroom?" the only way
@@ -220,7 +220,8 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         raise SystemExit(1)
 
     if "control" in arms:
-        console.print("[red]control is always replayed — pass only the arms to compare[/]")
+        console.print("[red]control is always included in the incremental run — pass only the "
+                      "arms to compare[/]")
         raise SystemExit(1)
     problems = eng.check_arms(["control"] + arms, env)
     if problems:
@@ -316,7 +317,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
             raise SystemExit(1)
         console.print(f"[yellow]falling back to {fb} for ALL arms[/] — the comparison stays "
                       f"paired; recorded thinking blocks will be stripped (cross-model).")
-        if not assume_yes and not Confirm.ask(f"[cyan]replay on {fb}?[/]", default=True,
+        if not assume_yes and not Confirm.ask(f"[cyan]run on {fb}?[/]", default=True,
                                               console=console):
             raise SystemExit(0)
         replay_model = fb
@@ -377,8 +378,9 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         f"[bold]rough cost/arm[/] ${lo:.2f}–${hi:.2f} (capped at ${budget_usd:.2f} each)\n"
         f"[yellow]this sends your session content to api.anthropic.com"
         f"{' and api.condense.chat' if 'condense' in arms else ''}[/]",
-        title="incremental replay", border_style="cyan"))
-    if not assume_yes and not Confirm.ask("[cyan]replay it?[/]", default=False, console=console):
+        title="incremental", border_style="cyan"))
+    if not assume_yes and not Confirm.ask("[cyan]run the incremental?[/]", default=False,
+                                          console=console):
         raise SystemExit(0)
 
     # write per-arm jsonl under <out>/incremental/<task>-<arm>.jsonl (control included) so
@@ -639,7 +641,7 @@ def render_summary(summary: dict, console: Console) -> None:
     capper = min(reaches, key=reaches.get) if reaches else None
     capped = capper and len(set(reaches.values())) > 1
     cap_txt = f", where {capper} hit its budget" if capped else ""
-    t = Table(title=f"[bold]counterfactual — {Path(summary['session']).name} "
+    t = Table(title=f"[bold]incremental — {Path(summary['session']).name} "
                     f"({summary['model']}, {summary['steps']} decision points; "
                     f"all deltas over the first {cap_n} steps{cap_txt})")
     for col in ("arm", "reached", "errors", "vs original", "exact", "avg ctx tokens",
@@ -726,7 +728,7 @@ def render_summary(summary: dict, console: Console) -> None:
         _render_goal_quality(summary, console, common)
     if floor is not None:
         label = "(secondary — structural) " if summary.get("judge") == "goal" else ""
-        console.print(f"[dim]{label}control replays the SAME session with NO compaction; its "
+        console.print(f"[dim]{label}the control arm runs the SAME session with NO compaction; its "
                       f"{floor:.0%} agreement with the original is the NOISE FLOOR (sampling + "
                       f"free-running divergence), not 100%. An arm only loses the trajectory to "
                       f"the extent it falls below it; a few points on <30 steps is noise.[/]")
@@ -768,8 +770,9 @@ def render_summary(summary: dict, console: Console) -> None:
     if rec:
         console.print(
             "[dim]* recorded = what these turns actually consumed when the session ran (its own "
-            "model + live caching); the replay rows re-ran the same turns fresh, so compare arms "
-            "to control for the counterfactual and to recorded for the backtest anchor.[/]")
+            "model + live caching); the incremental rows re-ran the same turns fresh, so compare "
+            "arms to control for the incremental comparison and to recorded for the backtest "
+            "anchor.[/]")
         # replays reconstruct only the tools the session references; the original CC
         # requests also carried the full system prompt + available tool/MCP catalog
         # (mostly unused). When that overhead is large the recorded row dwarfs the

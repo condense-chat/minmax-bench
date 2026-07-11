@@ -256,10 +256,10 @@ def _setup_step(console: Console, strategies: list[str]) -> list[str]:
 def _pick_local_sessions(console: Console) -> str:
     """Interactive multi-pick over ~/.claude/projects -> a claude-code:<paths> spec.
 
-    This is the COST BACKTEST entry point: replay your own sessions turn-by-turn
-    through the selected strategies and see what they would have cost. For the
-    quality counterfactual (would it have made the same decisions), see
-    `minmax-bench quality incremental`.
+    This is the COST BACKTEST entry point: run your own sessions turn-by-turn
+    through the selected strategies and see what they would have cost. For quality /
+    trajectory preservation (would it have made the same decisions), see the
+    incremental mode: `minmax-bench quality incremental`.
     """
     from datetime import datetime
 
@@ -433,7 +433,7 @@ def _pick_model(console: Console) -> str:
 def _quality_preflight(console: Console, arms: list[str], *, need_docker: bool) -> None:
     """Dependency preflight, the rich preview of the same checks the full driver
     gates on. Full runs reuse generate._preflight_full (Docker/harbor/auth/keys/port
-    — single source of truth); incremental replays need only auth + arm keys."""
+    — single source of truth); incremental runs need only auth + arm keys."""
     import os
 
     from .quality.engine import auth_mode, load_env
@@ -475,7 +475,7 @@ def run_quality_wizard(console: Console) -> QualityWizardResult:
     mode = _select_one(console, "trajectory type", [
         ("full", "full trajectories — run the agent end-to-end on tasks "
                  "(behavior, rework, solve, milestones)", True),
-        ("incremental", "incremental — teacher-forced per-step replay of a recorded "
+        ("incremental", "incremental — teacher-forced per-step run of a recorded "
                         "session (paired A/B, cheap, no turn noise)", True),
     ])
     return (_full_wizard if mode == "full" else _incremental_wizard)(console)
@@ -557,9 +557,9 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         ("condense", "condense — compaction proxy", True, True),
         ("headroom", "headroom — token proxy + injected retrieve loop (CCR)", True, False),
     ])
-    # inherit the session's OWN model by default — replaying it faithfully is the point;
+    # inherit the session's OWN model by default — running it faithfully is the point;
     # an arm that can't serve it auto-falls-back at run time (only override deliberately)
-    mt = Table(title="[bold]replay model", show_header=False, box=None)
+    mt = Table(title="[bold]incremental model", show_header=False, box=None)
     mt.add_row(f"[dim] 0[/] [green]inherit from session[/] "
                f"[dim]({own or 'unknown'})[/]   [green]← default[/]")
     for i, (mid, label, _d) in enumerate(QUALITY_MODELS, 1):
@@ -613,7 +613,7 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         f"[bold]scoring[/] {judge}\n"
         f"[bold]per-arm cap[/] ${budget:g}   [bold]out[/] {out}",
         title="ready", border_style="green"))
-    if not Confirm.ask("[cyan]replay it?[/]", default=False, console=console):
+    if not Confirm.ask("[cyan]run the incremental?[/]", default=False, console=console):
         raise KeyboardInterrupt
     return QualityWizardResult(mode="incremental", source=src, session=session, swechat=swechat,
                                conv=conv, task=task, arms=",".join(arms), model=model,

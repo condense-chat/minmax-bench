@@ -255,8 +255,8 @@ def _load_incremental(root, arms):
 
     Everything is computed on the common step set (both arms answered, step > 0 — the
     cold-cache first step is excluded consistently for tokens, cost AND fidelity), and
-    the arm's action-fidelity is reported next to control's: control replay is the noise
-    floor (sampling + reconstruction error); only the gap below it is signal.
+    the arm's action-fidelity is reported next to control's: the control incremental run is
+    the noise floor (sampling + reconstruction error); only the gap below it is signal.
     """
     def rows(p):
         d = {}
@@ -301,7 +301,7 @@ def _load_incremental(root, arms):
 
 
 def _faithful_step(r):
-    """A faithful replayed step agrees with the original AND doesn't redundantly re-fetch
+    """A faithful incremental step agrees with the original AND doesn't redundantly re-fetch
     info an earlier step already held. Pre-redundant artifacts have no 'redundant' key, so
     they degrade gracefully to plain agreement."""
     return bool(r.get("agree_action")) and not r.get("redundant")
@@ -378,7 +378,7 @@ SUB = ("vanilla = the noise floor; ✓ = the arm's band overlaps vanilla's, ✗ 
        "triggered and headroom only compresses individual tool outputs >200 tokens, so a "
        "len ✗ on a ⊘ task is a BEHAVIORAL effect of the arm's wiring, not compaction damage. "
        "fid = per-step action agreement vs the control noise floor; it is only shown when "
-       "the arm actually compressed (|comp| ≥ 2%) — ⊘ passthrough means the replay proved "
+       "the arm actually compressed (|comp| ≥ 2%) — ⊘ passthrough means the incremental run proved "
        "no compaction happened, so agreement deltas would be noise. "
        "No model was called to produce this.")
 
@@ -443,14 +443,14 @@ def main(argv=None):
 _LEGEND = (
     "control = the vanilla baseline (its own row); every arm is measured against it. "
     "solve = trials solved / attempted (⚠ = some crashed; — = not run in this pass). "
-    "method = how the row was measured — N× full trials, +replay = teacher-forced per-step. "
-    "length = arm trajectory length vs control's median (+longer / −shorter; ✓/✗ = within "
-    "control's noise band, needs ≥2 runs/arm; ⊘ short = control never crossed the compaction "
-    "gate so nothing compacted). faithful = per-step agreement with the original (docked for "
-    "redundant re-work), coloured vs the control replay floor — green ≥ floor (no measurable "
-    "loss), red below; ⊘ n/a = nothing compressed, so agreement would be noise. cost = $ vs "
-    "control (replay; a negative value means the arm cost MORE — a cache-bust). "
-    "No model was called.")
+    "method = how the row was measured — N× full trajectories, +incremental = teacher-forced "
+    "per-step. length = arm trajectory length vs control's median (+longer / −shorter; ✓/✗ = "
+    "within control's noise band, needs ≥2 runs/arm; ⊘ short = control never crossed the "
+    "compaction gate so nothing compacted). faithful = incremental per-step agreement with the "
+    "original (docked for redundant re-work), coloured vs the control floor (control's own "
+    "incremental noise) — green ≥ floor (no measurable loss), red below; ⊘ n/a = nothing "
+    "compressed, so agreement would be noise. cost = $ vs control (incremental; a negative "
+    "value means the arm cost MORE — a cache-bust). No model was called.")
 _SHORT = "[dim]⊘ short[/]"
 _DASH = "[dim]—[/]"
 
@@ -472,11 +472,11 @@ def _solve_pct(c):
 
 
 def _method(c):
-    """How the row was measured: N full trials and/or teacher-forced replay. '—' only when
-    neither exists (incremental-only rows still show 'replay' with no full trials)."""
+    """How the row was measured: N full-trajectory trials and/or the incremental
+    (teacher-forced per-step) mode. '—' only when neither exists."""
     m = f"{c['n']}× full" if c["n"] else ""
     if (c.get("incr") or {}).get("fid") is not None:
-        m = f"{m} +replay" if m else "replay"
+        m = f"{m} +incremental" if m else "incremental"
     return m or _DASH
 
 
@@ -495,10 +495,10 @@ def _len_delta(v, a, sub_gate):
 
 
 def _faithful_cost(a, floor):
-    """(faithfulness, cost) — pure replay metrics, independent of the full run. Faithfulness
-    is the per-step score (agreement AND no redundant re-fetch), coloured against the control
-    floor (same-run reconstruction noise): green ≥ floor (no measurable loss), red below.
-    ⊘ n/a when nothing was compressed (agreement would be measuring noise); — when no replay."""
+    """(faithfulness, cost) — pure incremental metrics, independent of the full run.
+    Faithfulness is the per-step score (agreement AND no redundant re-fetch), coloured against
+    the control floor (same-run reconstruction noise): green ≥ floor (no measurable loss), red
+    below. ⊘ n/a when nothing was compressed; — when there is no incremental data."""
     inc = a.get("incr") or {}
     fid = inc.get("fid")
     if fid is None:
@@ -530,7 +530,7 @@ def render_console(d):
         if ri:
             t.add_section()
         v, sub = r["vanilla"], r["sub_gate"]
-        # control's replay fidelity floor for this task (same-run reconstruction noise); the
+        # control's incremental fidelity floor for this task (same-run reconstruction noise); the
         # arms are coloured against it, and the control row shows it.
         floor = _floor_for(r, d["arms"])
         # control is the baseline: its own row, length shown absolute, faithfulness = the floor
@@ -547,15 +547,15 @@ def render_console(d):
 
 
 def _floor_for(r, arms):
-    """The control replay fidelity floor for a task (fid_ctrl, ≈equal across arms)."""
+    """The control incremental fidelity floor for a task (fid_ctrl, ≈equal across arms)."""
     return next((r["arms"][a]["incr"]["fid_ctrl"] for a in arms
                  if (r["arms"][a].get("incr") or {}).get("fid_ctrl") is not None), None)
 
 
 def _takeaway(console, d):
     """One-glance summary across both measurement modes: full-run comparability (graded AND
-    compaction could fire) and replay coverage, plus divergences — length (full) or fidelity
-    below the control floor (replay)."""
+    compaction could fire) and incremental coverage, plus divergences — length (full) or
+    fidelity below the control floor (incremental)."""
     comparable, tooshort = set(), set()
     for r in d["rows"]:
         graded = (len(r["vanilla"]["_lens"]) >= 2
@@ -582,7 +582,7 @@ def _takeaway(console, d):
             full += f", {len(tooshort)} too short"
         parts.append(full)
     if replayed:
-        parts.append(f"replay: {len(replayed)} tasks")
+        parts.append(f"incremental: {len(replayed)} tasks")
     console.print("[bold]takeaway[/]  " + " · ".join(parts or ["nothing comparable yet"]))
     if diverge:
         console.print("[red]  ✗ diverges vs control:[/] " + ", ".join(diverge))

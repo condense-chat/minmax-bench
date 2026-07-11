@@ -216,7 +216,7 @@ Per task, vanilla `k≈3` sets the floor; each method's runs are tested against 
 | **rework** | does it re-fetch info it already had? *(compaction amnesia; range-aware — post-edit re-inspection counts as verification, not rework)* |
 | **milestone** | does it accomplish the same subgoals? *(approach-agnostic, LLM-judged, arm-blind; the reference run is excluded from vanilla's own coverage)* |
 | **solve** | does it still pass the verifier? *(trials that crash or hit the wall timeout count as failures — `⚠ lost` in the table — not as missing data)* |
-| **fid** | teacher-forced per-step action agreement, shown next to the **control replay's** agreement (the noise floor) — only the gap below the floor is signal |
+| **fid** | teacher-forced per-step action agreement, shown next to the **control incremental run's** agreement (the noise floor) — only the gap below the floor is signal |
 
 **When does context-reduction actually trigger?** Both products are gated to act only where
 reduction pays off, and a small task structurally cannot exercise them: condense compacts the
@@ -277,11 +277,11 @@ every verdict). `--dataset` selects the harbor dataset; only
 The quality bench is **pure standard library** — nothing to install to *analyze* runs; Docker + Harbor
 are only needed to *generate* them.
 
-### Replay your own session — `quality incremental`
+### Run your own session incrementally — `quality incremental`
 
 How would one of your real sessions have played out under condense? Pick any session from
-`~/.claude/projects` and teacher-force it step-by-step through each arm, next to a control replay
-(the noise floor). No Docker, no Harbor — just auth (an API key **or** your Claude Code login). It
+`~/.claude/projects` and teacher-force it step-by-step through each arm, next to a control
+incremental run (the noise floor). No Docker, no Harbor — just auth (an API key **or** your Claude Code login). It
 auto-detects the session's model, shows a cost estimate, and asks before spending:
 
 ```bash
@@ -292,8 +292,8 @@ uv run minmax-bench quality incremental ~/.claude/projects/<proj>/<id>.jsonl --a
 Per arm you get **same-action agreement** (did it still make the same next move? read it against
 the control floor, not 100%) or, with `--judge goal`, a per-step good/degraded/bad quality rating;
 plus **avg context tokens**, **$ vs control** (over the steps every arm reached), and a **recorded**
-row showing what those turns *actually* consumed when the session ran — so the table is both a
-counterfactual and a backtest. `--capture` runs your version-matched Claude Code binary once,
+row showing what those turns *actually* consumed when the session ran — so the table is both an
+incremental comparison and a backtest. `--capture` runs your version-matched Claude Code binary once,
 locally, to reconstruct the exact system prompt + tools your session used instead of a stored
 template. Note the condense arm sends your session content to `api.condense.chat`.
 
@@ -308,7 +308,7 @@ Reported impartially, including results unfavorable to condense.
   (5 → 12 steps) by **inducing todo-tool planning + verification** — behavioral, *not* amnesia. This
   *explains* that task's large full-run cost gap (which looked like noise at k=1).
 - **Token savings ≠ dollar savings** — compaction busts the prompt cache (the same effect behind the
-  `headroom-kompress` (token-mode) cost result above); verified two ways (teacher-forced replay + real runs).
+  `headroom-kompress` (token-mode) cost result above); verified two ways (teacher-forced incremental + real runs).
 
 ## Layout
 
@@ -329,7 +329,7 @@ runs/              committed reference runs (replayable, no spend)
 
 minmax_bench/quality/   quality / trajectory-preservation bench (pure stdlib; see scripts/README.md)
   generate.py      GENERATE data (spends): --mode full|incremental, --arms, --agent
-  engine.py        teacher-forced replay engine (session I/O, scoring, pricing)
+  engine.py        teacher-forced incremental engine (session I/O, scoring, pricing)
   report.py        DISPLAY (pure, never spends): reads artifacts -> html/md
 scripts/           thin `python3 scripts/{generate,report}.py` wrappers around the above
 harbor_agents/     custom Harbor agent (self-contained headroom-CCR wiring)

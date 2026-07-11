@@ -135,9 +135,9 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None, every
                      auth: str, assume_yes: bool, judge: str = "off", steps: bool = True,
                      capture: bool = False, headroom_mode: str = "token", ccr: bool = True,
                      ctx_gate: int = 50_000) -> None:
-    """Rich teacher-forced replay of one session — picker when no --session, model
-    auto-fallback, cost preview, per-arm progress, a summary table with the recorded
-    backtest anchor, and a per-step good/semi/bad/redundant readout. Writes
+    """Rich incremental (teacher-forced, per-step) run of one session — picker when no
+    --session, model auto-fallback, cost preview, per-arm progress, a summary table with the
+    recorded backtest anchor, and a per-step good/semi/bad/redundant readout. Writes
     <out>/incremental/<task>-<arm>.jsonl for report."""
     from .counterfactual import pick_session, render_steps, render_summary, replay
     sp = Path(session).expanduser() if session else pick_session(console)
@@ -161,12 +161,12 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None, every
 @quality_app.command("incremental")
 def quality_incremental(
     session: str | None = typer.Argument(None, help="A session .jsonl (default: pick from ~/.claude/projects)."),
-    arms: str = typer.Option("condense", "--arms", help="Arms to replay besides control (condense, headroom)."),
-    model: str | None = typer.Option(None, "--model", "-m", help="Replay model (default: the session's own, with auto-fallback if an arm can't serve it)."),
+    arms: str = typer.Option("condense", "--arms", help="Arms to compare besides control (condense, headroom)."),
+    model: str | None = typer.Option(None, "--model", "-m", help="Model to run the incremental on (default: the session's own, with auto-fallback if an arm can't serve it)."),
     every: int = typer.Option(1, "--every", help="Sample every Nth decision point."),
     limit: int = typer.Option(0, "--limit", "-n", help="Max decision points (0 = all)."),
     budget_usd: float = typer.Option(2.0, "--budget-usd", help="Per-arm spend cap (control included)."),
-    max_tokens: int = typer.Option(6000, "--max-tokens", help="Replay output cap per step."),
+    max_tokens: int = typer.Option(6000, "--max-tokens", help="Per-step output cap."),
     out: str | None = typer.Option(None, "--out", help="Output dir (default results/incremental/<session>-<ts>)."),
     task: str = typer.Option("session", "--task", help="Task label for the report join."),
     auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force the Claude Code login)."),
@@ -175,15 +175,16 @@ def quality_incremental(
     capture: bool = typer.Option(False, "--capture", help="Run your version-matched Claude Code binary once (locally) to capture its system prompt + tools, instead of a stored template."),
     headroom_mode: str = typer.Option("token", "--headroom-mode", help="For a headroom arm: token (compression — the meaningful test) or cache (~passthrough). Auto-starts the proxy."),
     ccr: bool = typer.Option(True, "--ccr/--no-ccr", help="For the headroom arm, inject the CCR retrieve loop (via headroom mcp serve); --no-ccr runs it as kompress (compression only)."),
-    ctx_gate: int = typer.Option(50_000, "--ctx-gate", help="Skip sessions whose peak context stays below this (compaction can't fire — nothing to compare). 0 = replay anyway."),
+    ctx_gate: int = typer.Option(50_000, "--ctx-gate", help="Skip sessions whose peak context stays below this (compaction can't fire — nothing to compare). 0 = run it anyway."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
 ):
     """Incremental (teacher-forced per-step) trajectories — the paired counterpart
-    to `run`'s full trajectories. Replays one session through control + each arm,
+    to `run`'s full trajectories. Runs one session through control + each arm,
     with the session's own model (auto-falling back if an arm can't serve it), a
     cost preview, and a summary table incl. the recorded backtest anchor (SPENDS).
 
-    This is what used to be the `counterfactual` command — replay YOUR own sessions.
+    This is what used to be the `counterfactual` command — the incremental mode on
+    YOUR own sessions.
     """
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     stem = Path(session).stem[:8] if session else "picked"

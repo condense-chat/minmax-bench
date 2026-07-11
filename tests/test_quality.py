@@ -190,7 +190,7 @@ def test_report_shows_incremental_only_tasks(tmp_path):
     row = next((r for r in built["rows"] if r["task"] == "sess"), None)
     assert row is not None                                   # incremental-only task got a row
     a = row["arms"]["condense"]
-    assert a["n"] == 0 and report._method(a) == "replay"     # no full run, still 'replay'
+    assert a["n"] == 0 and report._method(a) == "incremental"  # no full run, still shows it
     faith, _cost = report._faithful_cost(a, report._floor_for(row, ["condense"]))
     assert "%" in faith                                      # a real number, not '—'
 

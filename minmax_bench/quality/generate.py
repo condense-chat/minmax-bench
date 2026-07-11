@@ -498,7 +498,7 @@ def incremental(args, env):
     if args.limit:
         sel = sel[: args.limit]
     sid = str(uuid.uuid4())
-    print(f"[incremental] {len(msgs)} msgs, replaying {len(sel)}/{len(points)} decision points "
+    print(f"[incremental] {len(msgs)} msgs, running {len(sel)}/{len(points)} decision points "
           f"per arm ({', '.join(arms)}), session {sid}")
     # arms hit independent endpoints with independent budgets — replay them concurrently;
     # steps WITHIN an arm stay sequential (incremental prompt caching needs nested prefixes)
