@@ -407,22 +407,34 @@ def full(args, env):
             finally:
                 _stop_proxy(proxy)
     if not args.dry_run:
-        # resume hint: cells still missing trials (timeouts, failures, or an interrupt) —
-        # re-running the same command finishes them without re-spending completed trials
+        # cells still missing trials (timeouts, failures, or an interrupt) — re-running the
+        # same command finishes them without re-spending completed trials
         def _need(a, t):
             want = (args.k_vanilla or args.k + 1) if a == "vanilla" else args.k
             return len(glob.glob(f"{out}/{a}-{t}/*/*/verifier/reward.txt")) < want
         incomplete = [(a, t) for a in arms for t in tasks if _need(a, t)]
         ncells = len(arms) * len(tasks)
+        if args.milestones:
+            judge_milestones(args, env)
+        # end on the results themselves, not just a command to run later
+        cmd = f"minmax-bench quality report --from {out} --tasks {len(tasks)}"
+        try:
+            from types import SimpleNamespace
+
+            from minmax_bench.quality import report as _report
+            rargs = SimpleNamespace(
+                tasks=",".join(tasks), agent="claude-code",
+                arms=",".join(a for a in arms if a != "vanilla"),
+                ctx_gate=getattr(args, "ctx_gate", 50_000), **{"from": out})
+            _console.print()
+            _report.render_console(_report.build(rargs))
+        except Exception as e:  # noqa: BLE001 — a report hiccup must not fail a finished run
+            _console.print(f"[dim](couldn't render inline: {type(e).__name__}; run: {cmd})[/]")
         if incomplete:
             _console.print(f"[yellow][resume][/] {len(incomplete)}/{ncells} cells incomplete — "
-                           f"re-run the SAME command to finish them (done trials skip; partial "
-                           f"cells run only the missing).")
+                           f"re-run the SAME command to finish (done trials skip). Re-view: {cmd}")
         else:
-            _console.print(f"[green][done][/] all {ncells} cells complete → "
-                           f"minmax-bench quality report --from {out} --tasks {len(tasks)}")
-    if args.milestones and not args.dry_run:
-        judge_milestones(args, env)
+            _console.print(f"[green][done][/] all {ncells} cells complete. Re-view anytime: {cmd}")
 
 
 # ------------------------------------------------------------------ INCREMENTAL: teacher-forced
