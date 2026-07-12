@@ -427,7 +427,9 @@ def full(args, env):
                 arms=",".join(a for a in arms if a != "vanilla"),
                 ctx_gate=getattr(args, "ctx_gate", 50_000), **{"from": out})
             _console.print()
-            _report.render_console(_report.build(rargs))
+            # scope to THIS run's tasks — the shared out dir may also hold unrelated
+            # incremental replays, which the full report would otherwise union in
+            _report.render_console(_report.build(rargs, include_incremental_only=False))
         except Exception as e:  # noqa: BLE001 — a report hiccup must not fail a finished run
             _console.print(f"[dim](couldn't render inline: {type(e).__name__}; run: {cmd})[/]")
         if incomplete:

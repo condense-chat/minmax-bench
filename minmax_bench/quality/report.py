@@ -207,7 +207,7 @@ def _cell_stats(cell):
     }
 
 
-def build(args):
+def build(args, include_incremental_only=True):
     root = args.__dict__["from"]
     arms = [a for a in args.arms.split(",") if a]
     idx = index_runs(root, args.agent)
@@ -220,10 +220,11 @@ def build(args):
     incr = _load_incremental(root, arms)
     rows = []
     gate = getattr(args, "ctx_gate", 50_000)
-    # curated full-run tasks first, then any task that only has incremental-replay data
-    # (replays labelled by session, e.g. `swe-long` or a uuid) so those still get a row
+    # curated full-run tasks first, then (unless scoped off — e.g. the inline render after a
+    # full run) any task that only has incremental-replay data, so session-labelled replays
+    # (swe-long, a uuid) still get a row when the report is pointed at an incremental dir
     curated = list(resolve_tasks(args.tasks))
-    extra = sorted({t for t, _a in incr} - set(curated))
+    extra = sorted({t for t, _a in incr} - set(curated)) if include_incremental_only else []
     for task in curated + extra:
         v = _cell_stats(idx.get(f"vanilla-{task}"))
         row = {"task": task, "vanilla": v, "arms": {},
