@@ -183,7 +183,7 @@ def test_incremental_latency_vs_control(tmp_path):
     out = report._load_incremental(str(tmp_path), ["condense", "headroom"])
     con = out[("kv", "condense")]
     assert abs(con["latency_ctrl"] - 1.0) < 1e-9 and abs(con["latency"] - 1.55) < 1e-9
-    assert "+55%" in report._latency_cell(con)                      # 1.55 / 1.0 - 1
+    assert "-55%" in report._latency_cell(con)         # 1 - 1.55/1.0 → slower = worse = negative
     assert "—" in report._latency_cell(out[("kv", "headroom")])     # untimed arm -> —
 
 
@@ -216,7 +216,7 @@ def test_report_shows_incremental_only_tasks(tmp_path):
     assert row is not None                                   # incremental-only task got a row
     a = row["arms"]["condense"]
     assert a["n"] == 0                                       # no full run
-    assert a["incr"]["scoring"] == "structural"             # inferred: no LLM judge in records
+    assert a["incr"]["scoring"] == "struct"                 # inferred: no LLM judge in records
     faith, _cost = report._faithful_cost(a, report._floor_for(row, ["condense"]))
     assert "%" in faith                                      # a real number, not '—'
 
@@ -232,7 +232,7 @@ def test_faithful_engagement_counts_ccr_retrieves():
     engaged = report._faithful_cost(low_with_ccr, floor)[0]
     assert "40%" in passthrough and "green" not in passthrough and "red" not in passthrough
     assert "40%" in engaged and ("green" in engaged or "red" in engaged)  # verdict colour
-    assert "-10pt" in engaged and "-10pt" in passthrough  # gap vs the 50% floor, both cases
+    assert "(-10)" in engaged and "(-10)" in passthrough  # gap vs the 50% floor, both cases
     assert report._engaged({"comp": 0.01, "retrieves": 3}) is True
     assert report._engaged({"comp": 0.01, "retrieves": 0}) is False
     assert report._engaged({"comp": 0.20, "retrieves": 0}) is True  # compression alone counts
@@ -243,9 +243,9 @@ def test_scoring_infers_llm_judge():
     structural = {0: {"agree_action": True, "agree_semantic": True}}
     goal = {0: {"agree_action": True, "quality": "good"}}
     equiv = {0: {"agree_action": False, "agree_semantic": True}}  # upgraded a near-miss
-    assert report._scoring(structural) == "structural"
-    assert report._scoring(goal) == "LLM · goal"
-    assert report._scoring(equiv) == "LLM · equivalence"
+    assert report._scoring(structural) == "struct"
+    assert report._scoring(goal) == "llm:goal"
+    assert report._scoring(equiv) == "llm:equiv"
 
 
 def test_check_arms_catches_unknown_arm_and_missing_keys():

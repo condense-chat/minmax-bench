@@ -320,10 +320,10 @@ def _scoring(recset):
     upgraded), or plain structural agreement (exact/action match, no LLM)."""
     vals = list(recset.values())
     if any("quality" in r for r in vals):
-        return "LLM · goal"
+        return "llm:goal"
     if any(r.get("agree_semantic") not in (None, r.get("agree_action")) for r in vals):
-        return "LLM · equivalence"
-    return "structural"
+        return "llm:equiv"
+    return "struct"
 
 
 def _faithful_step(r):
@@ -474,19 +474,16 @@ _FULL_LEGEND = (
     "behavioural). No model was called.")
 _INCR_LEGEND = (
     "teacher-forced per-step run of a recorded session. control = the baseline (its own row); "
-    "its faithful is the noise floor. scoring = how each step was judged — structural "
-    "(exact/action match, no LLM) or an LLM judge (goal = rate each action toward the task; "
-    "equivalence = upgrade grep-vs-rg near-misses). comp = context compressed; ↻N = CCR "
-    "retrieve calls a headroom arm made (it fetched a compressed output back, so net comp can "
-    "be ~0 yet still engaged). faithful = per-step agreement with the original (docked for "
-    "redundant re-work), with its gap from the control floor in percentage points (±pt). When "
-    "the arm engaged (compressed, or made a CCR retrieve) it is coloured vs the floor — green "
-    "≥ floor (no measurable loss), red below. When it barely touched the context (comp <2%, no "
-    "CCR — see comp) the score is still shown but DIM/un-coloured: fid ≈ the floor there by "
-    "construction, so a verdict would over-claim. — = no incremental data at all. cost = $ vs "
-    "control (a negative value means the arm cost MORE — a cache-bust). latency = per-step "
-    "wall-clock vs control (+ = slower; the control row shows its own s/step) — compaction and "
-    "CCR retrieve round-trips add real latency; wall-clock, so read it as a trend, not exact.")
+    "its faithful is the noise floor, its s/step the latency baseline. Every delta is vs "
+    "control and signed so [bold]+ = BETTER[/], − = worse. scoring = how each step was judged — "
+    "struct (exact/action match, no LLM), llm:goal (rate each action toward the task) or "
+    "llm:equiv (upgrade grep-vs-rg near-misses). ctx / $ / time saved = context / cost / "
+    "per-step wall-clock saved vs control (+ = less/cheaper/faster). ↻N = CCR retrieve calls a "
+    "headroom arm made (net ctx-saved can be ~0 yet still engaged). faithful = per-step "
+    "agreement with the original (docked for redundant re-work), with its gap from the floor in "
+    "points (+ = above floor). Coloured green ≥ floor / red below when the arm engaged "
+    "(compressed or CCR-retrieved); else dim (≈ floor by construction — no verdict). "
+    "— = no incremental data. time saved is wall-clock — read it as a trend, not exact.")
 _SHORT = "[dim]⊘ short[/]"
 _DASH = "[dim]—[/]"
 
@@ -545,9 +542,10 @@ def _comp_cell(inc):
 
 
 def _latency_cell(inc):
-    """Per-step wall-clock vs control, signed % (+ = slower); — when not timed (old artifact)."""
+    """Per-step wall-clock SAVED vs control, signed % (+ = faster, − = slower); — when not
+    timed (old artifact). Same sign convention as ctx/$ saved: positive is better."""
     la, lc = inc.get("latency"), inc.get("latency_ctrl")
-    return _DASH if la is None or not lc else _pct(la / lc - 1)
+    return _DASH if la is None or not lc else _pct(1 - la / lc)
 
 
 def _latency_floor(r, arms):
@@ -568,8 +566,8 @@ def _faithful_cost(a, floor):
         return _DASH, _DASH
     cost = _pct(inc.get("costd"))
     txt = f"{fid:.0%}"
-    if floor is not None:  # the comparison vs the control floor, in percentage points
-        txt += f" ({(fid - floor) * 100:+.0f}pt)"
+    if floor is not None:  # gap vs the control floor, in percentage points (+ = above = better)
+        txt += f" ({(fid - floor) * 100:+.0f})"
     if not _engaged(inc):
         return f"[dim]{txt}[/]", cost
     if floor is not None:
@@ -635,7 +633,7 @@ def _incremental_table(console, d, model):
     t = Table(title=title, caption=_INCR_LEGEND, caption_justify="left", caption_style="dim")
     for col in ("task", "arm", "scoring"):
         t.add_column(col, no_wrap=True)
-    for col in ("comp", "faithful", "cost", "latency"):
+    for col in ("ctx saved", "faithful", "$ saved", "time saved"):
         t.add_column(col, justify="right" if col != "faithful" else "center")
 
     def render_row(r):
