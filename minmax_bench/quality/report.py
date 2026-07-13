@@ -293,6 +293,8 @@ def _load_incremental(root, arms):
             zc = sum(A[s].get("cost_usd", 0) for s in common)
             out[(task, arm)] = {
                 "comp": round(1 - ac / cc, 4), "costd": round(1 - zc / oc, 4),
+                # per-step wall-clock (only on newer artifacts) — mean over the common steps
+                "latency": _mean_latency(A, common), "latency_ctrl": _mean_latency(C, common),
                 "fid": sum(_faithful_step(A[s]) for s in common) / len(common),
                 "fid_ctrl": sum(_faithful_step(C[s]) for s in common) / len(common),
                 "redund": sum(bool(A[s].get("redundant")) for s in common),
@@ -303,6 +305,13 @@ def _load_incremental(root, arms):
                 "scoring": _scoring(A), "steps": len(common),
             }
     return out
+
+
+def _mean_latency(rowset, common):
+    """Mean per-step wall-clock over the common steps; None when nothing was timed."""
+    v = [rowset[s].get("latency_s") for s in common]
+    v = [x for x in v if isinstance(x, (int, float))]
+    return (sum(v) / len(v)) if v else None
 
 
 def _scoring(recset):
@@ -475,7 +484,9 @@ _INCR_LEGEND = (
     "≥ floor (no measurable loss), red below. When it barely touched the context (comp <2%, no "
     "CCR — see comp) the score is still shown but DIM/un-coloured: fid ≈ the floor there by "
     "construction, so a verdict would over-claim. — = no incremental data at all. cost = $ vs "
-    "control (a negative value means the arm cost MORE — a cache-bust).")
+    "control (a negative value means the arm cost MORE — a cache-bust). latency = per-step "
+    "wall-clock vs control (+ = slower; the control row shows its own s/step) — compaction and "
+    "CCR retrieve round-trips add real latency; wall-clock, so read it as a trend, not exact.")
 _SHORT = "[dim]⊘ short[/]"
 _DASH = "[dim]—[/]"
 
@@ -531,6 +542,18 @@ def _comp_cell(inc):
     if inc.get("ccr"):
         txt += f" [magenta]↻{inc.get('retrieves', 0)}[/]"
     return txt
+
+
+def _latency_cell(inc):
+    """Per-step wall-clock vs control, signed % (+ = slower); — when not timed (old artifact)."""
+    la, lc = inc.get("latency"), inc.get("latency_ctrl")
+    return _DASH if la is None or not lc else _pct(la / lc - 1)
+
+
+def _latency_floor(r, arms):
+    """Control's own per-step wall-clock for a task (latency_ctrl, ≈equal across arms)."""
+    return next((r["arms"][a]["incr"]["latency_ctrl"] for a in arms
+                 if (r["arms"][a].get("incr") or {}).get("latency_ctrl") is not None), None)
 
 
 def _faithful_cost(a, floor):
@@ -612,21 +635,23 @@ def _incremental_table(console, d, model):
     t = Table(title=title, caption=_INCR_LEGEND, caption_justify="left", caption_style="dim")
     for col in ("task", "arm", "scoring"):
         t.add_column(col, no_wrap=True)
-    for col in ("comp", "faithful", "cost"):
+    for col in ("comp", "faithful", "cost", "latency"):
         t.add_column(col, justify="right" if col != "faithful" else "center")
 
     def render_row(r):
         floor = _floor_for(r, d["arms"])
         scoring = _scoring_for(r, d["arms"]) or _DASH
         ctrl_faith = f"[dim]{floor:.0%} floor[/]" if floor is not None else _DASH
-        yield True, "control", (scoring, _DASH, ctrl_faith, _DASH)
+        lat0 = _latency_floor(r, d["arms"])
+        ctrl_lat = f"[dim]{lat0:.1f}s[/]" if lat0 is not None else _DASH
+        yield True, "control", (scoring, _DASH, ctrl_faith, _DASH, ctrl_lat)
         for arm in d["arms"]:
             inc = r["arms"][arm].get("incr") or {}
             if inc.get("fid") is None:
-                yield False, arm, ("", _DASH, _DASH, _DASH)
+                yield False, arm, ("", _DASH, _DASH, _DASH, _DASH)
                 continue
             faith, cost = _faithful_cost(r["arms"][arm], floor)
-            yield False, arm, ("", _comp_cell(inc), faith, cost)
+            yield False, arm, ("", _comp_cell(inc), faith, cost, _latency_cell(inc))
 
     _grouped(t, rows, render_row)
     console.print(t)

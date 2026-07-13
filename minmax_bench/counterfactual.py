@@ -21,6 +21,7 @@ import contextlib
 import json
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -400,7 +401,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     for arm in all_arms:
         path = inc_dir / f"{task}-{arm}.jsonl"
         spent, n_ok, n_action, n_exact, ctx_total = 0.0, 0, 0, 0, 0
-        n_err, first_err, ctx_series = 0, None, []
+        n_err, first_err, ctx_series, lat_total = 0, None, [], 0.0
         qual = {"good": 0, "degraded": 0, "bad": 0}  # goal-judge tally
         judge_spent = 0.0  # LLM-judge cost, billed into the budget and reported separately
         by_step = {}  # step-index -> {ctx, cost, agree} for common-step fair aggregation
@@ -441,6 +442,9 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                     orig = eng.extract_action(msgs[i]["content"])
                     rec["orig"] = orig
                     ccr_overhead = 0.0
+                    # wall-clock for the whole decision point — for CCR this INCLUDES the
+                    # retrieve round-trips, which is exactly the latency headroom pays
+                    t0 = time.monotonic()
                     if ccr_active and mcp and mcp.ok:
                         resp, err, nr, ccr_overhead = eng.ccr_step(arm, tmpl_body, msgs[:i], args,
                                                                    sid, tmpl_headers, env, mcp)
@@ -448,6 +452,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                     else:
                         req = eng.build_request(tmpl_body, msgs[:i], args, sid)
                         resp, err = eng.call_api(arm, req, tmpl_headers, env)
+                    latency = time.monotonic() - t0
                     if err:
                         rec["error"] = err
                         n_err += 1
@@ -489,9 +494,12 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                         # per-step, keyed by the shared decision-point index so arm-vs-control
                         # deltas can be computed over the COMMON steps all arms reached (an arm
                         # that hits its budget early must not be compared over a longer step set)
+                        lat_total += latency
                         by_step[step] = {"ctx": step_ctx, "cost": round(c, 4),
-                                         "agree": bool(action), "redundant": bool(redundant)}
+                                         "agree": bool(action), "redundant": bool(redundant),
+                                         "latency": round(latency, 3)}
                         rec.update(replay=rep, agree_exact=exact, agree_action=action,
+                                   latency_s=round(latency, 3),
                                    agree_semantic=agree_sem, sim=round(sim, 3),
                                    redundant=bool(redundant), usage=usage, cost_usd=round(c, 4))
                         # goal-based per-step quality: is the arm's action good/degraded/bad
@@ -530,6 +538,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
             "faithful": n_faithful, "redundant": n_redund,
             "errors": n_err, "first_error": (first_err or "")[:300],
             "avg_ctx_tokens": (ctx_total // n_ok) if n_ok else 0,
+            "avg_latency_s": round(lat_total / n_ok, 3) if n_ok else 0.0,
             "ctx_series": ctx_series, "quality": qual, "by_step": by_step,
             "ccr_retrieves": n_retrieves, "ccr": bool(ccr_active and mcp and mcp.ok),
             "judge_usd": round(judge_spent, 4),
@@ -624,8 +633,10 @@ def _over(a: dict, common: set):
     n = len(steps)
     if not n:
         return None
+    lats = [x["latency"] for x in steps if "latency" in x]
     return {"n": n, "agree": sum(x["agree"] for x in steps) / n,
-            "ctx": sum(x["ctx"] for x in steps) / n, "cost": sum(x["cost"] for x in steps)}
+            "ctx": sum(x["ctx"] for x in steps) / n, "cost": sum(x["cost"] for x in steps),
+            "latency": (sum(lats) / len(lats)) if lats else None}
 
 
 def render_summary(summary: dict, console: Console) -> None:
@@ -645,13 +656,13 @@ def render_summary(summary: dict, console: Console) -> None:
                     f"({summary['model']}, {summary['steps']} decision points; "
                     f"all deltas over the first {cap_n} steps{cap_txt})")
     for col in ("arm", "reached", "errors", "vs original", "exact", "avg ctx tokens",
-                "ctx vs control", "cost", "$ vs control"):
+                "ctx vs control", "cost", "$ vs control", "s/step"):
         t.add_column(col, justify="right" if col != "arm" else "left")
     rec = summary.get("recorded")
     if rec:
         t.add_row("[dim]recorded*[/]", f"[dim]{rec['steps']}[/]", "[dim]—[/]", "[dim]—[/]",
                   "[dim]—[/]", f"[dim]{rec['avg_ctx_tokens']:,}[/]", "[dim]—[/]",
-                  f"[dim]${rec['cost_usd']:.2f}[/]", "[dim]—[/]")
+                  f"[dim]${rec['cost_usd']:.2f}[/]", "[dim]—[/]", "[dim]—[/]")
     for arm, a in summary["arms"].items():
         n = a["steps_ok"]
         # vs-original agreement and the vs-control deltas are all computed over the COMMON
@@ -688,6 +699,10 @@ def render_summary(summary: dict, console: Console) -> None:
         # 'reached' = how far this arm got; mark the arm that capped the window (hit budget)
         reached_cell = (f"[yellow]{n} ◀ budget cap[/]"
                         if capper == arm and len(set(reaches.values())) > 1 else str(n))
+        # per-step wall-clock: common-step aggregate, else the arm's own average (old artifacts
+        # have no by_step latency); compaction (esp. condense-sync) and CCR round-trips add to it
+        lat = (ac.get("latency") if ac else None) or a.get("avg_latency_s") or None
+        lat_cell = f"{lat:.1f}s" if lat else "—"
         t.add_row(
             arm, reached_cell, f"[red]{errs}[/]" if errs else "0",
             agree_cell,
@@ -696,6 +711,7 @@ def render_summary(summary: dict, console: Console) -> None:
             f"{comp:+.0%}" if comp is not None else "—",
             cost_cell,
             f"{costd:+.0%}" if costd is not None else "—",
+            lat_cell,
         )
     console.print(t)
     # if arms stopped at different depths (an arm hit its budget / error-bailed), say so —

@@ -162,6 +162,31 @@ def test_incremental_faithfulness_docks_redundant_refetch(tmp_path):
     assert inc["redund"] == 1
 
 
+def test_incremental_latency_vs_control(tmp_path):
+    """Per-step wall-clock is aggregated per arm over the common steps and shown as a signed
+    % vs control (+ = slower); artifacts without timing degrade to '—'."""
+    d = tmp_path / "incremental"
+    d.mkdir()
+
+    def write(arm, recs):
+        (d / f"kv-{arm}.jsonl").write_text("\n".join(json.dumps(r) for r in recs))
+
+    def rec(step, lat):
+        r = {"step": step, "agree_action": True, "cost_usd": 1.0, "usage": {"input_tokens": 100}}
+        if lat is not None:
+            r["latency_s"] = lat
+        return r
+
+    write("control", [rec(0, 1.0), rec(1, 1.0), rec(2, 1.0)])       # ~1s/step
+    write("condense", [rec(0, 1.4), rec(1, 1.6), rec(2, 1.5)])      # steps 1,2 -> 1.55s
+    write("headroom", [rec(0, None), rec(1, None), rec(2, None)])   # untimed -> —
+    out = report._load_incremental(str(tmp_path), ["condense", "headroom"])
+    con = out[("kv", "condense")]
+    assert abs(con["latency_ctrl"] - 1.0) < 1e-9 and abs(con["latency"] - 1.55) < 1e-9
+    assert "+55%" in report._latency_cell(con)                      # 1.55 / 1.0 - 1
+    assert "—" in report._latency_cell(out[("kv", "headroom")])     # untimed arm -> —
+
+
 def test_faithful_step_backward_compatible():
     # old artifacts have no 'redundant' key -> degrade gracefully to plain agreement
     assert report._faithful_step({"agree_action": True}) is True
