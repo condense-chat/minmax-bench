@@ -327,10 +327,20 @@ def _scoring(recset):
 
 
 def _faithful_step(r):
-    """A faithful incremental step agrees with the original AND doesn't redundantly re-fetch
-    info an earlier step already held. Pre-redundant artifacts have no 'redundant' key, so
-    they degrade gracefully to plain agreement."""
-    return bool(r.get("agree_action")) and not r.get("redundant")
+    """A faithful step took a valid action and didn't redundantly re-fetch info it already had.
+
+    'Valid' depends on how the run was scored. With a GOAL judge (each action rated on its own
+    merit toward the task), a good step is faithful — control replaying itself scores ~100%,
+    so an arm only loses by taking WORSE steps: a trustworthy floor. Without a judge, we fall
+    back to STRUCTURAL agreement with the original recorded action, whose ceiling is low even
+    for control (the model rarely reproduces its own past sampling) — noisy, not a true 100%.
+    """
+    q = r.get("quality")
+    if q is not None:
+        good = q == "good"                                   # goal judge
+    else:                                                    # structural (equiv upgrades a
+        good = bool(r.get("agree_semantic", r.get("agree_action")))  # near-miss if it ran)
+    return good and not r.get("redundant")
 
 
 # ---------------------------------------------------------------- rendering
@@ -475,14 +485,17 @@ _FULL_LEGEND = (
 _INCR_LEGEND = (
     "teacher-forced per-step run of a recorded session. control = the baseline (its own row); "
     "its faithful is the noise floor, its s/step the latency baseline. Every delta is vs "
-    "control and signed so [bold]+ = BETTER[/], − = worse. scoring = how each step was judged — "
-    "struct (exact/action match, no LLM), llm:goal (rate each action toward the task) or "
-    "llm:equiv (upgrade grep-vs-rg near-misses). ctx / $ / time saved = context / cost / "
+    "control and signed so [bold]+ = BETTER[/], − = worse. scoring = how each step was judged: "
+    "llm:goal rates each action on its own merit (control ≈100% — trustworthy floor; an arm "
+    "only loses by taking WORSE steps), whereas struct / llm:equiv match the ORIGINAL recorded "
+    "action, whose ceiling is sampling-driven and low even for control (a noisy floor — prefer "
+    "--judge goal). ctx / $ / time saved = context / cost / "
     "per-step wall-clock saved vs control (+ = less/cheaper/faster). ↻N = CCR retrieve calls a "
-    "headroom arm made (net ctx-saved can be ~0 yet still engaged). faithful = per-step "
-    "agreement with the original (docked for redundant re-work), with its gap from the floor in "
-    "points (+ = above floor). Coloured green ≥ floor / red below when the arm engaged "
-    "(compressed or CCR-retrieved); else dim (≈ floor by construction — no verdict). "
+    "headroom arm made (net ctx-saved can be ~0 yet still engaged). faithful = the % of "
+    "control's own faithfulness the arm keeps (control = 100% by construction; its absolute "
+    "good-rate is shown in parens) — normalising divides out the sampling/judge floor, so 100% "
+    "= no measurable loss. Coloured green ≥95% / yellow 85–95% / red <85% when the arm engaged "
+    "(compressed or CCR-retrieved); else dim (≈100% by construction — no verdict). "
     "— = no incremental data. time saved is wall-clock — read it as a trend, not exact.")
 _SHORT = "[dim]⊘ short[/]"
 _DASH = "[dim]—[/]"
@@ -554,25 +567,33 @@ def _latency_floor(r, arms):
                  if (r["arms"][a].get("incr") or {}).get("latency_ctrl") is not None), None)
 
 
+def _faithful_norm(fid, floor):
+    """The arm's faithfulness as a fraction of control's — control replaying itself is 1.0
+    (100%) by construction, so this is 'how much of control's faithfulness the arm keeps',
+    with the absolute sampling/judge floor divided out. None when there's no floor to divide by.
+    Capped at 1.0: an arm can't be MORE faithful than the no-compaction reference (excess is
+    noise)."""
+    if fid is None or not floor:
+        return None
+    return min(fid / floor, 1.0)
+
+
 def _faithful_cost(a, floor):
-    """(faithfulness, cost) — incremental metrics. Faithfulness is the per-step score (agreement
-    AND no redundant re-fetch). When the arm engaged (compressed or made a CCR retrieve) it is
-    coloured against the control floor: green ≥ floor (no measurable loss), red below. When it
-    barely touched the context (comp <2%, no CCR) the score is still shown, but DIM / un-coloured:
-    fid ≈ floor by construction there, so a verdict would over-claim (read it with comp)."""
+    """(faithfulness, cost) — incremental metrics. Faithfulness is normalised to control (=100%):
+    the % of control's own faithfulness the arm retains, coloured green ≥95% (no measurable loss)
+    / yellow 85–95% / red <85% when the arm engaged (compressed or made a CCR retrieve). When it
+    barely touched the context (comp <2%, no CCR) the value is shown DIM (≈100% by construction —
+    no verdict). — when there's no incremental data or no control floor to normalise against."""
     inc = a.get("incr") or {}
-    fid = inc.get("fid")
-    if fid is None:
-        return _DASH, _DASH
     cost = _pct(inc.get("costd"))
-    txt = f"{fid:.0%}"
-    if floor is not None:  # gap vs the control floor, in percentage points (+ = above = better)
-        txt += f" ({(fid - floor) * 100:+.0f})"
+    norm = _faithful_norm(inc.get("fid"), floor)
+    if norm is None:
+        return _DASH, cost
+    txt = f"{norm:.0%}"
     if not _engaged(inc):
         return f"[dim]{txt}[/]", cost
-    if floor is not None:
-        txt = f"[green]{txt}[/]" if fid >= floor - 0.02 else f"[red]{txt}[/]"
-    return txt, cost
+    return (f"[green]{txt}[/]" if norm >= 0.95
+            else f"[red]{txt}[/]" if norm < 0.85 else f"[yellow]{txt}[/]"), cost
 
 
 def _has_full(r, arms):
@@ -639,7 +660,9 @@ def _incremental_table(console, d, model):
     def render_row(r):
         floor = _floor_for(r, d["arms"])
         scoring = _scoring_for(r, d["arms"]) or _DASH
-        ctrl_faith = f"[dim]{floor:.0%} floor[/]" if floor is not None else _DASH
+        # control is the 100% reference (arms are normalised to it); show its own absolute
+        # good-rate in parens so a harsh judge / low sampling floor is visible
+        ctrl_faith = f"[dim]100% ({floor:.0%})[/]" if floor is not None else _DASH
         lat0 = _latency_floor(r, d["arms"])
         ctrl_lat = f"[dim]{lat0:.1f}s[/]" if lat0 is not None else _DASH
         yield True, "control", (scoring, _DASH, ctrl_faith, _DASH, ctrl_lat)
@@ -687,12 +710,13 @@ def _takeaway(console, d):
                for arm in d["arms"] if r["arms"][arm].get("length_ok") is False]
     for r in d["rows"]:                                   # fidelity meaningfully below floor
         floor = _floor_for(r, d["arms"])
-        if floor is None:
-            continue
+        if floor is None or floor < 0.6:  # a low floor is noise-dominated (warned below), not
+            continue                      # a trustworthy baseline to call divergence against
         for arm in d["arms"]:
             inc = r["arms"][arm].get("incr") or {}
-            if inc.get("fid") is not None and _engaged(inc) and inc["fid"] < floor - 0.1:
-                diverge.append(f"{r['task']}/{arm} fidelity ({inc['fid']:.0%} vs {floor:.0%})")
+            norm = _faithful_norm(inc.get("fid"), floor)
+            if norm is not None and _engaged(inc) and norm < 0.85:  # kept <85% of control
+                diverge.append(f"{r['task']}/{arm} fidelity ({norm:.0%} of control)")
     parts = []
     if comparable or tooshort:
         full = f"full: {len(comparable)} comparable"
@@ -706,6 +730,14 @@ def _takeaway(console, d):
         console.print("[red]  ✗ diverges vs control:[/] " + ", ".join(diverge))
     elif comparable or replayed:
         console.print("[green]  ✓ no divergence detected[/]")
+    # a low control floor means faithfulness was scored by structural match (no goal judge),
+    # whose ceiling is sampling-driven — the comparison is noise-dominated, not trustworthy
+    lowfloor = sum(1 for r in d["rows"]
+                   if (_floor_for(r, d["arms"]) or 1) < 0.6 and _has_incr(r, d["arms"]))
+    if lowfloor:
+        console.print(f"[yellow]  ⚠ {lowfloor} incremental task(s) have a low faithfulness floor "
+                      "(structural match, no goal judge) — noise-dominated; re-run with "
+                      "--judge goal for a trustworthy ~100% control baseline.[/]")
 
 
 if __name__ == "__main__":

@@ -194,6 +194,20 @@ def test_faithful_step_backward_compatible():
     assert report._faithful_step({"agree_action": False}) is False
 
 
+def test_faithful_step_uses_goal_quality_when_present():
+    """A goal-judged run rates each action on its own merit — so control (which takes valid
+    steps) scores ~100%, not the low structural-agreement floor. The report must honour that:
+    a 'good' step is faithful even if it structurally disagrees with the original."""
+    # good toward the task but did NOT match the original action -> still faithful under goal
+    assert report._faithful_step({"quality": "good", "agree_action": False}) is True
+    assert report._faithful_step({"quality": "degraded", "agree_action": True}) is False
+    assert report._faithful_step({"quality": "bad"}) is False
+    # a good step that redundantly re-fetches is still docked
+    assert report._faithful_step({"quality": "good", "redundant": True}) is False
+    # llm:equiv upgrades a near-miss via agree_semantic when there's no goal quality
+    assert report._faithful_step({"agree_action": False, "agree_semantic": True}) is True
+
+
 def test_report_shows_incremental_only_tasks(tmp_path):
     """A task with ONLY incremental data (no full run — e.g. a session-labelled run) still
     gets a row with a faithfulness number, and its scoring method is inferred."""
@@ -230,9 +244,9 @@ def test_faithful_engagement_counts_ccr_retrieves():
     low_with_ccr = {"incr": {"fid": 0.4, "comp": 0.01, "retrieves": 5, "costd": 0.0}}
     passthrough = report._faithful_cost(low_no_ccr, floor)[0]
     engaged = report._faithful_cost(low_with_ccr, floor)[0]
-    assert "40%" in passthrough and "green" not in passthrough and "red" not in passthrough
-    assert "40%" in engaged and ("green" in engaged or "red" in engaged)  # verdict colour
-    assert "(-10)" in engaged and "(-10)" in passthrough  # gap vs the 50% floor, both cases
+    # normalised to control: fid 0.4 / floor 0.5 = 80% of control's faithfulness
+    assert "80%" in passthrough and "green" not in passthrough and "red" not in passthrough
+    assert "80%" in engaged and ("green" in engaged or "red" in engaged)  # verdict colour
     assert report._engaged({"comp": 0.01, "retrieves": 3}) is True
     assert report._engaged({"comp": 0.01, "retrieves": 0}) is False
     assert report._engaged({"comp": 0.20, "retrieves": 0}) is True  # compression alone counts
