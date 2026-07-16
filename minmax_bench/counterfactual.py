@@ -205,6 +205,68 @@ def estimate_usd(msgs, points, price) -> tuple[float, float]:
     return control / 1e6, busted / 1e6
 
 
+# --------------------------------------------------------------------------- re-judge
+def _task_hint(msgs: list[dict]) -> str:
+    """The session's first real user instruction (skip injected <system-reminder>/CLAUDE.md)."""
+    return next((b.get("text", "") for b in (msgs[0]["content"] if msgs else [])
+                 if isinstance(b, dict) and b.get("type") == "text"
+                 and not b.get("text", "").lstrip().startswith("<")), "")
+
+
+def rejudge_run(run_dir: str, *, judge: str, env: dict, console: Console,
+                session_root: Path = CC_PROJECTS) -> float:
+    """Re-score an existing incremental run's per-step quality WITHOUT re-replaying. Re-runs the
+    goal judge on each recorded action (the situation is reconstructed from the label's session),
+    rewrites 'quality' in place, and prints each file's new good-rate. Cheap — judge calls only —
+    so a recalibrated judge can be applied to arms you already replayed. control's good-rate is
+    the calibration check: it should land ≥90% (it replays a real, capable-agent session)."""
+    inc = Path(run_dir) / "incremental"
+    files = sorted(inc.glob("*.jsonl"))
+    if not files:
+        console.print(f"[red]no incremental jsonl under {inc}[/]")
+        raise SystemExit(1)
+    groups: dict[str, list] = {}
+    for f in files:                                 # <label>-<arm>.jsonl (arm = last segment)
+        arm = f.stem.rsplit("-", 1)[-1]
+        groups.setdefault(f.stem[: -(len(arm) + 1)], []).append((f, arm))
+    spent = 0.0
+    for label, group in sorted(groups.items()):
+        hits = sorted(session_root.rglob(f"{label}*.jsonl"))
+        if not hits:
+            console.print(f"[yellow]rejudge: no session found for {label} — skipped[/]")
+            continue
+        msgs, _ = eng.parse_session(str(hits[0]))
+        task_hint = _task_hint(msgs)
+        for f, arm in group:
+            recs = [json.loads(line) for line in open(f)]
+            n = 0
+            for r in recs:
+                i, rep = r.get("msg_index"), r.get("replay")
+                if i is None or not rep or r.get("error"):
+                    continue
+                orig = r.get("orig") or {}
+                if judge == "goal" and rep.get("type") == "text" and orig.get("type") == "text":
+                    q, c = eng.judge_text_match(orig, rep, task_hint, env)
+                else:
+                    situ = eng.recent_context(msgs, i)
+                    q, c = eng.judge_action_quality(task_hint, situ, rep, env)
+                spent += c
+                if q:
+                    r["quality"], n = q, n + 1
+            with open(f, "w") as out:
+                out.write("\n".join(json.dumps(r) for r in recs) + "\n")
+            scored = sum("quality" in r for r in recs)
+            good = sum(r.get("quality") == "good" for r in recs)
+            rate = f"{good}/{scored} good ({good / scored:.0%})" if scored else "no scored steps"
+            flag = ""
+            if arm == "control" and scored:
+                flag = " [green]✓ ≥90%[/]" if good / scored >= 0.9 else " [yellow]⚠ <90%[/]"
+            console.print(f"[dim]{f.stem}:[/] rejudged {n} · {rate}{flag}")
+    console.print(f"[green]rejudge complete[/] — ${spent:.3f} in judge calls. "
+                  "Re-view: minmax-bench quality report --from " + run_dir)
+    return spent
+
+
 # --------------------------------------------------------------------------- replay
 def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, every: int,
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,

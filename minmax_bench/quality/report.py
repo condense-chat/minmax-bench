@@ -710,8 +710,8 @@ def _takeaway(console, d):
                for arm in d["arms"] if r["arms"][arm].get("length_ok") is False]
     for r in d["rows"]:                                   # fidelity meaningfully below floor
         floor = _floor_for(r, d["arms"])
-        if floor is None or floor < 0.6:  # a low floor is noise-dominated (warned below), not
-            continue                      # a trustworthy baseline to call divergence against
+        if floor is None or floor < 0.9:  # control should score ≥90% under a calibrated judge;
+            continue                      # below that the baseline is noisy (warned below)
         for arm in d["arms"]:
             inc = r["arms"][arm].get("incr") or {}
             norm = _faithful_norm(inc.get("fid"), floor)
@@ -733,11 +733,12 @@ def _takeaway(console, d):
     # a low control floor means faithfulness was scored by structural match (no goal judge),
     # whose ceiling is sampling-driven — the comparison is noise-dominated, not trustworthy
     lowfloor = sum(1 for r in d["rows"]
-                   if (_floor_for(r, d["arms"]) or 1) < 0.6 and _has_incr(r, d["arms"]))
+                   if (_floor_for(r, d["arms"]) or 1) < 0.9 and _has_incr(r, d["arms"]))
     if lowfloor:
-        console.print(f"[yellow]  ⚠ {lowfloor} incremental task(s) have a low faithfulness floor "
-                      "(structural match, no goal judge) — noise-dominated; re-run with "
-                      "--judge goal for a trustworthy ~100% control baseline.[/]")
+        console.print(f"[yellow]  ⚠ {lowfloor} incremental task(s) have control <90% faithful — "
+                      "the judge is miscalibrated (or the run wasn't goal-judged), so the "
+                      "baseline is noisy. Re-score with `minmax-bench quality rejudge --from "
+                      "<dir>` (cheap) or re-run with --judge goal.[/]")
 
 
 if __name__ == "__main__":

@@ -130,6 +130,32 @@ def quality_report(
     main(argv)
 
 
+@quality_app.command("rejudge")
+def quality_rejudge(
+    from_: str = typer.Option(..., "--from", help="An incremental run dir (holds incremental/<label>-<arm>.jsonl)."),
+    judge: str = typer.Option("goal", "--judge", help="Judge to (re)apply per step: goal (recommended) | off."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the spend confirmation."),
+):
+    """Re-score an existing incremental run's per-step quality with the current (recalibrated)
+    judge — WITHOUT re-replaying, so it spends only on judge calls. Applies the SAME judge to
+    every arm; control's good-rate is the calibration check (should be ≥90%)."""
+    import os
+
+    from .counterfactual import REPO_ROOT, rejudge_run
+    from .quality import engine as eng
+    env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
+    if not (env.get("ANTHROPIC_API_KEY") or eng.auth_mode(env)):
+        console.print("[red]rejudge needs auth — set ANTHROPIC_API_KEY or a Claude Code login.[/]")
+        raise typer.Exit(1)
+    if not yes and not typer.confirm(f"Re-judge {from_} with the {judge!r} judge? "
+                                     "(spends on judge calls only, no re-replay)"):
+        raise typer.Exit(0)
+    try:
+        rejudge_run(from_, judge=judge, env=env, console=console)
+    except SystemExit as e:
+        raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
+
+
 def _run_incremental(*, session: str | None, arms: str, model: str | None, every: int,
                      limit: int, budget_usd: float, max_tokens: int, out: str, task: str,
                      auth: str, assume_yes: bool, judge: str = "off", steps: bool = True,
