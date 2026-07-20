@@ -14,6 +14,26 @@ import json
 from .models import Message
 
 
+def parse_token_count(raw: str | None) -> int | None:
+    """'200k' / '1.5m' / '50,000' -> int tokens; None/''/unparseable -> None.
+
+    The one parser for every human-entered token amount (CLI --token-budget, the
+    wizard's budget prompt) so they accept identical spellings.
+    """
+    if not raw:
+        return None
+    r = raw.strip().lower().replace(",", "")
+    mult = 1
+    if r.endswith("k"):
+        mult, r = 1_000, r[:-1]
+    elif r.endswith("m"):
+        mult, r = 1_000_000, r[:-1]
+    try:
+        return int(float(r) * mult)
+    except ValueError:
+        return None
+
+
 class TokenCounter:
     """Local token counter. Uses tiktoken (offline).
 

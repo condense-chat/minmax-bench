@@ -26,6 +26,7 @@ from .runner import key as track_key
 from .runner import run as run_bench
 from .runstore import BASELINE, RunStore
 from .strategies import STRATEGY_MATRIX, default_selected, has_entry, matrix_names
+from .tokens import parse_token_count as _parse_token_budget
 
 app = typer.Typer(add_completion=False, help="Estimated token/cost savings benchmark for agent-session proxies.")
 console = Console()
@@ -51,8 +52,8 @@ def _flag(argv: list[str], name: str, value, default=None) -> None:
 
 @quality_app.command("run")
 def quality_run(
-    tasks: str | None = typer.Option(None, "--tasks", help="N = first N recommended | random:N (with --seed) | a,b,c | omitted = 5. See --list-tasks."),
-    arms: str = typer.Option("condense,headroom", "--arms", help="Methods to run; vanilla baseline always included."),
+    tasks: str | None = typer.Option(None, "--tasks", help="N recommended | random:N (with --seed) | group (all|long|short|hard|medium) | a,b,c | omitted = 5. `long`=author timeout ≥30m, biasing toward sessions long enough to compact. See --list-tasks."),
+    arms: str = typer.Option("condense,headroom", "--arms", help="Methods to run; vanilla baseline always included. Also: headroom-kompress (ablation), vanilla-proxy (passthrough control — isolates the proxy-wiring confound)."),
     model: str | None = typer.Option(None, "--model", "-m", help="Model id (default claude-sonnet-4-6)."),
     dataset: str = typer.Option(_Q_DATASET, "--dataset", "-d", help="Harbor dataset (only the default is validated)."),
     k: int = typer.Option(4, "--k", help="Trials per arm/task."),
@@ -88,11 +89,15 @@ def quality_run(
         except (KeyboardInterrupt, EOFError):
             console.print("[yellow]aborted.[/]")
             raise typer.Exit(1) from None
+        if w.mode == "view":  # display-only: re-render a stored run, never spends
+            from minmax_bench.quality.report import main as report_main
+            report_main(["--from", w.out, "--arms", w.arms, "--tasks", w.tasks])
+            return
         if w.mode == "incremental":
             _run_incremental(session=w.session, arms=w.arms, model=w.model, every=w.every,
                              limit=w.limit, budget_usd=w.budget_usd, max_tokens=6000,
                              out=w.out, task=w.task, auth="auto", assume_yes=True, judge=w.judge,
-                             capture=w.capture)
+                             capture=w.capture, ctx_gate=w.ctx_gate)
             return
         arms, tasks, model, k, budget_usd, milestones, out = (
             w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out)
@@ -128,6 +133,41 @@ def quality_report(
     _flag(argv, "--tasks", tasks)
     _flag(argv, "--out", out)
     main(argv)
+
+
+@quality_app.command("runs")
+def quality_runs(
+    roots: str = typer.Option("results,runs/quality-sample", "--roots", help="Comma list of dirs to scan for quality result dirs."),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max runs to list (newest first)."),
+):
+    """List stored quality runs (full + incremental) — pure filesystem walk, never spends."""
+    from datetime import datetime as _dt
+
+    from rich.table import Table
+
+    from minmax_bench.quality.report import discover_runs
+    infos = discover_runs([r.strip() for r in roots.split(",") if r.strip()])
+    if not infos:
+        console.print("[yellow]no quality runs found — generate one with "
+                      "`minmax-bench quality run`[/]")
+        return
+    t = Table(title=f"[bold]quality runs ({len(infos)})[/] — newest first",
+              caption="view one: minmax-bench quality report --from <dir>",
+              caption_justify="left", caption_style="dim")
+    t.add_column("when", no_wrap=True)
+    t.add_column("dir", overflow="fold")  # the path is what feeds --from; never ellipsize it
+    for col in ("modes", "model", "arms", "tasks"):
+        t.add_column(col)
+    for i in infos[:limit]:
+        when = _dt.fromtimestamp(Path(i["dir"]).stat().st_mtime).strftime("%m-%d %H:%M")
+        shown = ", ".join(i["tasks"][:3]) + (f", … +{len(i['tasks']) - 3}"
+                                             if len(i["tasks"]) > 3 else "")
+        t.add_row(when, i["dir"], "+".join(i["modes"]), i["model"] or "[dim]?[/]",
+                  ", ".join(a for a in i["arms"] if a not in ("vanilla", "control"))
+                  or "[dim](baseline only)[/]", shown)
+    if len(infos) > limit:
+        t.add_row("…", f"(+{len(infos) - limit} more — raise --limit)", "", "", "", "")
+    console.print(t)
 
 
 @quality_app.command("rejudge")
@@ -261,22 +301,6 @@ def _resolve_setup(opt: str, strategies: list[str]) -> list[str]:
     if o == "auto":
         return tools_for(strategies)
     return [t.strip() for t in o.split(",") if t.strip()]
-
-
-def _parse_token_budget(raw: str | None) -> int | None:
-    """'200k'/'1.5m'/'50000' -> int tokens; None/'' -> None."""
-    if not raw:
-        return None
-    r = raw.strip().lower().replace(",", "")
-    mult = 1
-    if r.endswith("k"):
-        mult, r = 1_000, r[:-1]
-    elif r.endswith("m"):
-        mult, r = 1_000_000, r[:-1]
-    try:
-        return int(float(r) * mult)
-    except ValueError:
-        return None
 
 
 @app.command("run")

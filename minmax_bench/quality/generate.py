@@ -16,6 +16,9 @@ Shared:
                                               + the mcp retrieve loop (Compress-Cache-Retrieve)
                              headroom-kompress = token-mode compression WITHOUT retrieval
                                               (ablation only)
+                             vanilla-proxy     = vanilla through a do-nothing local forwarder
+                                              (full mode only) — the passthrough CONTROL that
+                                              isolates the non-default-base-URL confound
 Optional (full): --milestones runs an LLM judge over the runs → results/<out>/milestones.json.
 
 Nothing here is read by report.py except the files it writes. Keep generation and display separate.
@@ -87,6 +90,7 @@ DEFAULT_DATASET = "terminal-bench/terminal-bench-2-1"  # the only validated data
 DEFAULT_MODEL = "claude-sonnet-4-6"
 SUPPORTED_AGENTS = {"claude-code"}  # codex / opencode: TODO; harbor agent ids in _arm_wiring
 HRPORT = int(os.environ.get("HRPORT", "8787"))
+PTPORT = int(os.environ.get("PTPORT", "8788"))  # the vanilla-proxy passthrough control
 
 # arm -> headroom proxy mode. Two arms, mirroring the cost bench's headroom names:
 # 'headroom' is the REGULAR/full product (token-mode proxy + the mcp retrieve loop,
@@ -99,10 +103,23 @@ HEADROOM_MODES = {"headroom": "token", "headroom-kompress": "token"}
 _HARBOR = [None]
 
 # ------------------------------------------------------------------ FULL: drive Harbor per arm/task
+def _k_for(args, arm):
+    """Trials for an arm: vanilla defaults to k+1 — the noise floor is shared by every
+    comparison, so one extra vanilla run sharpens every verdict."""
+    return (args.k_vanilla or args.k + 1) if arm == "vanilla" else args.k
+
+
 def _arm_wiring(arm, env):
     """(base_url, allow_host, harbor_agent, extra_flags) for an arm — how a real user deploys it."""
     if arm == "vanilla":
         return "https://api.anthropic.com", "api.anthropic.com", "claude-code", []
+    if arm == "vanilla-proxy":
+        # the passthrough CONTROL: vanilla through a do-nothing local forwarder — the
+        # same non-default ANTHROPIC_BASE_URL wiring every proxy arm carries, with zero
+        # content change. Its delta vs vanilla isolates the proxy-wiring confound
+        # (Claude Code composes a ~8-9k-token-larger request on a non-default base URL).
+        return (f"http://host.docker.internal:{PTPORT}", "host.docker.internal",
+                "claude-code", [])
     if arm == "condense":
         tok = env.get("CONDENSE_API_KEY", "")
         return ("https://api.condense.chat/anthropic", "api.condense.chat", "claude-code",
@@ -119,9 +136,9 @@ def _arm_wiring(arm, env):
     sys.exit(f"unknown arm: {arm}")
 
 
-def _proxy_up():
+def _proxy_up(port=HRPORT):
     try:
-        socket.create_connection(("127.0.0.1", HRPORT), timeout=1).close()
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
         return True
     except OSError:
         return False
@@ -267,6 +284,12 @@ def _preflight_full(arms, env):
                   "reusable token-mode proxy up" if pm == "token" else
                   f"busy with a {pm or 'unknown'}-mode proxy — `kill $(lsof -ti :{HRPORT})`")
         rows.append((f"port {HRPORT}", ok, detail, True))
+    if "vanilla-proxy" in arms:
+        busy = _proxy_up(PTPORT)
+        rows.append((f"port {PTPORT}", not busy,
+                     "free" if not busy else
+                     f"busy — the passthrough control needs it (`kill $(lsof -ti :{PTPORT})` "
+                     f"or set PTPORT)", True))
     return rows
 
 
@@ -312,7 +335,7 @@ def full(args, env):
                      f"use a fresh --out, or --force to overwrite.")
     if not args.dry_run:
         json.dump({"model": model, "dataset": args.dataset}, open(mf_path, "w"))
-    kv = args.k_vanilla or args.k + 1
+    kv = _k_for(args, "vanilla")
     trials = len(tasks) * (kv + args.k * (len(arms) - 1))
     _console.print(f"[bold]plan[/] {len(arms)} arms ({', '.join(arms)}) × {len(tasks)} tasks "
                    f"× k={args.k} (vanilla {kv}) = {trials} trials, cost ceiling "
@@ -323,13 +346,16 @@ def full(args, env):
                 else Live(grid.render(), console=_console, refresh_per_second=4))
     with live_ctx as live:
         for arm in arms:
-            # the vanilla band is the noise floor every arm is judged against — one extra
-            # vanilla run sharpens every verdict, so it defaults to k+1
-            k = (args.k_vanilla or args.k + 1) if arm == "vanilla" else args.k
-            proxy = None
+            k = _k_for(args, arm)
+            proxy = passthrough = None
             try:
                 if arm in HEADROOM_MODES and not args.dry_run:
                     proxy = _start_proxy(out, HEADROOM_MODES[arm])
+                if arm == "vanilla-proxy" and not args.dry_run:
+                    from minmax_bench.quality.passthrough import PassthroughProxy
+                    passthrough = PassthroughProxy(port=PTPORT).start()
+                    _console.print(f"[dim][vanilla-proxy] passthrough forwarder up on "
+                                   f":{PTPORT} → api.anthropic.com[/]")
                 base, allow, agent, extra = _arm_wiring(arm, env)
                 for task in tasks:
                     cell = f"{out}/{arm}-{task}"
@@ -356,7 +382,11 @@ def full(args, env):
                             + os.environ.get("PYTHONPATH", "")}
                     if args.dry_run:
                         print(f"### {arm} / {task} (k={k}, base={base}) ###")
-                        print("   " + " ".join(cmd))
+                        shown = " ".join(cmd)
+                        tok = env.get("CONDENSE_API_KEY")
+                        if tok:  # never echo a live key into the terminal/logs
+                            shown = shown.replace(tok, tok[:6] + "…")
+                        print("   " + shown)
                         continue
                     if run_k <= 0:
                         grid.set(arm, task, "skip", done)
@@ -406,12 +436,13 @@ def full(args, env):
                     live.update(grid.render())
             finally:
                 _stop_proxy(proxy)
+                if passthrough:
+                    passthrough.stop()
     if not args.dry_run:
         # cells still missing trials (timeouts, failures, or an interrupt) — re-running the
         # same command finishes them without re-spending completed trials
         def _need(a, t):
-            want = (args.k_vanilla or args.k + 1) if a == "vanilla" else args.k
-            return len(glob.glob(f"{out}/{a}-{t}/*/*/verifier/reward.txt")) < want
+            return len(glob.glob(f"{out}/{a}-{t}/*/*/verifier/reward.txt")) < _k_for(args, a)
         incomplete = [(a, t) for a in arms for t in tasks if _need(a, t)]
         ncells = len(arms) * len(tasks)
         if args.milestones:
@@ -637,7 +668,11 @@ def judge_milestones(args, env):
             covs = []
             # the reference run trivially covers its own milestones — exclude it from
             # vanilla's coverage so the vanilla band isn't inflated vs the arms
-            paths = [p for p, _ in sess[arm] if p != ref][:3]
+            eligible = [p for p, _ in sess[arm] if p != ref]
+            paths = eligible[:3]  # cost cap: 3 coverage calls per (task, arm)
+            if len(eligible) > len(paths):  # no silent caps — say what was dropped
+                print(f"[milestones] {task}/{arm}: judging {len(paths)} of "
+                      f"{len(eligible)} runs (per-arm cap)")
             for p in paths:
                 _, s2 = _summary(p)
                 c = _ask(COVER.format(task=t, ms=json.dumps(ms), summary=s2), env)

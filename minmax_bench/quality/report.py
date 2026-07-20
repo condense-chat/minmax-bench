@@ -26,21 +26,97 @@ import json
 import os
 import re
 
-from rich.console import Console
-from rich.table import Table
+try:  # rich renders the terminal tables, but analysis must work on a bare python3
+    from rich.console import Console
+    from rich.table import Table
+    HAVE_RICH = True
+except ImportError:  # fresh clone, no install — fall back to the plain-text views
+    HAVE_RICH = False
 
 # one session parser for the spend side (generate/engine) and the display side.
 from minmax_bench.quality.engine import (
     SESSION_GLOB,
+    ctx_tokens,
     extract_action,
     parse_session,
-    recorded_usage,
+    peak_ctx,
     resolve_tasks,
 )
 
 AGENT_SESSION_GLOB = {  # only claude-code is wired; others are TODO
     "claude-code": SESSION_GLOB,
 }
+
+# longest names first — cell dir names are '<arm>-<task>' and arm names contain hyphens,
+# so splitting is a longest-prefix match against the arms the bench knows about
+KNOWN_ARMS = ("headroom-kompress", "vanilla-proxy", "headroom", "condense", "vanilla", "control")
+
+
+def split_cell(name):
+    """'<arm>-<task>' -> (arm, task) by longest known-arm prefix; (None, name) if no match."""
+    for arm in KNOWN_ARMS:
+        if name.startswith(arm + "-"):
+            return arm, name[len(arm) + 1:]
+    return None, name
+
+
+DEFAULT_RUN_ROOTS = ("results", "runs/quality-sample")
+
+
+def _run_info(d):
+    """What one results dir holds: modes (full/incremental), arms, tasks, model."""
+    modes, arms, tasks, model = set(), set(), set(), None
+    for mf in ("run-manifest.json", "summary.json"):  # full manifest first, then incremental
+        try:
+            model = model or json.load(open(os.path.join(d, mf))).get("model")
+        except (OSError, json.JSONDecodeError):
+            continue
+    cells = {os.path.basename(os.path.dirname(p))
+             for p in glob.glob(os.path.join(d, "*", "attempted.json"))}
+    for p in glob.glob(os.path.join(d, "*", "*", "*", "verifier", "reward.txt")):
+        cell = p
+        for _ in range(4):
+            cell = os.path.dirname(cell)
+        cells.add(os.path.basename(cell))
+    for c in cells:
+        arm, task = split_cell(c)
+        if arm:
+            modes.add("full")
+            arms.add(arm)
+            tasks.add(task)
+    for p in glob.glob(os.path.join(d, "incremental", "*.jsonl")):
+        label, _, arm = os.path.basename(p)[:-len(".jsonl")].rpartition("-")
+        modes.add("incremental")
+        arms.add(arm or label)
+        tasks.add(label or arm)
+    return {"dir": d, "modes": sorted(modes), "arms": sorted(arms),
+            "tasks": sorted(tasks), "model": model}
+
+
+def discover_runs(roots=DEFAULT_RUN_ROOTS):
+    """Quality result dirs under `roots`, newest first — pure filesystem walk, never spends.
+
+    A run dir is any directory holding full-mode artifacts (run-manifest.json /
+    attempted.json cells / verifier rewards) or incremental artifacts
+    (incremental/*.jsonl, summary.json). Used by `quality runs` and the wizard's
+    view mode so stored results are discoverable without remembering paths.
+    """
+    dirs = set()
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for pat, up in (("run-manifest.json", 1), ("summary.json", 1), ("attempted.json", 2),
+                        (os.path.join("incremental", "*.jsonl"), 2),
+                        (os.path.join("verifier", "reward.txt"), 5)):
+            for p in glob.glob(os.path.join(root, "**", pat), recursive=True):
+                d = p
+                for _ in range(up):
+                    d = os.path.dirname(d)
+                if d:
+                    dirs.add(d)
+    infos = [i for i in (_run_info(d) for d in dirs) if i["modes"]]
+    infos.sort(key=lambda i: os.path.getmtime(i["dir"]), reverse=True)
+    return infos
 
 
 def actions(path):
@@ -173,13 +249,6 @@ def index_runs(root, agent):
 
 
 # ---------------------------------------------------------------- assemble (from artifacts only)
-def _peak_ctx(path):
-    """Largest recorded per-request context (input + cache read/write) in a session."""
-    return max((u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-                + u.get("cache_creation_input_tokens", 0) for u in recorded_usage(path)),
-               default=0)
-
-
 def _cell_stats(cell):
     runs = cell["runs"] if cell else []
     lens, rws, peaks = [], [], []
@@ -187,7 +256,7 @@ def _cell_stats(cell):
         acts = actions(p)
         lens.append(len(acts))
         rws.append(rework_count(acts))
-        peaks.append(_peak_ctx(p))
+        peaks.append(peak_ctx(p))
     n = len(runs)
     attempted = cell["attempted"] if cell and cell["attempted"] else n
     started = n  # trial dirs that actually opened (reward or not); >n means some crashed
@@ -272,9 +341,7 @@ def _load_incremental(root, arms):
                 d[r["step"]] = r
         return d
 
-    def ctx(u):
-        return (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-                + u.get("cache_creation_input_tokens", 0))
+    ctx = ctx_tokens  # the shared context-size definition (engine.ctx_tokens)
 
     out = {}
     for cf in sorted(glob.glob(f"{root}/**/incremental/*-control.jsonl", recursive=True)):
@@ -468,7 +535,10 @@ def main(argv=None):
     render_console(d)
     out = args.out or f"report.{args.format}"
     open(out, "w").write(render_md(d) if args.format == "md" else render_html(d))
-    Console().print(f"[dim]wrote {out}[/]")
+    if HAVE_RICH:
+        Console().print(f"[dim]wrote {out}[/]")
+    else:
+        print(f"wrote {out}")
 
 
 # The wide table() view (all axes as separate columns) is the HTML/md layout. The terminal
@@ -561,10 +631,16 @@ def _latency_cell(inc):
     return _DASH if la is None or not lc else _pct(1 - la / lc)
 
 
+def _incr_field(r, arms, key):
+    """The first arm's incremental value for `key` — used for control-side fields
+    (fid_ctrl / latency_ctrl / scoring), which are ≈equal across a task's arms."""
+    return next((r["arms"][a]["incr"][key] for a in arms
+                 if (r["arms"][a].get("incr") or {}).get(key) is not None), None)
+
+
 def _latency_floor(r, arms):
-    """Control's own per-step wall-clock for a task (latency_ctrl, ≈equal across arms)."""
-    return next((r["arms"][a]["incr"]["latency_ctrl"] for a in arms
-                 if (r["arms"][a].get("incr") or {}).get("latency_ctrl") is not None), None)
+    """Control's own per-step wall-clock for a task (the latency baseline)."""
+    return _incr_field(r, arms, "latency_ctrl")
 
 
 def _faithful_norm(fid, floor):
@@ -608,8 +684,7 @@ def _has_incr(r, arms):
 
 def _scoring_for(r, arms):
     """The scoring method used for a task's incremental run (uniform across its arms)."""
-    return next((r["arms"][a]["incr"]["scoring"] for a in arms
-                 if (r["arms"][a].get("incr") or {}).get("scoring")), None)
+    return _incr_field(r, arms, "scoring")
 
 
 def _grouped(t, rows, render_row):
@@ -681,6 +756,11 @@ def _incremental_table(console, d, model):
 def render_console(d):
     """Terminal view: two focused tables (full trajectories, then incremental) so the two
     measurement modes aren't confounded, followed by a one-glance takeaway."""
+    if not HAVE_RICH:
+        # bare-python3 fallback (fresh clone, nothing installed): the md view carries
+        # every axis in one wide table — less pretty, same numbers
+        print(render_md(d))
+        return
     console = Console()
     model = d.get("model")
     _full_table(console, d, model)
@@ -689,9 +769,8 @@ def render_console(d):
 
 
 def _floor_for(r, arms):
-    """The control incremental fidelity floor for a task (fid_ctrl, ≈equal across arms)."""
-    return next((r["arms"][a]["incr"]["fid_ctrl"] for a in arms
-                 if (r["arms"][a].get("incr") or {}).get("fid_ctrl") is not None), None)
+    """The control incremental fidelity floor for a task (the noise floor)."""
+    return _incr_field(r, arms, "fid_ctrl")
 
 
 def _takeaway(console, d):

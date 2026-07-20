@@ -91,10 +91,36 @@ def dataset_tasks(org="terminal-bench"):
     return curated + [t for t in local if t not in curated]
 
 
+LONG_TIMEOUT_SEC = 1800  # a task whose own author timeout is >= this is in the `long` group
+
+
+def task_meta(task, org="terminal-bench"):
+    """(timeout_sec, difficulty) from a task's task.toml, or (0.0, "").
+
+    timeout_sec is the task author's wall-clock budget — the best a-priori proxy we have
+    for how much work (and thus context) a solve accumulates. It is only a PROXY: the
+    ground truth for "did the arm actually compact" is the report's peak-context gate (⊘).
+    """
+    base = os.path.expanduser(f"~/.cache/harbor/tasks/packages/{org}/{task}")
+    if not os.path.isdir(base):
+        return (0.0, "")
+    for root, _dirs, files in os.walk(base):
+        if "task.toml" in files:
+            text = open(os.path.join(root, "task.toml")).read()
+            tos = [float(x) for x in re.findall(r"timeout_sec\s*=\s*([0-9.]+)", text)]
+            dif = re.search(r'difficulty\s*=\s*"(\w+)"', text)
+            return (max(tos) if tos else 0.0, dif.group(1) if dif else "")
+    return (0.0, "")
+
+
 def resolve_tasks(raw, org="terminal-bench", seed=None):
     """--tasks forms: omitted -> first 5 recommended; N -> first N known (recommended
     order first, then the rest alphabetically); random:N -> N sampled from everything
-    known locally (use --seed to reproduce); else comma-separated names."""
+    known locally (use --seed to reproduce); a named GROUP (all | long | short | hard |
+    medium | easy) filtered from the local set by task.toml metadata; else comma-separated
+    names. `long`/`short` split on the author timeout (>= / < 1800s); the rest match
+    difficulty. Groups are HEURISTIC biases toward long-enough sessions — the report's
+    peak-context gate (⊘) is what actually confirms an arm compacted."""
     import random as _random
     raw = (raw or "").strip()
     rand_n = None
@@ -102,6 +128,22 @@ def resolve_tasks(raw, org="terminal-bench", seed=None):
         rand_n = raw.split(":", 1)[1]
         if not rand_n.isdigit():
             sys.exit(f"--tasks {raw}: expected random:<N>")
+    groups = {"all", "long", "short", "hard", "medium", "easy"}
+    if raw.lower() in groups:
+        pool = dataset_tasks(org)
+        if raw.lower() == "all":
+            return pool
+        meta = {t: task_meta(t, org) for t in pool}
+        if raw.lower() == "long":
+            sel = [t for t in pool if meta[t][0] >= LONG_TIMEOUT_SEC]
+        elif raw.lower() == "short":
+            sel = [t for t in pool if 0 < meta[t][0] < LONG_TIMEOUT_SEC]
+        else:  # difficulty groups
+            sel = [t for t in pool if meta[t][1] == raw.lower()]
+        if not sel:
+            sys.exit(f"--tasks {raw}: no local {org} tasks match (have you downloaded the "
+                     f"dataset? `harbor datasets download <org>/<dataset>`)")
+        return sel
     if not raw or raw.isdigit() or rand_n:
         n = int(rand_n or raw or 5)
         pool = dataset_tasks(org)
@@ -866,6 +908,22 @@ def call_api(arm, req, tmpl_headers, env):
                 continue
             return None, f"{type(e).__name__}: {e}"
     return None, "unreachable"
+
+
+def ctx_tokens(usage):
+    """One request's total context: fresh input + cache reads + cache writes.
+
+    The single definition of "context size" every consumer (peak-ctx gate, compression
+    %, picker preview) shares — three usage tiers, summed the same way everywhere.
+    """
+    return (usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0))
+
+
+def peak_ctx(session_path):
+    """Largest recorded per-request context across a session — the number that decides
+    whether a replay/compaction gate (--ctx-gate) can ever fire."""
+    return max((ctx_tokens(u) for u in recorded_usage(session_path)), default=0)
 
 
 def cost_usd(usage, model=None):

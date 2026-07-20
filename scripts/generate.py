@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Thin wrapper — the quality bench lives in minmax_bench/quality (importable, unit-tested).
 
-Still runs on a bare `python3` from a fresh clone: the quality subpackage is pure
-standard library, so nothing needs to be installed to generate or analyze runs
-(Docker + harbor are only needed for --mode full itself).
+Analysis (`scripts/report.py`) runs on a bare `python3` from a fresh clone; GENERATION
+additionally needs `rich` for its progress display (part of the normal `uv sync` install;
+Docker + harbor are only needed for --mode full itself).
 """
 import os
 import sys

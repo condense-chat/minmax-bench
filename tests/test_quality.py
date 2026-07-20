@@ -577,3 +577,112 @@ def test_ccr_step_no_mcp_falls_back_to_single_call(monkeypatch):
     monkeypatch.setattr(e, "build_request", lambda *a, **k: {})
     resp, err, nr, oh = e.ccr_step("headroom", {}, [], _args(), "s", {}, {}, None)
     assert nr == 0 and e.extract_action(resp["content"])["name"] == "Bash"
+
+
+# ---------------------------------------------------------------- shared ctx helpers
+def test_ctx_tokens_sums_all_three_usage_tiers():
+    u = {"input_tokens": 5, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 20}
+    assert eng.ctx_tokens(u) == 125
+    assert eng.ctx_tokens({}) == 0
+
+
+def test_peak_ctx_reads_a_session(tmp_path):
+    p = tmp_path / "s.jsonl"
+    rows = [
+        {"type": "assistant", "requestId": "r1",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "a"}],
+                     "usage": {"input_tokens": 10, "cache_read_input_tokens": 40}}},
+        {"type": "assistant", "requestId": "r2",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "b"}],
+                     "usage": {"input_tokens": 10, "cache_read_input_tokens": 990}}},
+    ]
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert eng.peak_ctx(str(p)) == 1000
+
+
+# ---------------------------------------------------------------- run discovery
+def test_split_cell_handles_hyphenated_arms():
+    assert report.split_cell("headroom-kompress-kv-store-grpc") == ("headroom-kompress",
+                                                                    "kv-store-grpc")
+    assert report.split_cell("vanilla-proxy-dna-assembly") == ("vanilla-proxy", "dna-assembly")
+    assert report.split_cell("vanilla-dna-assembly") == ("vanilla", "dna-assembly")
+    assert report.split_cell("mystery-thing") == (None, "mystery-thing")
+
+
+def test_discover_runs_finds_full_and_incremental(tmp_path):
+    full = tmp_path / "jobs" / "runA"
+    (full / "vanilla-taskx" / "t1" / "inst" / "verifier").mkdir(parents=True)
+    (full / "vanilla-taskx" / "t1" / "inst" / "verifier" / "reward.txt").write_text("1")
+    (full / "run-manifest.json").write_text(json.dumps({"model": "claude-test-1"}))
+    inc = tmp_path / "inc" / "runB"
+    (inc / "incremental").mkdir(parents=True)
+    (inc / "incremental" / "sess-control.jsonl").write_text("")
+    (inc / "incremental" / "sess-condense.jsonl").write_text("")
+    infos = {i["dir"]: i for i in report.discover_runs([str(tmp_path)])}
+    a = infos[str(full)]
+    assert a["modes"] == ["full"] and a["model"] == "claude-test-1"
+    assert a["arms"] == ["vanilla"] and a["tasks"] == ["taskx"]
+    b = infos[str(inc)]
+    assert b["modes"] == ["incremental"]
+    assert set(b["arms"]) == {"control", "condense"} and b["tasks"] == ["sess"]
+
+
+# ---------------------------------------------------------------- rich-free analysis
+def test_render_console_falls_back_to_plain_text_without_rich(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(report, "HAVE_RICH", False)
+    args = SimpleNamespace(tasks="kv-store-grpc", arms="condense", agent="claude-code",
+                           ctx_gate=50_000, **{"from": "runs/quality-sample"})
+    report.render_console(report.build(args))
+    out = capsys.readouterr().out
+    assert "| task |" in out and "kv-store-grpc" in out  # the md fallback rendered
+
+
+# ---------------------------------------------------------------- passthrough control arm
+def test_passthrough_proxy_relays_status_headers_and_stream():
+    import threading
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from minmax_bench.quality.passthrough import PassthroughProxy
+
+    class Up(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            n = int(self.headers.get("content-length") or 0)
+            body = self.rfile.read(n)
+            assert self.headers.get("x-api-key") == "sk-test"
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b"data: " + body + b"\n\n")
+
+    up = HTTPServer(("127.0.0.1", 0), Up)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    try:
+        with PassthroughProxy(port=0, upstream=f"http://127.0.0.1:{up.server_address[1]}") as p:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{p.port}/v1/messages", data=b'{"m":1}',
+                headers={"x-api-key": "sk-test"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                assert r.status == 200
+                assert r.headers["content-type"] == "text/event-stream"
+                assert r.read() == b'data: {"m":1}\n\n'
+    finally:
+        up.shutdown()
+        up.server_close()
+
+
+def test_vanilla_proxy_arm_wiring_targets_the_local_forwarder():
+    from minmax_bench.quality import generate as gen
+    base, allow, agent, extra = gen._arm_wiring("vanilla-proxy", {})
+    assert base == f"http://host.docker.internal:{gen.PTPORT}"
+    assert allow == "host.docker.internal" and agent == "claude-code" and extra == []
+
+
+def test_k_for_vanilla_defaults_to_k_plus_one():
+    from minmax_bench.quality.generate import _k_for
+    args = SimpleNamespace(k=4, k_vanilla=None)
+    assert _k_for(args, "vanilla") == 5 and _k_for(args, "condense") == 4
+    assert _k_for(SimpleNamespace(k=4, k_vanilla=2), "vanilla") == 2

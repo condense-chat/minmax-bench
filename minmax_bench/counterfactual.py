@@ -104,8 +104,7 @@ def _peek(path: Path, max_lines: int = 300) -> tuple[str, str | None, bool, int,
                 u = rec.get("message", {}).get("usage") if rec.get("type") == "assistant" else None
                 if isinstance(u, dict):
                     has_assistant = True
-                    peak = max(peak, u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-                               + u.get("cache_creation_input_tokens", 0))
+                    peak = max(peak, eng.ctx_tokens(u))
     except OSError:
         return "", None, False, 0, False
     return " ".join(prompt.split())[:90], cwd, has_assistant, peak, capped
@@ -310,9 +309,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     # skip too-short sessions early: if the session's peak context never crossed the
     # compaction gate, no arm would ever compact anything — the replay is a guaranteed
     # passthrough, so spending on it buys nothing. --ctx-gate 0 forces it anyway.
-    peak = max((u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-                + u.get("cache_creation_input_tokens", 0)
-                for u in eng.recorded_usage(str(session))), default=0)
+    peak = eng.peak_ctx(str(session))
     if ctx_gate and peak < ctx_gate:
         console.print(Panel.fit(
             f"[yellow]{session.name}[/] peaks at [bold]{peak / 1000:.0f}k[/] context — below the "
@@ -451,12 +448,9 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     inc_dir = out_dir / "incremental"
     inc_dir.mkdir(parents=True, exist_ok=True)
     sid = str(uuid.uuid4())
-    # the session's first user text — task context for the equivalence judge
-    # the first real user instruction — skip injected <system-reminder>/CLAUDE.md blocks
-    # (ensure_reminders may have prepended them) so the judges get the task, not the reminders
-    task_hint = next((b.get("text", "") for b in (msgs[0]["content"] if msgs else [])
-                      if isinstance(b, dict) and b.get("type") == "text"
-                      and not b.get("text", "").lstrip().startswith("<")), "")
+    # the first real user instruction — task context for the judges (skips the injected
+    # <system-reminder>/CLAUDE.md blocks that ensure_reminders may have prepended)
+    task_hint = _task_hint(msgs)
     summary: dict = {"session": str(session), "model": replay_model, "steps": len(sel),
                      "judged": judge, "arms": {}}
     from minmax_bench.quality import generate as gen
@@ -548,9 +542,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                         redundant = _is_refetch(rep, seen_files, seen_cmds)
                         n_redund += redundant
                         n_faithful += bool(action and not redundant)
-                        step_ctx = (usage.get("input_tokens", 0)
-                                    + usage.get("cache_read_input_tokens", 0)
-                                    + usage.get("cache_creation_input_tokens", 0))
+                        step_ctx = eng.ctx_tokens(usage)
                         ctx_total += step_ctx
                         ctx_series.append(step_ctx)
                         # per-step, keyed by the shared decision-point index so arm-vs-control
@@ -617,8 +609,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     pos = {i: k for k, i in enumerate(points)}
     ks = [pos[i] for i in sel if pos[i] < len(rec)]
     if ks:
-        ctx = sum(rec[k].get("input_tokens", 0) + rec[k].get("cache_read_input_tokens", 0)
-                  + rec[k].get("cache_creation_input_tokens", 0) for k in ks)
+        ctx = sum(eng.ctx_tokens(rec[k]) for k in ks)
         summary["recorded"] = {
             "steps": len(ks), "avg_ctx_tokens": ctx // len(ks),
             "cost_usd": round(sum(eng.cost_usd(rec[k], meta["model"]) for k in ks), 4),

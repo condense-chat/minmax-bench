@@ -11,6 +11,7 @@ from __future__ import annotations
 import shutil
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
@@ -27,6 +28,7 @@ from .preflight import disabled_strategies, preflight
 from .provision import _reachable
 from .report import DEFAULT_EDGES
 from .strategies import default_selected, matrix_names, selectable, tool_for
+from .tokens import parse_token_count
 
 
 @dataclass
@@ -168,19 +170,7 @@ def _parse_range(raw: str) -> tuple[int | None, int | None] | None:
     return (lo, hi)
 
 
-def _parse_tokens(raw: str) -> int | None:
-    raw = raw.strip().lower().replace(",", "")
-    if not raw:
-        return None
-    mult = 1
-    if raw.endswith("k"):
-        mult, raw = 1_000, raw[:-1]
-    elif raw.endswith("m"):
-        mult, raw = 1_000_000, raw[:-1]
-    try:
-        return int(float(raw) * mult)
-    except ValueError:
-        return None
+_parse_tokens = parse_token_count  # one parser for every human-entered token amount
 
 
 def _dense_ready() -> bool:
@@ -401,6 +391,37 @@ class QualityWizardResult:
     limit: int = 0
     judge: str = "off"
     capture: bool = False
+    ctx_gate: int = 50_000     # 0 = deliberately replay a below-gate session
+
+
+def _ask_int(console: Console, prompt: str, default: int, lo: int = 0) -> int:
+    """Integer prompt that re-asks on junk instead of crashing the wizard."""
+    while True:
+        raw = Prompt.ask(prompt, default=str(default), console=console).strip()
+        try:
+            v = int(raw or default)
+        except ValueError:
+            console.print(f"[yellow]enter a whole number (≥{lo})[/]")
+            continue
+        if v < lo:
+            console.print(f"[yellow]enter a number ≥{lo}[/]")
+            continue
+        return v
+
+
+def _ask_float(console: Console, prompt: str, default: float, lo: float = 0.0) -> float:
+    """Float prompt that re-asks on junk instead of crashing the wizard."""
+    while True:
+        raw = Prompt.ask(prompt, default=f"{default:g}", console=console).strip()
+        try:
+            v = float(raw or default)
+        except ValueError:
+            console.print(f"[yellow]enter a number (≥{lo:g})[/]")
+            continue
+        if v < lo:
+            console.print(f"[yellow]enter a number ≥{lo:g}[/]")
+            continue
+        return v
 
 
 def _select_one(console: Console, title: str, options: list[tuple[str, str, bool]],
@@ -477,12 +498,50 @@ def run_quality_wizard(console: Console) -> QualityWizardResult:
                  "(behavior, rework, solve, milestones)", True),
         ("incremental", "incremental — teacher-forced per-step run of a recorded "
                         "session (paired A/B, cheap, no turn noise)", True),
+        ("view", "view an existing run — pick from stored results and re-render "
+                 "(free, never spends)", True),
     ])
-    return (_full_wizard if mode == "full" else _incremental_wizard)(console)
+    return {"full": _full_wizard, "incremental": _incremental_wizard,
+            "view": _view_wizard}[mode](console)
+
+
+def _view_wizard(console: Console) -> QualityWizardResult:
+    """Pick a stored quality run and hand it back for display — the wizard face of
+    `quality report` / `quality runs`. Never spends."""
+    from datetime import datetime
+
+    from .quality.report import discover_runs
+    infos = discover_runs()
+    if not infos:
+        console.print("[yellow]no stored quality runs found under results/ — "
+                      "generate one first[/]")
+        raise KeyboardInterrupt
+    opts = []
+    for i in infos[:20]:
+        when = datetime.fromtimestamp(Path(i["dir"]).stat().st_mtime).strftime("%m-%d %H:%M")
+        label = (f"{when}  {i['dir']}  [dim]{'+'.join(i['modes'])}"
+                 f" · {i['model'] or '?'} · {len(i['tasks'])} task(s)[/]")
+        opts.append((i["dir"], label, True))
+    chosen = _select_one(console, "stored quality runs — newest first", opts)
+    info = next(i for i in infos if i["dir"] == chosen)
+    arms = [a for a in info["arms"] if a not in ("vanilla", "control")]
+    return QualityWizardResult(
+        mode="view", model=None, out=chosen, arms=",".join(arms) or "condense,headroom",
+        tasks=",".join(info["tasks"]) or "5")
+
+
+def _resolve_tasks_safe(spec: str, org: str = "terminal-bench") -> tuple[list[str] | None, str]:
+    """resolve_tasks without the sys.exit: (tasks, "") or (None, why) — a bad spec or a
+    missing local dataset must re-prompt inside the wizard, not kill it."""
+    from .quality.engine import resolve_tasks
+    try:
+        return resolve_tasks(spec, org), ""
+    except SystemExit as e:
+        return None, str(e.code or "no tasks match")
 
 
 def _full_wizard(console: Console) -> QualityWizardResult:
-    from .quality.engine import DEFAULT_TASKS, resolve_tasks
+    from .quality.engine import task_meta
     _select_one(console, "dataset", [
         ("terminal-bench", "terminal-bench-2-1 — curated coding tasks WITH verifiers", True),
         ("swe-chat", "SWE-chat — recorded sessions (no verifiers; incremental only)", False),
@@ -493,26 +552,58 @@ def _full_wizard(console: Console) -> QualityWizardResult:
         ("headroom", "headroom — token proxy + retrieve loop (CCR)", True, True),
         ("headroom-kompress", "headroom-kompress — token compression, no retrieval (ablation)",
          True, False),
+        ("vanilla-proxy", "vanilla-proxy — passthrough control (isolates the proxy-wiring "
+                          "confound every proxy arm shares)", True, False),
     ])
-    t = Table(title="[bold]recommended tasks (short → long)", show_header=False, box=None)
-    for i, name in enumerate(DEFAULT_TASKS, 1):
-        t.add_row(f"[dim]{i:>2}[/] {name}{'   [green]← default 5[/]' if i == 5 else ''}")
-    console.print(t)
-    tasks = Prompt.ask("[cyan]tasks[/] (a number N = first N, random:N, comma names, blank = 5)",
-                       default="5", console=console).strip() or "5"
+    # Group shortcuts, biased toward sessions long enough that condense/headroom actually
+    # compact. The default 5 are SHORT tasks — an agent solves them without ever crossing
+    # the compaction threshold, so a compressing arm just passes through (nothing to measure).
+    compacts = any(a.startswith(("condense", "headroom")) for a in arms)
+    long_group = _resolve_tasks_safe("long")[0] or []
+    n_long, n_hard = len(long_group), len(_resolve_tasks_safe("hard")[0] or [])
+    n_all = len(_resolve_tasks_safe("all")[0] or [])
+    g = Table(title="[bold]pick a group[/] — or a number N, random:N, or comma-separated names",
+              show_header=False, box=None, padding=(0, 2, 0, 0))
+    g.add_row("[cyan]long[/]", f"{n_long} tasks · author budget ≥30m",
+              "[green]most likely to trigger compaction[/]")
+    g.add_row("[cyan]hard[/]", f"{n_hard} tasks · difficulty=hard", "")
+    g.add_row("[cyan]all[/]", f"{n_all} tasks", "the whole local set")
+    g.add_row("[cyan]5[/]", "first 5 recommended",
+              "[yellow]short — a compressing arm may just pass through[/]" if compacts
+              else "quick smoke set")
+    console.print(g)
+    if long_group:
+        # show the long group so the user sees what they'd get (length from the task timeout)
+        lg = Table(title="[dim]long group:[/]", show_header=False, box=None)
+        for name in long_group:
+            mins = int((task_meta(name)[0] or 0) // 60)
+            lg.add_row(f"[dim]{mins:>3}m[/]  {name}")
+        console.print(lg)
+    default_tasks = "long" if compacts and long_group else "5"
+    while True:  # validate the spec now — a typo must re-prompt, not die after preflight
+        tasks = Prompt.ask("[cyan]tasks[/] (group long|hard|all, a number N, random:N, "
+                           "comma names)", default=default_tasks, console=console
+                           ).strip() or default_tasks
+        task_list, why = _resolve_tasks_safe(tasks)
+        if task_list:
+            break
+        console.print(f"[yellow]{why}[/]")
     model = _pick_model(console)
-    k = int(Prompt.ask("[cyan]trials per arm[/] (k — ≥2 for a verdict; 4 recommended)",
-                       default="4", console=console) or 4)
-    budget = float(Prompt.ask("[cyan]per-trial $ cap[/]", default="5", console=console) or 5)
+    k = _ask_int(console, "[cyan]trials per arm[/] (k — ≥2 for a verdict; 4 recommended)",
+                 4, lo=1)
+    budget = _ask_float(console, "[cyan]per-trial $ cap[/]", 5.0)
     milestones = Confirm.ask("[cyan]also run the LLM milestone judge?[/]", default=True,
                              console=console)
     out = Prompt.ask("[cyan]output dir[/]", default="results/jobs/run", console=console).strip()
     _quality_preflight(console, arms, need_docker=True)
-    ntasks = len(resolve_tasks(tasks, "terminal-bench"))
-    kv, trials = k + 1, len(resolve_tasks(tasks, "terminal-bench")) * ((k + 1) + k * len(arms))
+    ntasks = len(task_list)
+    kv = k + 1
+    trials = ntasks * (kv + k * len(arms))
+    shown = ", ".join(task_list[:6]) + (f", … +{ntasks - 6}" if ntasks > 6 else "")
     console.print(Panel.fit(
-        f"[bold]full trajectories[/]   [bold]model[/] {model}   [bold]tasks[/] {ntasks}   "
-        f"[bold]k[/] {k} (vanilla {kv})\n[bold]arms[/] vanilla + {', '.join(arms)}\n"
+        f"[bold]full trajectories[/]   [bold]model[/] {model}   "
+        f"[bold]k[/] {k} (vanilla {kv})\n[bold]tasks[/] ({ntasks}) {shown}\n"
+        f"[bold]arms[/] vanilla + {', '.join(arms)}\n"
         f"[bold]milestones[/] {'yes' if milestones else 'no'}   [bold]out[/] {out}\n"
         f"[bold]{trials} trials[/], cost ceiling ~[bold]${trials * budget:.0f}[/] "
         f"(${budget:g}/trial cap)", title="ready", border_style="green"))
@@ -523,29 +614,41 @@ def _full_wizard(console: Console) -> QualityWizardResult:
 
 
 def _incremental_wizard(console: Console) -> QualityWizardResult:
-    from pathlib import Path
-
+    from .quality import engine as eng
     src = _select_one(console, "source session", [
         ("own", "your own Claude Code sessions (~/.claude/projects) — pick from a list", True),
         ("file", "a session .jsonl path", True),
         ("swechat", "SWE-chat cached conversations (coming soon here)", False),
     ])
-    session = swechat = None
+    swechat = None
     conv = 0
-    task = "session"
-    if src == "own":
-        from .counterfactual import pick_session
-        p = pick_session(console)  # the peak-ctx picker
-        session = str(p)
-        task = p.stem[:12]
-    else:  # file
-        raw = Prompt.ask("[cyan]session .jsonl path[/]", console=console).strip()
-        p = Path(raw).expanduser()
-        if not p.is_file():
-            console.print(f"[red]not a file:[/] {p}")
-            raise KeyboardInterrupt
-        session = str(p)
-        task = p.stem[:12]
+    ctx_gate = 50_000
+    # gate the pick NOW: a session whose peak context never crossed the compaction gate
+    # is a guaranteed passthrough — surfacing that after every knob is answered (as the
+    # runner's late SystemExit did) wastes the whole wizard walk.
+    while True:
+        if src == "own":
+            from .counterfactual import pick_session
+            p = pick_session(console)  # the peak-ctx picker
+        else:  # file
+            raw = Prompt.ask("[cyan]session .jsonl path[/]", console=console).strip()
+            p = Path(raw).expanduser()
+            if not p.is_file():
+                console.print(f"[red]not a file:[/] {p} — try again")
+                continue
+        peak = eng.peak_ctx(str(p))
+        if peak >= ctx_gate:
+            break
+        console.print(Panel.fit(
+            f"[yellow]{p.name}[/] peaks at [bold]{peak / 1000:.0f}k[/] context — below the "
+            f"[bold]{ctx_gate / 1000:.0f}k[/] compaction gate.\nNothing would be compacted, "
+            f"so there is nothing to compare.",
+            title="too short — not comparable", border_style="yellow"))
+        if Confirm.ask("[cyan]pick a different session?[/]", default=True, console=console):
+            continue
+        ctx_gate = 0  # deliberate override: replay it anyway
+        break
+    session, task = str(p), p.stem[:12]
     # show the session's own model so the inherit default is meaningful
     from .counterfactual import session_meta
     own = session_meta(Path(session)).get("model")
@@ -573,11 +676,9 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         model = QUALITY_MODELS[int(raw) - 1][0]
     else:
         model = raw
-    every = int(Prompt.ask("[cyan]sample every Nth decision point[/]", default="1",
-                           console=console) or 1)
-    limit = int(Prompt.ask("[cyan]max decision points[/] (0 = all)", default="0",
-                           console=console) or 0)
-    budget = float(Prompt.ask("[cyan]per-arm $ cap[/]", default="2", console=console) or 2)
+    every = _ask_int(console, "[cyan]sample every Nth decision point[/]", 1, lo=1)
+    limit = _ask_int(console, "[cyan]max decision points[/] (0 = all)", 0)
+    budget = _ask_float(console, "[cyan]per-arm $ cap[/]", 2.0)
     # faithful capture: run the version-matched Claude Code binary once, LOCALLY, to
     # capture the EXACT system prompt + tools + CLAUDE.md your run used — instead of an
     # approximate frozen template. Consent + full transparency, per the user's ask.
@@ -618,4 +719,4 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     return QualityWizardResult(mode="incremental", source=src, session=session, swechat=swechat,
                                conv=conv, task=task, arms=",".join(arms), model=model,
                                every=every, limit=limit, budget_usd=budget, out=out,
-                               judge=judge, capture=capture)
+                               judge=judge, capture=capture, ctx_gate=ctx_gate)

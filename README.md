@@ -227,8 +227,11 @@ vanilla's **peak context** per task and marks tasks **⊘** when it stays under 
 (`--ctx-gate`, default 50k): on a ⊘ task no compaction/compression fired, so a length ✗ there
 measures the arm's *wiring and behavioral* side-effects, not compaction damage. (One such effect
 we measured: Claude Code composes a ~8-9k-token-larger request whenever `ANTHROPIC_BASE_URL` is
-non-default, a flat confound shared by every proxy arm — isolating it cleanly needs a passthrough
-vanilla-proxy control arm, which is on the roadmap.) Compaction *quality* claims must come from
+non-default, a flat confound shared by every proxy arm. The **`vanilla-proxy` arm** isolates it:
+vanilla routed through a do-nothing local forwarder — same wiring, zero content change — so
+vanilla-proxy vs vanilla is the wiring effect alone, and a proxy arm read against vanilla-proxy
+has the confound subtracted. Add it with `--arms condense,headroom,vanilla-proxy` or tick it in
+the wizard.) Compaction *quality* claims must come from
 tasks whose vanilla runs clear the gate — the long half of the curated list.
 
 A verdict is **✓** if the method's band *overlaps* vanilla's, **✗** if disjoint — and needs
@@ -264,6 +267,7 @@ uv run minmax-bench quality run
 # tasks (--list-tasks shows all; --tasks 2, --tasks random:8 --seed 42, or a,b):
 uv run minmax-bench quality run -m claude-haiku-4-5 --tasks 5 --milestones --out results/jobs/run1
 uv run minmax-bench quality report --from results/jobs/run1 --tasks 5     # pure display, free
+uv run minmax-bench quality runs        # list every stored quality run (full + incremental), free
 # also: `quality incremental --session <f> --task <t>` (teacher-forced per-step), `quality judge`.
 # The scripts/ wrappers (`python3 scripts/generate.py …`) still work identically.
 ```
