@@ -59,6 +59,7 @@ def quality_run(
     k: int = typer.Option(4, "--k", help="Trials per arm/task."),
     k_vanilla: int | None = typer.Option(None, "--k-vanilla", help="Trials for the vanilla baseline (default k+1)."),
     budget_usd: float = typer.Option(5.0, "--budget-usd", help="Per-trial spend cap (Harbor max_budget_usd)."),
+    wall_timeout: int = typer.Option(2400, "--wall-timeout", help="Per-trial wall-clock FLOOR (seconds). The effective cap auto-sizes up to each task's own author budget (× the arm's exec multiplier) + build/setup/verify overhead, so long tasks aren't guillotined; raise this to give slow arms even more room."),
     concurrency: int = typer.Option(1, "--concurrency", help="Parallel trials per cell (harbor -n)."),
     milestones: bool = typer.Option(False, "--milestones", help="Also run the LLM milestone judge."),
     out: str = typer.Option("results/jobs/run", "--out", help="Results root."),
@@ -102,7 +103,8 @@ def quality_run(
         arms, tasks, model, k, budget_usd, milestones, out = (
             w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out)
     argv = ["--mode", "full", "--arms", arms, "--dataset", dataset, "--out", out,
-            "--k", str(k), "--budget-usd", str(budget_usd), "--concurrency", str(concurrency)]
+            "--k", str(k), "--budget-usd", str(budget_usd), "--concurrency", str(concurrency),
+            "--wall-timeout", str(wall_timeout)]
     _flag(argv, "--tasks", tasks)
     _flag(argv, "--model", model)
     _flag(argv, "--k-vanilla", k_vanilla)

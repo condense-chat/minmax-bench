@@ -109,6 +109,27 @@ def _k_for(args, arm):
     return (args.k_vanilla or args.k + 1) if arm == "vanilla" else args.k
 
 
+# container build + agent-setup + verify slack to add on top of a task's EXECUTION budget,
+# beyond the setup-timeout allotment (360s × setup_timeout_mult) itself. ~build 600 + verify.
+_WALL_OVERHEAD_PAD = 900
+
+
+def _wall_cap(args, task_budget_sec, exec_mult):
+    """Per-trial wall-clock budget in seconds. AUTO-SIZED to the task's own author budget so
+    a long task is never killed below what it was designed for.
+
+    A flat --wall-timeout is a floor, not the whole budget: the harness must also cover the
+    agent's execution budget (task timeout_sec × this arm's exec multiplier — headroom runs
+    at 3×) and the one-time-per-trial container build + agent-setup + verify overhead. The
+    old flat 2400s default undercut every task whose author budget exceeded it (regex-chess,
+    train-fasttext, video-processing are all 3600s), guillotining them for EVERY arm.
+    args.wall_timeout stays a hard floor the user can raise further.
+    """
+    setup = 360 * args.setup_timeout_mult          # harbor agent-setup timeout (×mult)
+    needed = int((task_budget_sec or 0) * exec_mult + setup + _WALL_OVERHEAD_PAD)
+    return max(args.wall_timeout, needed)
+
+
 def _arm_wiring(arm, env):
     """(base_url, allow_host, harbor_agent, extra_flags) for an arm — how a real user deploys it."""
     if arm == "vanilla":
@@ -401,14 +422,21 @@ def full(args, env):
                                "started_utc": datetime.now(UTC).isoformat(timespec="seconds")},
                               open(f"{cell}/attempted.json", "w"))
                     timed_out = False
-                    # per-trial wall budget scaled to the trials actually run. tracked Popen (not
-                    # subprocess.run) so an interrupt/timeout terminates the harbor child and waits
-                    # for its container/network teardown BEFORE the reaper runs.
+                    # per-trial wall budget AUTO-SIZED to the task's own author budget so a long
+                    # task is never guillotined below what it was designed for — the harness cap
+                    # must cover agent EXECUTION (task timeout_sec × this arm's exec multiplier,
+                    # e.g. headroom's 3×) PLUS container build + agent setup + verify overhead.
+                    # args.wall_timeout is a FLOOR the user can raise, not the whole story: a flat
+                    # 2400s default silently killed every task whose author budget (some 3600s)
+                    # exceeded it, for every arm. See _wall_cap.
+                    per_trial = _wall_cap(args, eng.task_meta(task)[0], mult or 1)
+                    # tracked Popen (not subprocess.run) so an interrupt/timeout terminates the
+                    # harbor child and waits for its container/network teardown BEFORE the reaper.
                     with open(f"{out}/_runlog.txt", "a") as runlog:
                         proc = subprocess.Popen(cmd, env=renv, stdout=runlog,
                                                 stderr=subprocess.STDOUT)
                         _HARBOR[0] = proc
-                        cap = args.wall_timeout * run_k
+                        cap = per_trial * run_k
                         cell_start = grid.state[(arm, task)]["start"]
                         try:
                             while proc.poll() is None:
