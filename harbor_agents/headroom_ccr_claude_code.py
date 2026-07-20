@@ -51,13 +51,18 @@ class HeadroomCcrClaudeCode(ClaudeCode):
             ),
             env={"DEBIAN_FRONTEND": "noninteractive"},
         )
-        # headroom-ai does NOT pull the `mcp` SDK, but `headroom mcp serve` needs it — install both.
+        # Two non-obvious deps, or even `headroom --version` crashes at import:
+        #   - the `mcp` SDK: headroom-ai doesn't pull it, but `headroom mcp serve` needs it.
+        #   - the `[proxy]` extra (fastapi): since 0.32.0 the CLI's _register_commands() imports
+        #     headroom.proxy.request_scope -> `from fastapi import Request` at load time, so a bare
+        #     `pip install headroom-ai` yields a CLI that ModuleNotFoundErrors on every subcommand.
         await self.exec_as_agent(
             environment,
             command=(
                 'export PATH="$HOME/.local/bin:$PATH"; '
-                "python3 -m pip install --user --quiet --break-system-packages headroom-ai mcp "
-                "|| python3 -m pip install --user --quiet headroom-ai mcp; "
+                "python3 -m pip install --user --quiet --break-system-packages "
+                "'headroom-ai[proxy]' mcp "
+                "|| python3 -m pip install --user --quiet 'headroom-ai[proxy]' mcp; "
                 "headroom --version"
             ),
         )
