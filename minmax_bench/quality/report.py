@@ -578,11 +578,11 @@ def main(argv=None):
 # and INCREMENTAL teacher-forced per-step (scoring, compression, faithfulness, cost) — each
 # with control on its own row. rework/milestone/ctx detail stays in report.html.
 _FULL_LEGEND = (
-    "one table per arm; each row a task. van len/tok/$ = the vanilla baseline (mean steps, "
-    "total tokens, USD/trial) — the shared reference, dim. The arm's len/tok/$ are its mean vs "
-    "vanilla, signed and coloured INDEPENDENTLY: green below vanilla's spread (shorter / saved), "
-    "red above (longer / costlier), dim within — so an arm that cuts tokens yet costs more, the "
-    "cache-bust tax, shows green next to red. verdict = length preservation (the load-bearing "
+    "one table per arm; each row a task. length / tokens / $ each show [dim]vanilla[/]→arm (mean "
+    "steps, total tokens, USD/trial) with the signed delta below, coloured INDEPENDENTLY: green "
+    "below vanilla's spread (shorter / saved), red above (longer / costlier), dim within — so an "
+    "arm that cuts tokens yet costs more, the cache-bust tax, shows green next to red. verdict = "
+    "length preservation (the load-bearing "
     "axis): same work (within vanilla's band) / drifted ↑ longer / shorter ↓ / ⊘ too short "
     "(vanilla never crossed the compaction gate — nothing compacted, so any change is "
     "behavioural, not compaction). n1 = single run, a trend not a verdict (needs ≥2/arm). "
@@ -666,6 +666,19 @@ def _metric_cell(ctrl_list, arm_list, fmt):
     if am < lo:
         return f"[green]{val}[/] [green]{tag}[/]"
     return f"{val} [dim]{tag}[/]"
+
+
+def _cmp_cell(ctrl_list, arm_list, fmt):
+    """vanilla→arm for one metric on line 1, the signed delta below. arm value + delta coloured
+    vs vanilla's band: green below the spread (shorter/saved), red above (longer/costlier), dim
+    within. One column per metric instead of two, so the table stays readable."""
+    if not ctrl_list or not arm_list:
+        return _DASH
+    lo, hi = min(ctrl_list), max(ctrl_list)
+    cm, am = sum(ctrl_list) / len(ctrl_list), sum(arm_list) / len(arm_list)
+    color = "green" if am < lo else "red" if am > hi else "dim"
+    tag = f"{(am / cm - 1) * 100:+.0f}%" if cm else ""
+    return f"[dim]{fmt(cm)}[/]→[{color}]{fmt(am)}[/]\n[{color}]{tag}[/]"
 
 
 def _milestone_cell(a):
@@ -814,10 +827,10 @@ def _full_table(console, d, model):
                   caption_justify="left", caption_style="dim", pad_edge=False)
         has_ms = d.get("has_milestone")
         t.add_column("task", no_wrap=True)
-        for c in ("len", "tok", "$"):
-            t.add_column(f"van {c}", justify="right", style="dim")
-        for c in ("len", "tok", "$"):
-            t.add_column(f"{arm[:8]} {c}", justify="right")
+        # one column per metric, each showing vanilla→arm + delta (see _cmp_cell) — far less
+        # crammed than separate vanilla/arm columns, and the arm's absolute value is still there
+        for c in ("length", "tokens", "$"):
+            t.add_column(c, justify="right")
         t.add_column("verdict", justify="left", no_wrap=True)
         if has_ms:
             t.add_column("milestone", justify="right")  # subgoals reached vs vanilla
@@ -828,11 +841,9 @@ def _full_table(console, d, model):
                         f"solve {a['solve']}/{a['attempted']}[/]")
             cells = [
                 taskcell,
-                f"[dim]{v['length'][1]:.0f}[/]" if v["length"] else _DASH,
-                _metric_base(v["_toks"], _TOKFMT), _metric_base(v["_costs"], _USDFMT),
-                _metric_cell(v["_lens"], a["_lens"], _LENFMT),
-                _metric_cell(v["_toks"], a["_toks"], _TOKFMT),
-                _metric_cell(v["_costs"], a["_costs"], _USDFMT),
+                _cmp_cell(v["_lens"], a["_lens"], _LENFMT),
+                _cmp_cell(v["_toks"], a["_toks"], _TOKFMT),
+                _cmp_cell(v["_costs"], a["_costs"], _USDFMT),
                 _verdict_cell(v, a, sub),
             ]
             if has_ms:
