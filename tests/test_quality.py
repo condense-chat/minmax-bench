@@ -421,8 +421,9 @@ def test_peek_reports_peak_context(tmp_path):
                                                     "cache_read_input_tokens": 8000}}},  # after
     ]
     sess.write_text("\n".join(json.dumps(x) for x in lines))
-    prompt, cwd, has_assistant, peak, capped = _peek(sess)
+    prompt, cwd, has_assistant, peak, total, capped = _peek(sess)
     assert has_assistant and peak == 40020 and not capped  # peak, not last, not first
+    assert total == 5010 + 40020 + 8020  # total = every turn's context summed
 
 
 def test_step_verdict_and_redundancy():

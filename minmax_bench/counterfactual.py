@@ -54,6 +54,7 @@ class LocalSession:
     prompt: str           # first user text, for the picker
     cwd: str | None
     peak_ctx: int         # peak per-request context tokens the session actually used
+    total_ctx: int        # sum of per-request context across all turns (cumulative volume)
 
 
 # cap the per-file read that computes peak context, so a multi-GB transcript
@@ -61,15 +62,16 @@ class LocalSession:
 _PEEK_BYTE_CAP = 12_000_000
 
 
-def _peek(path: Path, max_lines: int = 300) -> tuple[str, str | None, bool, int, bool]:
-    """(prompt, cwd, has_assistant, peak_ctx, capped) from a session file.
+def _peek(path: Path, max_lines: int = 300) -> tuple[str, str | None, bool, int, int, bool]:
+    """(prompt, cwd, has_assistant, peak_ctx, total_ctx, capped) from a session file.
 
-    peak_ctx is the largest per-request context (input + cache read + cache write)
-    across the session's assistant turns — the number that decides whether a replay
-    would ever cross a compaction threshold. Only lines containing a usage block are
-    parsed, and the read stops at _PEEK_BYTE_CAP so giant transcripts stay cheap.
+    peak_ctx is the largest per-request context (input + cache read + cache write) across the
+    session's assistant turns — it decides whether a replay would ever cross a compaction
+    threshold. total_ctx sums that per-request context over ALL turns — the cumulative volume
+    the session churned (≈ avg context × turns), a different axis from peak. Only lines with a
+    usage block are parsed, and the read stops at _PEEK_BYTE_CAP so giant transcripts stay cheap.
     """
-    prompt, cwd, has_assistant, peak, capped, read = "", None, False, 0, False, 0
+    prompt, cwd, has_assistant, peak, total, capped, read = "", None, False, 0, 0, False, 0
     try:
         with path.open(encoding="utf-8") as fh:
             for n, line in enumerate(fh):
@@ -85,7 +87,7 @@ def _peek(path: Path, max_lines: int = 300) -> tuple[str, str | None, bool, int,
                 except json.JSONDecodeError:
                     continue
                 if rec.get("isSidechain"):
-                    return "", None, False, 0, False  # sub-agent transcript
+                    return "", None, False, 0, 0, False  # sub-agent transcript
                 if head:
                     cwd = cwd or rec.get("cwd")
                     if rec.get("type") == "assistant":
@@ -104,10 +106,12 @@ def _peek(path: Path, max_lines: int = 300) -> tuple[str, str | None, bool, int,
                 u = rec.get("message", {}).get("usage") if rec.get("type") == "assistant" else None
                 if isinstance(u, dict):
                     has_assistant = True
-                    peak = max(peak, eng.ctx_tokens(u))
+                    ct = eng.ctx_tokens(u)
+                    peak = max(peak, ct)
+                    total += ct
     except OSError:
-        return "", None, False, 0, False
-    return " ".join(prompt.split())[:90], cwd, has_assistant, peak, capped
+        return "", None, False, 0, 0, False
+    return " ".join(prompt.split())[:90], cwd, has_assistant, peak, total, capped
 
 
 def scan_sessions(root: Path = CC_PROJECTS, limit: int = 25) -> list[LocalSession]:
@@ -116,22 +120,35 @@ def scan_sessions(root: Path = CC_PROJECTS, limit: int = 25) -> list[LocalSessio
     for f in sorted(root.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
         if len(found) >= limit:
             break
-        prompt, cwd, has_assistant, peak, capped = _peek(f)
+        prompt, cwd, has_assistant, peak, total, capped = _peek(f)
         if not has_assistant:
             continue
         found.append(LocalSession(
             path=f, project=cwd or f.parent.name,  # cwd is exact; the dir name is a lossy slug
             mtime=f.stat().st_mtime, size=f.stat().st_size, prompt=prompt, cwd=cwd,
-            peak_ctx=peak if not capped else -peak,  # negative marks a capped (lower-bound) read
+            # negative marks a capped (lower-bound) read for BOTH: total truncates at the byte cap
+            peak_ctx=peak if not capped else -peak,
+            total_ctx=total if not capped else -total,
         ))
     return found
 
 
-def _fmt_ctx(peak: int) -> str:
-    """Peak context tokens for the picker; a capped read (peak < 0) shows '≥'."""
-    v = abs(peak)
-    body = f"{v / 1000:.0f}k" if v >= 1000 else str(v)
-    return (">" + body) if peak < 0 else body
+def _fmt_ctx(v: int) -> str:
+    """Context tokens for the picker; a capped read (v < 0) shows '>' (a lower bound). Scales
+    k/M/B — peak stays in the k–M range, but total (cache-reads re-counted each turn) reaches
+    the hundreds of millions on long sessions."""
+    n = abs(v)
+    if n >= 1_000_000_000:
+        body = f"{n / 1e9:.1f}B"
+    elif n >= 10_000_000:
+        body = f"{n / 1e6:.0f}M"
+    elif n >= 1_000_000:
+        body = f"{n / 1e6:.1f}M"
+    elif n >= 1000:
+        body = f"{n / 1000:.0f}k"
+    else:
+        body = str(n)
+    return (">" + body) if v < 0 else body
 
 
 def pick_session(console: Console) -> Path:
@@ -143,12 +160,14 @@ def pick_session(console: Console) -> Path:
     t.add_column("#", justify="right", style="dim")
     t.add_column("when", style="dim")
     t.add_column("project")
-    t.add_column("peak ctx", justify="right")  # peak per-request context tokens actually used
-    t.add_column("first prompt", max_width=52)
+    t.add_column("peak ctx", justify="right")   # largest single-turn context — gates compaction
+    t.add_column("total ctx", justify="right")  # cumulative context across all turns (volume)
+    t.add_column("first prompt", max_width=48)
     for i, s in enumerate(sessions, 1):
         t.add_row(str(i), datetime.fromtimestamp(s.mtime).strftime("%m-%d %H:%M"),
                   ("…" + s.project[-38:]) if len(s.project) > 39 else s.project,
-                  _fmt_ctx(s.peak_ctx), s.prompt or "[dim](no text prompt)[/]")
+                  _fmt_ctx(s.peak_ctx), f"[dim]{_fmt_ctx(s.total_ctx)}[/]",
+                  s.prompt or "[dim](no text prompt)[/]")
     console.print(t)
     raw = Prompt.ask("[cyan]session[/] (number or a /path/to/session.jsonl)",
                      console=console).strip()
