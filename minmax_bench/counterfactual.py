@@ -291,7 +291,7 @@ def rejudge_run(run_dir: str, *, judge: str, env: dict, console: Console,
 
 
 # --------------------------------------------------------------------------- replay
-def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, every: int,
+def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,
            model: str | None = None, auth: str = "auto", task: str = "session",
            judge: str = "off", capture: bool = False, headroom_mode: str = "token",
@@ -498,19 +498,14 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     args = SimpleNamespace(max_tokens=max_tokens, strip_thinking=strip_thinking,
                            swechat=None, keep_all_tools=True, drop_beta_config=drop_beta)
 
-    sel = points[:: max(1, every)]
+    # every decision point, in order — a contiguous nested-prefix sequence so the incremental
+    # prompt-cache model is faithful (each step writes a 1-turn delta, reads the rest). --limit
+    # trims to the first N (still contiguous, still faithful); strided sampling was removed
+    # because it writes N-turn cache deltas and can straddle condense's cache-bust events,
+    # distorting the compaction % / $ numbers.
+    sel = list(points)
     if limit:
         sel = sel[:limit]
-    if every > 1:
-        # faithfulness is per-step (each sampled decision is teacher-forced independently), so
-        # --every N is fine there. But compaction % / $ savings become a SUBSAMPLE with coarser
-        # cache granularity: each sampled step writes an N-turn cache delta, not the 1-turn deltas
-        # a real per-turn agent (and --every 1) write, and condense's threshold-gated cache-BUST
-        # events can fall between samples. So the cost/compaction numbers are approximate.
-        console.print(f"[yellow]--every {every}: 1-of-{every} steps. faithfulness is unaffected, "
-                      f"but compaction % / $ savings become a coarse SUBSAMPLE (each sampled step "
-                      f"writes an {every}-turn cache delta, and condense's cache-bust events can "
-                      f"fall between samples) — use [bold]--every 1[/] for a faithful cost number.[/]")
     lo, hi = estimate_usd(msgs, [i for i in sel], eng.rates_for(replay_model))
 
     console.print(Panel.fit(

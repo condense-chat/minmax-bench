@@ -390,7 +390,6 @@ class QualityWizardResult:
     swechat: str | None = None
     conv: int = 0
     task: str = "session"
-    every: int = 1
     limit: int = 0
     judge: str = "off"
     capture: bool = False
@@ -700,8 +699,7 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         model = QUALITY_MODELS[int(raw) - 1][0]
     else:
         model = raw
-    every = _ask_int(console, "[cyan]sample every Nth decision point[/]", 1, lo=1)
-    limit = _ask_int(console, "[cyan]max decision points[/] (0 = all)", 0)
+    limit = _ask_int(console, "[cyan]max decision points[/] (0 = all; contiguous from the start)", 0)
     budget = _ask_float(console, "[cyan]per-arm $ cap[/]", 2.0)
     # control runs first; by default the later arms are capped at the steps control reached
     # within budget — the paired comparison window, so no arm over-replays steps that have no
@@ -758,7 +756,7 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         raise KeyboardInterrupt
     return QualityWizardResult(mode="incremental", source=src, session=session, swechat=swechat,
                                conv=conv, task=task, arms=",".join(arms), model=model,
-                               every=every, limit=limit, budget_usd=budget, out=out,
+                               limit=limit, budget_usd=budget, out=out,
                                judge=judge, capture=capture, ctx_gate=ctx_gate,
                                independent_budgets=independent_budgets, resume=resume, auth=auth)
 

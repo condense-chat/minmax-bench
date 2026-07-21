@@ -644,7 +644,7 @@ def incremental(args, env):
     if "headroom" in arms:
         proxy = _start_proxy(args.out, args.headroom_mode)
 
-    sel = points[:: max(1, args.every)]
+    sel = list(points)  # contiguous; strided --every removed (distorts cache/compaction cost)
     if args.limit:
         sel = sel[: args.limit]
     sid = str(uuid.uuid4())
@@ -862,7 +862,6 @@ def main(argv=None):
                     help="task name for incremental artifacts; MUST match the --tasks name "
                          "you will pass to report.py or the comp/$Δ/fid columns can't join")
     ap.add_argument("--template", default="data/cc_request_template.json")
-    ap.add_argument("--every", type=int, default=1)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--max-tokens", type=int, default=6000)
     ap.add_argument("--strip-thinking", action="store_true")

@@ -103,7 +103,7 @@ def quality_run(
             report_main(["--from", w.out, "--arms", w.arms, "--tasks", w.tasks])
             return
         if w.mode == "incremental":
-            _run_incremental(session=w.session, arms=w.arms, model=w.model, every=w.every,
+            _run_incremental(session=w.session, arms=w.arms, model=w.model,
                              limit=w.limit, budget_usd=w.budget_usd, max_tokens=6000,
                              out=w.out, task=w.task, auth=w.auth, assume_yes=True, judge=w.judge,
                              capture=w.capture, ctx_gate=w.ctx_gate,
@@ -210,7 +210,7 @@ def quality_rejudge(
         raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
 
 
-def _run_incremental(*, session: str | None, arms: str, model: str | None, every: int,
+def _run_incremental(*, session: str | None, arms: str, model: str | None,
                      limit: int, budget_usd: float, max_tokens: int, out: str, task: str,
                      auth: str, assume_yes: bool, judge: str = "off", steps: bool = True,
                      capture: bool = False, headroom_mode: str = "token", ccr: bool = True,
@@ -226,7 +226,7 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None, every
         raise typer.BadParameter(f"not a session file: {sp}")
     arm_list = [a.strip() for a in arms.split(",") if a.strip() and a.strip() != "control"]
     try:
-        summary = replay(sp, arm_list, budget_usd=budget_usd, limit=limit, every=every,
+        summary = replay(sp, arm_list, budget_usd=budget_usd, limit=limit,
                          max_tokens=max_tokens, out_dir=Path(out), console=console,
                          assume_yes=assume_yes, model=model, auth=auth, task=task, judge=judge,
                          capture=capture, headroom_mode=headroom_mode, ccr=ccr, ctx_gate=ctx_gate,
@@ -245,8 +245,7 @@ def quality_incremental(
     session: str | None = typer.Argument(None, help="A session .jsonl (default: pick from ~/.claude/projects)."),
     arms: str = typer.Option("condense", "--arms", help="Arms to compare besides control (condense, headroom)."),
     model: str | None = typer.Option(None, "--model", "-m", help="Model to run the incremental on (default: the session's own, with auto-fallback if an arm can't serve it)."),
-    every: int = typer.Option(1, "--every", help="Sample every Nth decision point."),
-    limit: int = typer.Option(0, "--limit", "-n", help="Max decision points (0 = all)."),
+    limit: int = typer.Option(0, "--limit", "-n", help="Max decision points, contiguous from the start (0 = all). Strided sampling was removed — it distorted the cost/compaction numbers."),
     budget_usd: float = typer.Option(2.0, "--budget-usd", help="Per-arm spend cap (control included)."),
     max_tokens: int = typer.Option(6000, "--max-tokens", help="Per-step output cap."),
     out: str | None = typer.Option(None, "--out", help="Output dir (default results/incremental/<session>-<ts>)."),
@@ -273,7 +272,7 @@ def quality_incremental(
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     stem = Path(session).stem[:8] if session else "picked"
     out_dir = out or str(Path("results/incremental") / f"{stem}-{stamp}")
-    _run_incremental(session=session, arms=arms, model=model, every=every, limit=limit,
+    _run_incremental(session=session, arms=arms, model=model, limit=limit,
                      budget_usd=budget_usd, max_tokens=max_tokens, out=out_dir, task=task,
                      auth=auth, assume_yes=yes, judge=judge, steps=steps, capture=capture,
                      headroom_mode=headroom_mode, ccr=ccr, ctx_gate=ctx_gate,
