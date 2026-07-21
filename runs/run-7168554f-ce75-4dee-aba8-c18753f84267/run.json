@@ -1,0 +1,33 @@
+{
+  "uuid": "7168554f-ce75-4dee-aba8-c18753f84267",
+  "created_utc": "2026-07-18T08:10:38+00:00",
+  "dataset": "claude-code:/Users/mariopenglee/.claude/projects/-Users-mariopenglee-dev-tokenminning-bench/c1e6023b-5d1b-4890-93af-91d882f6013b.jsonl",
+  "strategies": [
+    "headroom",
+    "headroom-kompress",
+    "condense-sync",
+    "condense-async"
+  ],
+  "models": [
+    "claude-sonnet-5"
+  ],
+  "encoding": "o200k_base",
+  "count_mode": "local",
+  "max_tokens": 1,
+  "edges": [
+    16000,
+    32000,
+    100000,
+    200000
+  ],
+  "session_limit": null,
+  "point_limit": null,
+  "longest": null,
+  "token_limit": null,
+  "session_ids": [
+    "c1e6023b-5d1b-4890-93af-91d882f6013b"
+  ],
+  "session_test_uuids": {
+    "claude-sonnet-5::c1e6023b-5d1b-4890-93af-91d882f6013b": "dda6b45e-21f9-546e-ab7c-64a445b9718d"
+  }
+}

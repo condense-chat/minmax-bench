@@ -56,10 +56,17 @@ Two measurement paths (executors):
 Requires [uv](https://docs.astral.sh/uv/) and Python ≥ 3.11.
 
 ```bash
-uv sync                 # core
-uv sync --extra hf      # + HuggingFace loaders for the SWE-chat dataset
-cp .env.dist .env       # then fill in only the keys for what you run
+uv sync                       # core
+uv sync --extra hf            # + HuggingFace loaders for the SWE-chat dataset
+uv run minmax-bench setup     # guided: detect creds, fill in keys, write .env
 ```
+
+`setup` is a guided wizard — it shows what's already configured (masked), then walks you
+through Anthropic access (an API key **or** your Claude Code login), the condense-arm key, and
+the optional dataset token, and writes `.env` for you (updating keys in place, preserving the
+rest). Prefer to do it by hand? `cp .env.dist .env` and fill in only what you run.
+`minmax-bench info` prints the **resolved** state at any time — including which auth mode is
+actually active.
 
 ### What you need, per feature
 
@@ -76,8 +83,11 @@ bench authenticates the way Claude Code itself does, using your own login: it ch
 `CLAUDE_CODE_OAUTH_TOKEN` (mint one with `claude setup-token`), then
 `~/.claude/.credentials.json`, then the macOS keychain entry Claude Code maintains. Replays
 are Claude Code-shaped requests over your own sessions; usage draws on your plan, the token
-never leaves your machine except toward the endpoint an arm points at, and the run banner
-says `auth: Claude Code subscription` so it's never implicit.
+never leaves your machine except toward the endpoint an arm points at, and every run prints an
+`auth:` line so it's never implicit. If you have **both** a key and a login configured, `auto`
+prefers the key — force the other per-run with `--auth subscription` / `--auth api-key`, or the
+wizard's auth toggle (which only appears when both are present). Watch it: a subscription's
+rate limits are far tighter than API billing, so a large full matrix is better on a key.
 
 ## Quick start (offline, no keys)
 
@@ -277,6 +287,23 @@ uv run minmax-bench quality runs        # list every stored quality run (full + 
 vanilla baseline (the noise floor every arm is judged against — the extra run sharpens
 every verdict). `--dataset` selects the harbor dataset; only
 `terminal-bench/terminal-bench-2-1` is validated so far.
+
+**Run control** (full mode) — all exposed in the wizard and as flags:
+
+- **Resume is automatic.** Re-run the *same command / `--out`* and finished cells (any with a
+  verifier result, pass or fail) are skipped — only cells missing trials re-run. `--force`
+  ("full retry" in the wizard) re-runs everything from scratch instead.
+- **`--retries N`** re-attempts a cell that *crashed or timed out* (no verifier result) until
+  every trial resolves to a verdict or the attempts run out — a trial that ran and scored (even
+  0) is a real result and is **not** retried.
+- **`--wall-timeout`** is a per-trial floor; the effective cap **auto-sizes** to each task's own
+  author budget (× the arm's exec multiplier) + build/setup/verify overhead, so a long task is
+  never guillotined below what it was designed for.
+
+For **incremental**, arms run control-first and each later arm is **capped at the steps control
+reached** within budget (the paired comparison window — no spend on steps with no control
+counterpart); `--independent-budgets` restores per-arm budgets. `--resume`/`--no-resume` skips
+arms already finished (a cancel mid-run picks up at the next arm instead of re-running control).
 
 The quality bench is **pure standard library** — nothing to install to *analyze* runs; Docker + Harbor
 are only needed to *generate* them.

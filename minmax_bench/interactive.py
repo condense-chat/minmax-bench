@@ -376,6 +376,7 @@ class QualityWizardResult:
     arms: str
     model: str | None
     out: str
+    auth: str = "auto"              # auto | api-key | subscription (choice when both present)
     # full
     tasks: str = "5"
     k: int = 4
@@ -599,6 +600,7 @@ def _full_wizard(console: Console) -> QualityWizardResult:
     milestones = Confirm.ask("[cyan]also run the LLM milestone judge?[/]", default=True,
                              console=console)
     out = Prompt.ask("[cyan]output dir[/]", default="results/jobs/run", console=console).strip()
+    auth = _auth_choice(console)  # only prompts when both an API key AND a subscription exist
     # resume vs full retry: by default an existing out dir is RESUMED — only cells missing
     # trials (crashes, timeouts, interrupts) re-run; completed cells (incl. reward-0) are kept
     # and cost nothing. "Full retry" forces every cell to re-run from scratch (--force), which
@@ -625,14 +627,14 @@ def _full_wizard(console: Console) -> QualityWizardResult:
         f"[bold]arms[/] vanilla + {', '.join(arms)}\n"
         f"[bold]milestones[/] {'yes' if milestones else 'no'}   [bold]out[/] {out}\n"
         f"[bold]mode[/] {'[red]full retry (re-run all)[/]' if force else 'resume (fill missing)'}"
-        f"{f'  ·  auto-retry ×{retries}' if retries else ''}\n"
+        f"{f'  ·  auto-retry ×{retries}' if retries else ''}   [bold]auth[/] {auth}\n"
         f"[bold]{trials} trials[/], cost ceiling ~[bold]${trials * budget:.0f}[/] "
         f"(${budget:g}/trial cap)", title="ready", border_style="green"))
     if not Confirm.ask("[cyan]run it?[/]", default=False, console=console):
         raise KeyboardInterrupt
     return QualityWizardResult(mode="full", arms=",".join(arms), tasks=tasks, model=model,
                                k=k, budget_usd=budget, milestones=milestones, out=out,
-                               force=force, retries=retries)
+                               force=force, retries=retries, auth=auth)
 
 
 def _incremental_wizard(console: Console) -> QualityWizardResult:
@@ -738,6 +740,7 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     # arm has no sentinel and re-runs. Only meaningful when reusing an out; harmless otherwise.
     resume = Confirm.ask("[cyan]resume?[/] (skip arms already complete in this out dir; a "
                          "cancelled arm re-runs)", default=True, console=console)
+    auth = _auth_choice(console)  # only prompts when both an API key AND a subscription exist
     _quality_preflight(console, arms, need_docker=False)
     model_lbl = f"inherit ({own})" if model is None else model
     console.print(Panel.fit(
@@ -749,7 +752,7 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         f"[bold]scoring[/] {judge}\n"
         f"[bold]per-arm cap[/] ${budget:g}   "
         f"[bold]window[/] {'independent budgets' if independent_budgets else 'cap to control'}   "
-        f"[bold]resume[/] {'yes' if resume else 'no'}   [bold]out[/] {out}",
+        f"[bold]resume[/] {'yes' if resume else 'no'}   [bold]auth[/] {auth}   [bold]out[/] {out}",
         title="ready", border_style="green"))
     if not Confirm.ask("[cyan]run the incremental?[/]", default=False, console=console):
         raise KeyboardInterrupt
@@ -757,4 +760,134 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
                                conv=conv, task=task, arms=",".join(arms), model=model,
                                every=every, limit=limit, budget_usd=budget, out=out,
                                judge=judge, capture=capture, ctx_gate=ctx_gate,
-                               independent_budgets=independent_budgets, resume=resume)
+                               independent_budgets=independent_budgets, resume=resume, auth=auth)
+
+
+# --------------------------------------------------------------------- auth + setup
+def _auth_choice(console: Console) -> str:
+    """Which Anthropic credential to spend. 'auto' unless BOTH an API key AND a Claude Code
+    subscription are configured — then let the user pick, since 'auto' silently prefers the key
+    and a subscription user would want to say so."""
+    import os
+
+    from .quality.engine import cc_oauth_token, load_env
+    env = {**load_env(), **os.environ}
+    if not (env.get("ANTHROPIC_API_KEY") and cc_oauth_token()):
+        return "auto"  # only one credential present — nothing to choose
+    return _select_one(console, "both an API key and a Claude Code login are configured — "
+                       "which should this run spend?", [
+        ("api-key", "API key — API billing", True),
+        ("subscription", "Claude Code subscription — draws on your plan, no API-key spend", True),
+    ])
+
+
+def _upsert_env(path: Path, updates: dict) -> None:
+    """Write KEY=value pairs into a .env, replacing existing keys IN PLACE and preserving every
+    other line and comment. Seeds from .env.dist when the file doesn't exist yet."""
+    if path.exists():
+        lines = path.read_text().splitlines()
+    elif (path.parent / ".env.dist").exists():
+        lines = (path.parent / ".env.dist").read_text().splitlines()
+    else:
+        lines = []
+    seen, out = set(), []
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s and s.split("=", 1)[0].strip() in updates:
+            k = s.split("=", 1)[0].strip()
+            out.append(f"{k}={updates[k]}")
+            seen.add(k)
+        else:
+            out.append(line)
+    out += [f"{k}={v}" for k, v in updates.items() if k not in seen]
+    path.write_text("\n".join(out) + "\n")
+
+
+def run_setup_wizard(console: Console) -> None:
+    """First-run setup: detect what's configured, fill in credentials, write .env — so an
+    open-source user goes from a fresh clone to a runnable bench without hand-editing .env.
+    Idempotent: existing secrets are shown masked and kept unless explicitly replaced."""
+    import os
+
+    from .quality.engine import auth_mode, cc_oauth_token, load_env
+    env_path = Path(".env")
+    console.print(Panel.fit(
+        Text.assemble(("minmax-bench · setup\n", "bold magenta"),
+                      ("configure credentials and write .env", "dim")),
+        border_style="magenta"))
+
+    env = {**load_env(), **os.environ}
+    mask = lambda v: ("…" + v[-4:]) if v and len(v) > 4 else ("set" if v else "[dim]—[/]")
+    am, sub = auth_mode(env), bool(cc_oauth_token())
+    t = Table(title="[bold]detected", show_header=False, box=None)
+    t.add_row("Anthropic auth", f"[green]{am}[/]" if am else "[red]none[/]")
+    t.add_row("  ANTHROPIC_API_KEY", mask(env.get("ANTHROPIC_API_KEY")))
+    t.add_row("  Claude Code login", "[green]available[/]" if sub else "[dim]not found[/]")
+    t.add_row("CONDENSE_API_KEY", mask(env.get("CONDENSE_API_KEY")))
+    t.add_row("HF_TOKEN", mask(env.get("HF_TOKEN")))
+    console.print(t)
+
+    updates: dict = {}
+
+    console.print("\n[bold]1) Anthropic access[/] — the bench needs EITHER an API key OR your "
+                  "Claude Code subscription login.")
+    pick = _select_one(console, "Anthropic access", [
+        ("keep", f"keep current ({am or 'none'})", True),
+        ("api-key", "set / replace an ANTHROPIC_API_KEY (API billing)", True),
+        ("subscription", "use my Claude Code subscription "
+                         + ("[green](detected ✓)[/]" if sub else "(needs `claude setup-token`)"),
+         True),
+    ])
+    if pick == "api-key":
+        key = Prompt.ask("  [cyan]ANTHROPIC_API_KEY[/] (sk-ant-…)", password=True,
+                         default="", console=console).strip()
+        if key:
+            updates["ANTHROPIC_API_KEY"] = key
+    elif pick == "subscription":
+        if sub:
+            console.print("  [green]Claude Code login detected[/] — no key needed; runs use it "
+                          "automatically when no API key is set.")
+        else:
+            console.print("  Run [bold]claude setup-token[/] in another shell, then paste the "
+                          "token (or leave blank if you're logged into Claude Code — it's read "
+                          "from ~/.claude/.credentials.json / the keychain automatically).")
+            tok = Prompt.ask("  [cyan]CLAUDE_CODE_OAUTH_TOKEN[/]", password=True, default="",
+                             console=console).strip()
+            if tok:
+                updates["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+        if env.get("ANTHROPIC_API_KEY") or "ANTHROPIC_API_KEY" in updates:
+            console.print("  [dim]note: with an API key also present, runs default to it — pick "
+                          "subscription per-run in the wizard's auth toggle or with "
+                          "--auth subscription.[/]")
+
+    console.print("\n[bold]2) condense arm[/] — the quality-bench condense arm sends this to "
+                  "api.condense.chat (skip if you won't run condense).")
+    if Confirm.ask("  set CONDENSE_API_KEY?", default=not bool(env.get("CONDENSE_API_KEY")),
+                   console=console):
+        k = Prompt.ask("  [cyan]CONDENSE_API_KEY[/] (ak_…)", password=True, default="",
+                       console=console).strip()
+        if k:
+            updates["CONDENSE_API_KEY"] = k
+
+    console.print("\n[bold]3) SWE-chat dataset[/] [dim](optional)[/] — HuggingFace token for the "
+                  "gated SALT-NLP/SWE-chat dataset.")
+    if Confirm.ask("  set HF_TOKEN?", default=False, console=console):
+        k = Prompt.ask("  [cyan]HF_TOKEN[/] (hf_…)", password=True, default="",
+                       console=console).strip()
+        if k:
+            updates["HF_TOKEN"] = k
+
+    if not updates:
+        console.print("\n[dim]no changes to write.[/]")
+        return
+    console.print(f"\n[bold]will write to[/] {env_path}: [cyan]{', '.join(updates)}[/]")
+    if not Confirm.ask("write .env?", default=True, console=console):
+        console.print("[yellow]aborted — nothing written.[/]")
+        return
+    _upsert_env(env_path, updates)
+    env2 = {**load_env(), **os.environ, **updates}
+    console.print(Panel.fit(
+        f"[green]✓ wrote {env_path}[/]  ([dim]keys: {', '.join(updates)}[/])\n"
+        f"auth now resolves to: [bold]{auth_mode(env2) or 'none'}[/]\n"
+        f"[dim]verify:[/] minmax-bench info    [dim]·  run:[/] minmax-bench quality run",
+        border_style="green", title="setup complete"))

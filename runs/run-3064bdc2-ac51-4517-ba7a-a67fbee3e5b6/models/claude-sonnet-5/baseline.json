@@ -1,0 +1,1 @@
+{"sample:timeout-fix:0": {"model": "claude-sonnet-5", "points": [[0, 0, 40, 0, 243, true, null], [1, 0, 30, 243, 2031, true, null], [2, 0, 60, 2274, 823, true, null], [3, 0, 45, 3097, 63, true, null]]}}

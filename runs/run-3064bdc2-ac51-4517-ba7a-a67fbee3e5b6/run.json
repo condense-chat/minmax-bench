@@ -1,0 +1,33 @@
+{
+  "uuid": "3064bdc2-ac51-4517-ba7a-a67fbee3e5b6",
+  "created_utc": "2026-07-18T08:10:04+00:00",
+  "dataset": "sample",
+  "strategies": [
+    "headroom",
+    "headroom-kompress",
+    "condense-sync",
+    "condense-async"
+  ],
+  "models": [
+    "claude-sonnet-5"
+  ],
+  "encoding": "o200k_base",
+  "count_mode": "local",
+  "max_tokens": 1,
+  "edges": [
+    16000,
+    32000,
+    100000,
+    200000
+  ],
+  "session_limit": null,
+  "point_limit": null,
+  "longest": null,
+  "token_limit": null,
+  "session_ids": [
+    "sample:timeout-fix:0"
+  ],
+  "session_test_uuids": {
+    "claude-sonnet-5::sample:timeout-fix:0": "36c582c9-a2a8-5184-909c-7f667379f801"
+  }
+}

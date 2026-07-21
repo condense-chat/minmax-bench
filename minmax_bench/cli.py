@@ -99,12 +99,13 @@ def quality_run(
         if w.mode == "incremental":
             _run_incremental(session=w.session, arms=w.arms, model=w.model, every=w.every,
                              limit=w.limit, budget_usd=w.budget_usd, max_tokens=6000,
-                             out=w.out, task=w.task, auth="auto", assume_yes=True, judge=w.judge,
+                             out=w.out, task=w.task, auth=w.auth, assume_yes=True, judge=w.judge,
                              capture=w.capture, ctx_gate=w.ctx_gate,
                              independent_budgets=w.independent_budgets, resume=w.resume)
             return
-        arms, tasks, model, k, budget_usd, milestones, out, force, retries = (
-            w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out, w.force, w.retries)
+        arms, tasks, model, k, budget_usd, milestones, out, force, retries, auth = (
+            w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out, w.force, w.retries,
+            w.auth)
     argv = ["--mode", "full", "--arms", arms, "--dataset", dataset, "--out", out,
             "--k", str(k), "--budget-usd", str(budget_usd), "--concurrency", str(concurrency),
             "--wall-timeout", str(wall_timeout), "--retries", str(retries)]
@@ -501,6 +502,17 @@ def strategies_cmd():
                 console.print(f"    [dim]-> {r.proxy.base_url}[/]")
         except Exception as e:  # resolution needs creds/tools it may not have yet
             console.print(f"    [red]unavailable:[/] {e}")
+
+
+@app.command("setup")
+def setup_cmd():
+    """Guided first-run setup: detect what's configured, fill in credentials, write .env."""
+    from .interactive import run_setup_wizard
+    try:
+        run_setup_wizard(console)
+    except (KeyboardInterrupt, EOFError):
+        console.print("[yellow]setup aborted — nothing written.[/]")
+        raise typer.Exit(1) from None
 
 
 @app.command("info")
