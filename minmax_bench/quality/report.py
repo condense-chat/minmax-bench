@@ -586,6 +586,8 @@ _FULL_LEGEND = (
     "axis): same work (within vanilla's band) / drifted ↑ longer / shorter ↓ / ⊘ too short "
     "(vanilla never crossed the compaction gate — nothing compacted, so any change is "
     "behavioural, not compaction). n1 = single run, a trend not a verdict (needs ≥2/arm). "
+    "milestone = mean % of the task's subgoals the arm reached (LLM-judged, approach-agnostic), "
+    "green when it matches vanilla's band / red when below (only shown with --milestones). "
     "Under each task: peak context + solve rate (⚠lost trials count as fails). No model was called.")
 _INCR_LEGEND = (
     "teacher-forced per-step run of a recorded session. control = the baseline (its own row); "
@@ -594,14 +596,15 @@ _INCR_LEGEND = (
     "llm:goal rates each action on its own merit (control ≈100% — trustworthy floor; an arm "
     "only loses by taking WORSE steps), whereas struct / llm:equiv match the ORIGINAL recorded "
     "action, whose ceiling is sampling-driven and low even for control (a noisy floor — prefer "
-    "--judge goal). ctx / $ / time saved = context / cost / "
-    "per-step wall-clock saved vs control (+ = less/cheaper/faster). ↻N = CCR retrieve calls a "
-    "headroom arm made (net ctx-saved can be ~0 yet still engaged). faithful = the % of "
-    "control's own faithfulness the arm keeps (control = 100% by construction; its absolute "
-    "good-rate is shown in parens) — normalising divides out the sampling/judge floor, so 100% "
-    "= no measurable loss. Coloured green ≥95% / yellow 85–95% / red <85% when the arm engaged "
-    "(compressed or CCR-retrieved); else dim (≈100% by construction — no verdict). "
-    "— = no incremental data. time saved is wall-clock — read it as a trend, not exact.")
+    "--judge goal). compaction % / $ savings / speed up = context compressed / cost saved / "
+    "per-step wall-clock faster vs control (+ = better = less context / cheaper / faster). ↻N = "
+    "CCR retrieve calls a headroom arm made (net compaction can be ~0 yet still engaged). "
+    "faithful = the % of control's own faithfulness the arm keeps (control = 100% by "
+    "construction; its absolute good-rate is shown in parens) — normalising divides out the "
+    "sampling/judge floor, so 100% = no measurable loss. Coloured green ≥95% / yellow 85–95% / "
+    "red <85% when the arm engaged (compressed or CCR-retrieved); else dim (≈100% by "
+    "construction — no verdict). — = no incremental data. speed up is wall-clock — read it as a "
+    "trend, not exact.")
 _SHORT = "[dim]⊘ short[/]"
 _DASH = "[dim]—[/]"
 
@@ -663,6 +666,15 @@ def _metric_cell(ctrl_list, arm_list, fmt):
     if am < lo:
         return f"[green]{val}[/] [green]{tag}[/]"
     return f"{val} [dim]{tag}[/]"
+
+
+def _milestone_cell(a):
+    """Arm's milestone coverage (mean % of the task's subgoals reached), green when it overlaps
+    vanilla's band (same subgoals) / red when it falls below / plain when ungraded."""
+    m = a.get("milestone")
+    if not m:
+        return _DASH
+    return _colok(f"{m[1] * 100:.0f}%", a.get("milestone_ok"))
 
 
 def _TOKFMT(x):
@@ -800,25 +812,32 @@ def _full_table(console, d, model):
         title = f"[bold]{arm} vs vanilla" + (f" · {model}" if model else "") + "[/]"
         t = Table(title=title, caption=_FULL_LEGEND if ai == len(d["arms"]) - 1 else None,
                   caption_justify="left", caption_style="dim", pad_edge=False)
+        has_ms = d.get("has_milestone")
         t.add_column("task", no_wrap=True)
         for c in ("len", "tok", "$"):
             t.add_column(f"van {c}", justify="right", style="dim")
         for c in ("len", "tok", "$"):
             t.add_column(f"{arm[:8]} {c}", justify="right")
         t.add_column("verdict", justify="left", no_wrap=True)
+        if has_ms:
+            t.add_column("milestone", justify="right")  # subgoals reached vs vanilla
         for r in arm_rows:
             v, a, sub = r["vanilla"], r["arms"][arm], r["sub_gate"]
             peak = v["peak_ctx"] // 1000
             taskcell = (f"{r['task']}\n[dim]peak {peak}k{' ⊘' if sub else ''} · "
                         f"solve {a['solve']}/{a['attempted']}[/]")
-            t.add_row(
+            cells = [
                 taskcell,
                 f"[dim]{v['length'][1]:.0f}[/]" if v["length"] else _DASH,
                 _metric_base(v["_toks"], _TOKFMT), _metric_base(v["_costs"], _USDFMT),
                 _metric_cell(v["_lens"], a["_lens"], _LENFMT),
                 _metric_cell(v["_toks"], a["_toks"], _TOKFMT),
                 _metric_cell(v["_costs"], a["_costs"], _USDFMT),
-                _verdict_cell(v, a, sub))
+                _verdict_cell(v, a, sub),
+            ]
+            if has_ms:
+                cells.append(_milestone_cell(a))
+            t.add_row(*cells)
         console.print(t)
 
 
@@ -831,7 +850,7 @@ def _incremental_table(console, d, model):
     t = Table(title=title, caption=_INCR_LEGEND, caption_justify="left", caption_style="dim")
     for col in ("task", "arm", "scoring"):
         t.add_column(col, no_wrap=True)
-    for col in ("ctx saved", "faithful", "$ saved", "time saved"):
+    for col in ("compaction %", "faithful", "$ savings", "speed up"):
         t.add_column(col, justify="right" if col != "faithful" else "center")
 
     def render_row(r):
