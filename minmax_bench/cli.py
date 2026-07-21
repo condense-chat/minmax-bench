@@ -514,7 +514,18 @@ def info_cmd():
         return "set" if v else "[red]missing[/]"
 
     prof = load_profile(s.condense_profile)
+    # resolved Anthropic auth: how upstream calls will ACTUALLY authenticate (not just whether
+    # a key is set) — API key if present, else the Claude Code subscription OAuth token, else none
+    import os
+
+    from .quality import engine as _eng
+    _env = {**_eng.load_env(), **dict(os.environ)}
+    _auth = _eng.auth_mode(_env)
+    _auth_lbl = {"api-key": "[green]API key[/] (API billing)",
+                 "subscription": "[green]subscription[/] (Claude Code login, no API key)"}.get(
+                     _auth, "[red]NONE[/] — set ANTHROPIC_API_KEY or run `claude setup-token`")
     console.print("[bold]minmax-bench settings[/]")
+    console.print(f"  Anthropic auth    : {_auth_lbl}")
     console.print(f"  ANTHROPIC_API_KEY : {mask(s.anthropic_api_key)}")
     console.print(f"  OPENAI_API_KEY    : {mask(s.openai_api_key)}")
     console.print(f"  HF_TOKEN          : {mask(s.hf_token)}")

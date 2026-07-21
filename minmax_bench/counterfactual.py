@@ -437,6 +437,10 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         f"{' [yellow](thinking stripped: cross-model)[/]' if cross_model else ''}\n"
         f"[bold]arms[/] control + {', '.join(arms)}   "
         f"[bold]rough cost/arm[/] ${lo:.2f}–${hi:.2f} (capped at ${budget_usd:.2f} each)\n"
+        f"[bold]auth[/] "
+        + {"api-key": "API key (API billing)",
+           "subscription": "Claude Code subscription (no API key)"}.get(
+               eng.auth_mode(env), "NONE") + "\n"
         f"[yellow]this sends your session content to api.anthropic.com"
         f"{' and api.condense.chat' if 'condense' in arms else ''}[/]",
         title="incremental", border_style="cyan"))

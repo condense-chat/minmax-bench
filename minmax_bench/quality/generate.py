@@ -301,6 +301,14 @@ def _agent_auth_env(env):
     return ["--ae", f"CLAUDE_CODE_OAUTH_TOKEN={tok}"] if tok else []
 
 
+def _auth_label(env):
+    """Human label for how upstream calls will ACTUALLY authenticate — so every run says
+    plainly whether it's spending API credits or the user's Claude Code subscription."""
+    return {"api-key": "API key (API billing)",
+            "subscription": "Claude Code subscription (no API key)"}.get(
+                eng.auth_mode(env), "NONE — set ANTHROPIC_API_KEY or run `claude setup-token`")
+
+
 def _validate_full(args, env):
     arms = ["vanilla"] + [a for a in args.arms.split(",") if a]
     if not eng.auth_mode(env) and not args.dry_run:
@@ -406,6 +414,7 @@ def full(args, env):
     _console.print(f"[bold]plan[/] {len(arms)} arms ({', '.join(arms)}) × {len(tasks)} tasks "
                    f"× k={args.k} (vanilla {kv}) = {trials} trials, cost ceiling "
                    f"~${trials * args.budget_usd:.0f} (${args.budget_usd:g}/trial cap)")
+    _console.print(f"[bold]auth[/] {_auth_label(env)}")
     grid = _CellGrid(arms, tasks, kv, args.k, args.budget_usd)
     # a live status grid for the run (matches the wizard's rich look); dry-run stays plain
     live_ctx = (contextlib.nullcontext() if args.dry_run
@@ -641,6 +650,7 @@ def incremental(args, env):
     sid = str(uuid.uuid4())
     print(f"[incremental] {len(msgs)} msgs, running {len(sel)}/{len(points)} decision points "
           f"per arm ({', '.join(arms)}), session {sid}")
+    print(f"[incremental] auth: {_auth_label(env)}")
     # arms hit independent endpoints with independent budgets — replay them concurrently;
     # steps WITHIN an arm stay sequential (incremental prompt caching needs nested prefixes)
     try:
