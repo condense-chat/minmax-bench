@@ -372,8 +372,14 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     # here, not after the control arm has already burned the budget. If an arm rejects
     # the session's model, auto-detect a fallback that every arm can serve.
     def _preflight(m):
+        # carry the template's system prompt so an OAuth/subscription probe looks like a real
+        # Claude Code request. Anthropic treats/limits OAuth traffic that lacks the Claude Code
+        # identity differently — a bare "Say ok." can 429 where the real replay (which sends the
+        # system prompt via build_request) would go through, giving a false preflight abort.
         probe = {"model": m, "max_tokens": 16, "stream": True,
                  "messages": [{"role": "user", "content": "Say ok."}]}
+        if tmpl_body.get("system"):
+            probe["system"] = tmpl_body["system"]
         for arm in all_arms:
             _, err = eng.call_api(arm, probe, tmpl_headers, env)
             if err:
