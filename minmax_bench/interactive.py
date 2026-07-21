@@ -395,6 +395,7 @@ class QualityWizardResult:
     capture: bool = False
     ctx_gate: int = 50_000     # 0 = deliberately replay a below-gate session
     independent_budgets: bool = False  # True = each arm to own budget; False = cap to control
+    resume: bool = True        # skip arms already finished (.done sentinel) on re-run to same out
 
 
 def _ask_int(console: Console, prompt: str, default: int, lo: int = 0) -> int:
@@ -732,6 +733,11 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         ("equivalence", "structural + LLM upgrade of near-misses (grep vs rg) to 'agrees'", True),
     ])
     out = Prompt.ask("[cyan]output dir[/]", default="results/jobs/run", console=console).strip()
+    # resume: re-running to the same out skips arms that already finished (a .done sentinel),
+    # so a cancel mid-run resumes at the next arm instead of re-running control. An interrupted
+    # arm has no sentinel and re-runs. Only meaningful when reusing an out; harmless otherwise.
+    resume = Confirm.ask("[cyan]resume?[/] (skip arms already complete in this out dir; a "
+                         "cancelled arm re-runs)", default=True, console=console)
     _quality_preflight(console, arms, need_docker=False)
     model_lbl = f"inherit ({own})" if model is None else model
     console.print(Panel.fit(
@@ -743,7 +749,7 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         f"[bold]scoring[/] {judge}\n"
         f"[bold]per-arm cap[/] ${budget:g}   "
         f"[bold]window[/] {'independent budgets' if independent_budgets else 'cap to control'}   "
-        f"[bold]out[/] {out}",
+        f"[bold]resume[/] {'yes' if resume else 'no'}   [bold]out[/] {out}",
         title="ready", border_style="green"))
     if not Confirm.ask("[cyan]run the incremental?[/]", default=False, console=console):
         raise KeyboardInterrupt
@@ -751,4 +757,4 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
                                conv=conv, task=task, arms=",".join(arms), model=model,
                                every=every, limit=limit, budget_usd=budget, out=out,
                                judge=judge, capture=capture, ctx_gate=ctx_gate,
-                               independent_budgets=independent_budgets)
+                               independent_budgets=independent_budgets, resume=resume)

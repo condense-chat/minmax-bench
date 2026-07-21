@@ -271,7 +271,8 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,
            model: str | None = None, auth: str = "auto", task: str = "session",
            judge: str = "off", capture: bool = False, headroom_mode: str = "token",
-           ccr: bool = True, ctx_gate: int = 50_000, independent_budgets: bool = False) -> dict:
+           ccr: bool = True, ctx_gate: int = 50_000, independent_budgets: bool = False,
+           resume: bool = True) -> dict:
     env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
     if auth == "subscription":
         # force the Claude Code login path even when an API key is configured
@@ -465,6 +466,29 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     for arm in all_arms:
         arm_sel = sel if cap_steps is None else sel[:cap_steps]
         path = inc_dir / f"{task}-{arm}.jsonl"
+        done_path = inc_dir / f"{task}-{arm}.done"
+        # resume: a clean completion writes a .done sentinel (below). On a re-run to the SAME
+        # out, skip an arm whose sentinel matches this run's config — an INTERRUPTED arm left a
+        # partial jsonl and NO sentinel, so it re-runs from scratch. control's sentinel also
+        # carries the step window it defined, so a resumed condense/headroom stay capped.
+        cur_sig = {"n_sel": len(sel), "budget": budget_usd, "model": replay_model,
+                   "judge": judge, "independent": independent_budgets}
+        if resume and done_path.exists() and path.exists():
+            try:
+                saved = json.loads(done_path.read_text())
+            except (OSError, ValueError):
+                saved = None
+            if saved and saved.get("sig") == cur_sig:
+                a = saved["summary"]
+                # JSON stringifies int keys — restore by_step's int step indices so
+                # _common_steps intersects correctly with the freshly-run arms
+                a["by_step"] = {int(k): v for k, v in a.get("by_step", {}).items()}
+                summary["arms"][arm] = a
+                if arm == "control" and not independent_budgets:
+                    cap_steps = saved.get("steps_processed", len(sel))
+                console.print(f"[dim]↺ {arm}: already complete "
+                              f"({saved.get('steps_processed', '?')} steps) — skipping[/]")
+                continue
         spent, n_ok, n_action, n_exact, ctx_total = 0.0, 0, 0, 0, 0
         n_err, first_err, ctx_series, lat_total = 0, None, [], 0.0
         qual = {"good": 0, "degraded": 0, "bad": 0}  # goal-judge tally
@@ -618,6 +642,14 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
             if cap_steps < len(sel):
                 console.print(f"[dim]control stopped at {cap_steps}/{len(sel)} steps "
                               f"(budget) — capping remaining arms to that window[/]")
+        # completion sentinel for resume — reached only on a CLEAN finish (an interrupt raises
+        # out of the loop before here), so a partial arm never gets one and re-runs next time.
+        try:
+            done_path.write_text(json.dumps({
+                "sig": cur_sig, "steps_processed": n_ok + n_err,
+                "summary": summary["arms"][arm]}))
+        except OSError:
+            pass
     summary["judge"] = judge
     # backtest anchor: what these same turns ACTUALLY consumed when the session ran
     # (recorded usage, the session's own model + live caching) — replays above re-ran
