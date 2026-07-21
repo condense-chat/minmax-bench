@@ -100,7 +100,8 @@ def quality_run(
             _run_incremental(session=w.session, arms=w.arms, model=w.model, every=w.every,
                              limit=w.limit, budget_usd=w.budget_usd, max_tokens=6000,
                              out=w.out, task=w.task, auth="auto", assume_yes=True, judge=w.judge,
-                             capture=w.capture, ctx_gate=w.ctx_gate)
+                             capture=w.capture, ctx_gate=w.ctx_gate,
+                             independent_budgets=w.independent_budgets)
             return
         arms, tasks, model, k, budget_usd, milestones, out, force, retries = (
             w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out, w.force, w.retries)
@@ -206,7 +207,7 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None, every
                      limit: int, budget_usd: float, max_tokens: int, out: str, task: str,
                      auth: str, assume_yes: bool, judge: str = "off", steps: bool = True,
                      capture: bool = False, headroom_mode: str = "token", ccr: bool = True,
-                     ctx_gate: int = 50_000) -> None:
+                     ctx_gate: int = 50_000, independent_budgets: bool = False) -> None:
     """Rich incremental (teacher-forced, per-step) run of one session — picker when no
     --session, model auto-fallback, cost preview, per-arm progress, a summary table with the
     recorded backtest anchor, and a per-step good/semi/bad/redundant readout. Writes
@@ -220,7 +221,8 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None, every
         summary = replay(sp, arm_list, budget_usd=budget_usd, limit=limit, every=every,
                          max_tokens=max_tokens, out_dir=Path(out), console=console,
                          assume_yes=assume_yes, model=model, auth=auth, task=task, judge=judge,
-                         capture=capture, headroom_mode=headroom_mode, ccr=ccr, ctx_gate=ctx_gate)
+                         capture=capture, headroom_mode=headroom_mode, ccr=ccr, ctx_gate=ctx_gate,
+                         independent_budgets=independent_budgets)
     except SystemExit as e:
         raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
     render_summary(summary, console)
@@ -248,6 +250,7 @@ def quality_incremental(
     headroom_mode: str = typer.Option("token", "--headroom-mode", help="For a headroom arm: token (compression — the meaningful test) or cache (~passthrough). Auto-starts the proxy."),
     ccr: bool = typer.Option(True, "--ccr/--no-ccr", help="For the headroom arm, inject the CCR retrieve loop (via headroom mcp serve); --no-ccr runs it as kompress (compression only)."),
     ctx_gate: int = typer.Option(50_000, "--ctx-gate", help="Skip sessions whose peak context stays below this (compaction can't fire — nothing to compare). 0 = run it anyway."),
+    independent_budgets: bool = typer.Option(False, "--independent-budgets/--cap-to-control", help="Default caps every arm at the steps control reached within budget (the paired comparison window — no wasted spend past it). --independent-budgets lets each arm run to its own budget instead (e.g. a 'how far can each arm get' reach test), at the cost of ragged, partly-uncomparable step counts."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
 ):
     """Incremental (teacher-forced per-step) trajectories — the paired counterpart
@@ -264,7 +267,8 @@ def quality_incremental(
     _run_incremental(session=session, arms=arms, model=model, every=every, limit=limit,
                      budget_usd=budget_usd, max_tokens=max_tokens, out=out_dir, task=task,
                      auth=auth, assume_yes=yes, judge=judge, steps=steps, capture=capture,
-                     headroom_mode=headroom_mode, ccr=ccr, ctx_gate=ctx_gate)
+                     headroom_mode=headroom_mode, ccr=ccr, ctx_gate=ctx_gate,
+                     independent_budgets=independent_budgets)
 
 
 # judge takes niche flags; pass through to the driver (which owns its --help)

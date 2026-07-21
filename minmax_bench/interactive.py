@@ -394,6 +394,7 @@ class QualityWizardResult:
     judge: str = "off"
     capture: bool = False
     ctx_gate: int = 50_000     # 0 = deliberately replay a below-gate session
+    independent_budgets: bool = False  # True = each arm to own budget; False = cap to control
 
 
 def _ask_int(console: Console, prompt: str, default: int, lo: int = 0) -> int:
@@ -699,6 +700,14 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     every = _ask_int(console, "[cyan]sample every Nth decision point[/]", 1, lo=1)
     limit = _ask_int(console, "[cyan]max decision points[/] (0 = all)", 0)
     budget = _ask_float(console, "[cyan]per-arm $ cap[/]", 2.0)
+    # control runs first; by default the later arms are capped at the steps control reached
+    # within budget — the paired comparison window, so no arm over-replays steps that have no
+    # control counterpart to score against. Opting into independent budgets lets each arm run
+    # to its own cap (a "how far does each arm get" reach test) but yields ragged step counts.
+    independent_budgets = not Confirm.ask(
+        "[cyan]cap arms to control's step window?[/] (recommended — control runs first, later "
+        "arms stop at min(control's steps, own budget); No = each arm burns its own budget)",
+        default=True, console=console)
     # faithful capture: run the version-matched Claude Code binary once, LOCALLY, to
     # capture the EXACT system prompt + tools + CLAUDE.md your run used — instead of an
     # approximate frozen template. Consent + full transparency, per the user's ask.
@@ -732,11 +741,14 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         f"[bold]limit[/] {limit or 'all'}\n"
         f"[bold]source[/] {'exact capture' if capture else 'template'}   "
         f"[bold]scoring[/] {judge}\n"
-        f"[bold]per-arm cap[/] ${budget:g}   [bold]out[/] {out}",
+        f"[bold]per-arm cap[/] ${budget:g}   "
+        f"[bold]window[/] {'independent budgets' if independent_budgets else 'cap to control'}   "
+        f"[bold]out[/] {out}",
         title="ready", border_style="green"))
     if not Confirm.ask("[cyan]run the incremental?[/]", default=False, console=console):
         raise KeyboardInterrupt
     return QualityWizardResult(mode="incremental", source=src, session=session, swechat=swechat,
                                conv=conv, task=task, arms=",".join(arms), model=model,
                                every=every, limit=limit, budget_usd=budget, out=out,
-                               judge=judge, capture=capture, ctx_gate=ctx_gate)
+                               judge=judge, capture=capture, ctx_gate=ctx_gate,
+                               independent_budgets=independent_budgets)

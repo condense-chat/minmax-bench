@@ -271,7 +271,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
            max_tokens: int, out_dir: Path, console: Console, assume_yes: bool = False,
            model: str | None = None, auth: str = "auto", task: str = "session",
            judge: str = "off", capture: bool = False, headroom_mode: str = "token",
-           ccr: bool = True, ctx_gate: int = 50_000) -> dict:
+           ccr: bool = True, ctx_gate: int = 50_000, independent_budgets: bool = False) -> dict:
     env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
     if auth == "subscription":
         # force the Claude Code login path even when an API key is configured
@@ -454,7 +454,16 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     summary: dict = {"session": str(session), "model": replay_model, "steps": len(sel),
                      "judged": judge, "arms": {}}
     from minmax_bench.quality import generate as gen
+    # control runs FIRST; unless --independent-budgets, cap every later arm at the number of
+    # steps control actually completed within budget. The metric is a per-step PAIRED
+    # comparison against control, so steps past control's stop have no counterpart to score —
+    # replaying a (cheaper, compressed) arm beyond them is pure wasted spend. control, being
+    # the uncompressed/priciest-per-step arm, usually hits budget FIRST, so it defines the
+    # shortest comparable window. Each later arm still stops at its OWN budget if that comes
+    # first: min(control's steps, own budget), whichever is sooner.
+    cap_steps = None
     for arm in all_arms:
+        arm_sel = sel if cap_steps is None else sel[:cap_steps]
         path = inc_dir / f"{task}-{arm}.jsonl"
         spent, n_ok, n_action, n_exact, ctx_total = 0.0, 0, 0, 0, 0
         n_err, first_err, ctx_series, lat_total = 0, None, [], 0.0
@@ -483,9 +492,9 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                 console.print("[dim]headroom CCR: retrieve loop active via mcp serve[/]" if mcp.ok
                               else "[yellow]headroom CCR: mcp serve unavailable — arm runs as "
                                    "kompress (no retrieve)[/]")
-            tid = prog.add_task("", total=len(sel), stat="")
+            tid = prog.add_task("", total=len(arm_sel), stat="")
             consec_err = 0
-            for step, i in enumerate(sel):
+            for step, i in enumerate(arm_sel):
                 if spent >= budget_usd:
                     prog.update(tid, stat=f"budget ${budget_usd} reached")
                     break
@@ -601,6 +610,14 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
             # cap during the run used spent = replay + judge.
             "cost_usd": round(spent - judge_spent, 4), "file": str(path),
         }
+        # after control: cap the remaining arms at the steps control actually reached (unless
+        # the user opted into independent per-arm budgets). n_ok + n_err = decision points
+        # control processed before its budget/error cutoff — the paired window.
+        if arm == "control" and not independent_budgets:
+            cap_steps = n_ok + n_err
+            if cap_steps < len(sel):
+                console.print(f"[dim]control stopped at {cap_steps}/{len(sel)} steps "
+                              f"(budget) — capping remaining arms to that window[/]")
     summary["judge"] = judge
     # backtest anchor: what these same turns ACTUALLY consumed when the session ran
     # (recorded usage, the session's own model + live caching) — replays above re-ran
