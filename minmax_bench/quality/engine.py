@@ -204,8 +204,16 @@ def cc_oauth_token():
             return None
         exp = oauth.get("expiresAt") or 0
         if exp and exp / 1000 < time.time():
-            print("warn: Claude Code OAuth token is expired — open `claude` once to "
-                  "refresh it, or set ANTHROPIC_API_KEY", file=sys.stderr)
+            # the stored ACCESS token is short-lived and has expired. Claude Code refreshes it
+            # on use via the refresh token, so your subscription is fine — but this reader does
+            # NOT do the OAuth refresh, so it can't use the stale token and falls back to an API
+            # key. `claude setup-token` mints a LONG-LIVED token for exactly this programmatic use.
+            hint = ("run `claude setup-token` and `export CLAUDE_CODE_OAUTH_TOKEN=<it>` (a "
+                    "long-lived token)" if oauth.get("refreshToken")
+                    else "open `claude` once to refresh it")
+            print("warn: the stored Claude Code access token has expired (Claude Code refreshes "
+                  f"it on use; this bench does not) — {hint}, or set ANTHROPIC_API_KEY.",
+                  file=sys.stderr)
             return None
         return oauth.get("accessToken")
 
