@@ -501,6 +501,16 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
     sel = points[:: max(1, every)]
     if limit:
         sel = sel[:limit]
+    if every > 1:
+        # faithfulness is per-step (each sampled decision is teacher-forced independently), so
+        # --every N is fine there. But compaction % / $ savings become a SUBSAMPLE with coarser
+        # cache granularity: each sampled step writes an N-turn cache delta, not the 1-turn deltas
+        # a real per-turn agent (and --every 1) write, and condense's threshold-gated cache-BUST
+        # events can fall between samples. So the cost/compaction numbers are approximate.
+        console.print(f"[yellow]--every {every}: 1-of-{every} steps. faithfulness is unaffected, "
+                      f"but compaction % / $ savings become a coarse SUBSAMPLE (each sampled step "
+                      f"writes an {every}-turn cache delta, and condense's cache-bust events can "
+                      f"fall between samples) — use [bold]--every 1[/] for a faithful cost number.[/]")
     lo, hi = estimate_usd(msgs, [i for i in sel], eng.rates_for(replay_model))
 
     console.print(Panel.fit(
