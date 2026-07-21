@@ -402,9 +402,11 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         # pointless; the real replay would 429 on every step. Say so, and tailor the fix to the
         # auth actually in use (advising "switch to subscription" is nonsense if already on it).
         if eng.auth_mode(env) == "subscription":
-            fix = ("You're on your Claude Code subscription — its usage window is throttling you. "
-                   "A concurrent full run on the SAME login competes for it: pause it, wait for "
-                   "the window to reset, or use an API key (set ANTHROPIC_API_KEY / --auth api-key).")
+            fix = ("You're on your Claude Code subscription — ONE shared usage window. Anything "
+                   "else on the same login competes for it, including a Claude Code session you "
+                   "have open right now AND a concurrent full run. Close/pause those, wait for the "
+                   "window to reset, or put this replay on an API key (set ANTHROPIC_API_KEY / "
+                   "--auth api-key), which has its own separate limit.")
         else:
             fix = ("Your API key is being throttled. If a full run is going on the SAME key it's "
                    "competing for the same limit: pause it, use a separate key, or switch to your "
