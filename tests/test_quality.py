@@ -263,12 +263,18 @@ def test_scoring_infers_llm_judge():
 
 
 def test_check_arms_catches_unknown_arm_and_missing_keys():
-    # headroom-kompress is a full-mode-only arm — not a valid teacher-forced replay arm
-    problems = eng.check_arms(["control", "headroom-kompress", "condense"], {})
-    text = "\n".join(problems)
-    assert "headroom-kompress" in text
-    assert "ANTHROPIC_API_KEY" in text and "CONDENSE_API_KEY" in text
-    assert not eng.check_arms(["control"], {"ANTHROPIC_API_KEY": "k"})
+    # force "no subscription token" so the check is hermetic — cc_oauth_token reads the ambient
+    # environment (os.environ / .env / keychain), which the dev machine may actually have
+    eng._CC_TOKEN_CACHE[0] = None
+    try:
+        # headroom-kompress is a full-mode-only arm — not a valid teacher-forced replay arm
+        problems = eng.check_arms(["control", "headroom-kompress", "condense"], {})
+        text = "\n".join(problems)
+        assert "headroom-kompress" in text
+        assert "ANTHROPIC_API_KEY" in text and "CONDENSE_API_KEY" in text
+        assert not eng.check_arms(["control"], {"ANTHROPIC_API_KEY": "k"})
+    finally:
+        eng._CC_TOKEN_CACHE[0] = "unset"
 
 
 # ---------------------------------------------------------------- offline demo end-to-end

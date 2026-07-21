@@ -217,7 +217,11 @@ def cc_oauth_token():
             return None
         return oauth.get("accessToken")
 
-    tok = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or None
+    # os.environ first (an explicit export wins), then .env — the setup wizard writes the token
+    # to .env, and nothing load_dotenv's it into os.environ on the quality-bench paths, so read
+    # it directly or a wizard-wired token stays invisible and we wrongly fall back to an API key.
+    tok = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+           or load_env().get("CLAUDE_CODE_OAUTH_TOKEN") or None)
     if not tok:
         cred = os.path.expanduser("~/.claude/.credentials.json")
         if os.path.exists(cred):
