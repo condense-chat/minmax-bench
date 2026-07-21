@@ -766,19 +766,27 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
 # --------------------------------------------------------------------- auth + setup
 def _auth_choice(console: Console) -> str:
     """Which Anthropic credential to spend. 'auto' unless BOTH an API key AND a Claude Code
-    subscription are configured — then let the user pick, since 'auto' silently prefers the key
-    and a subscription user would want to say so."""
+    subscription are live — then let the user pick, since 'auto' silently prefers the key and a
+    subscription user would want to say so. When only one is live, say which (and how to enable
+    the other) rather than showing nothing — the missing toggle should never be a mystery."""
     import os
 
     from .quality.engine import cc_oauth_token, load_env
     env = {**load_env(), **os.environ}
-    if not (env.get("ANTHROPIC_API_KEY") and cc_oauth_token()):
-        return "auto"  # only one credential present — nothing to choose
-    return _select_one(console, "both an API key and a Claude Code login are configured — "
-                       "which should this run spend?", [
-        ("api-key", "API key — API billing", True),
-        ("subscription", "Claude Code subscription — draws on your plan, no API-key spend", True),
-    ])
+    has_key, has_sub = bool(env.get("ANTHROPIC_API_KEY")), bool(cc_oauth_token())
+    if has_key and has_sub:
+        return _select_one(console, "both an API key and a Claude Code login are live — "
+                           "which should this run spend?", [
+            ("api-key", "API key — API billing", True),
+            ("subscription", "Claude Code subscription — draws on your plan, no API-key spend", True),
+        ])
+    if has_key:
+        console.print("[dim]auth: API key (only live credential — no toggle). To spend your "
+                      "Claude Code subscription instead, run [/][cyan]claude setup-token[/][dim] "
+                      "(or open `claude` to refresh an expired login), then this choice appears.[/]")
+    elif has_sub:
+        console.print("[dim]auth: Claude Code subscription (no API key set).[/]")
+    return "auto"
 
 
 def _upsert_env(path: Path, updates: dict) -> None:
