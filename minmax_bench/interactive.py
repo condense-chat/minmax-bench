@@ -744,7 +744,7 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     console.print(Panel.fit(
         f"[bold]incremental trajectory[/]   [bold]model[/] {model_lbl}\n"
         f"[bold]session[/] {Path(session).name}\n"
-        f"[bold]arms[/] control + {', '.join(arms)}   [bold]every[/] {every}   "
+        f"[bold]arms[/] control + {', '.join(arms)}   "
         f"[bold]limit[/] {limit or 'all'}\n"
         f"[bold]source[/] {'exact capture' if capture else 'template'}   "
         f"[bold]scoring[/] {judge}\n"
