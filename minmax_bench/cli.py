@@ -69,6 +69,7 @@ def quality_run(
     list_tasks: bool = typer.Option(False, "--list-tasks", help="Print the known tasks and exit."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the Harbor commands without running."),
     auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force Claude Code login; no API key needed)."),
+    force: bool = typer.Option(False, "--force", help="Full retry: re-run ALL cells including completed ones (re-spends the whole run). Default resumes — only cells missing trials re-run."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the guided wizard; use flags/defaults."),
 ):
     """Run the agents end-to-end via Harbor and compare trajectories (SPENDS).
@@ -100,8 +101,8 @@ def quality_run(
                              out=w.out, task=w.task, auth="auto", assume_yes=True, judge=w.judge,
                              capture=w.capture, ctx_gate=w.ctx_gate)
             return
-        arms, tasks, model, k, budget_usd, milestones, out = (
-            w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out)
+        arms, tasks, model, k, budget_usd, milestones, out, force = (
+            w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out, w.force)
     argv = ["--mode", "full", "--arms", arms, "--dataset", dataset, "--out", out,
             "--k", str(k), "--budget-usd", str(budget_usd), "--concurrency", str(concurrency),
             "--wall-timeout", str(wall_timeout)]
@@ -115,6 +116,8 @@ def quality_run(
         argv += ["--auth", auth]
     if milestones:
         argv.append("--milestones")
+    if force:
+        argv.append("--force")
     if dry_run:
         argv.append("--dry-run")
     main(argv)

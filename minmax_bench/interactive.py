@@ -381,6 +381,7 @@ class QualityWizardResult:
     k: int = 4
     budget_usd: float = 5.0
     milestones: bool = True
+    force: bool = False              # True = full re-run (redo completed cells); False = resume
     # incremental
     source: str = ""                # "own" | "file" | "swechat"
     session: str | None = None
@@ -595,6 +596,13 @@ def _full_wizard(console: Console) -> QualityWizardResult:
     milestones = Confirm.ask("[cyan]also run the LLM milestone judge?[/]", default=True,
                              console=console)
     out = Prompt.ask("[cyan]output dir[/]", default="results/jobs/run", console=console).strip()
+    # resume vs full retry: by default an existing out dir is RESUMED — only cells missing
+    # trials (crashes, timeouts, interrupts) re-run; completed cells (incl. reward-0) are kept
+    # and cost nothing. "Full retry" forces every cell to re-run from scratch (--force), which
+    # re-spends the whole run — only pick it to redo genuinely-completed trials.
+    force = Confirm.ask(
+        "[cyan]full retry?[/] (re-run ALL cells incl. completed — [red]re-spends everything[/]; "
+        "default No = resume, only fill missing)", default=False, console=console)
     _quality_preflight(console, arms, need_docker=True)
     ntasks = len(task_list)
     kv = k + 1
@@ -605,12 +613,13 @@ def _full_wizard(console: Console) -> QualityWizardResult:
         f"[bold]k[/] {k} (vanilla {kv})\n[bold]tasks[/] ({ntasks}) {shown}\n"
         f"[bold]arms[/] vanilla + {', '.join(arms)}\n"
         f"[bold]milestones[/] {'yes' if milestones else 'no'}   [bold]out[/] {out}\n"
+        f"[bold]mode[/] {'[red]full retry (re-run all)[/]' if force else 'resume (fill missing)'}\n"
         f"[bold]{trials} trials[/], cost ceiling ~[bold]${trials * budget:.0f}[/] "
         f"(${budget:g}/trial cap)", title="ready", border_style="green"))
     if not Confirm.ask("[cyan]run it?[/]", default=False, console=console):
         raise KeyboardInterrupt
     return QualityWizardResult(mode="full", arms=",".join(arms), tasks=tasks, model=model,
-                               k=k, budget_usd=budget, milestones=milestones, out=out)
+                               k=k, budget_usd=budget, milestones=milestones, out=out, force=force)
 
 
 def _incremental_wizard(console: Console) -> QualityWizardResult:
