@@ -384,12 +384,29 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         return e and any(s in e for s in ("Connection refused", "URLError", "Errno 61",
                                           "Max retries", "Failed to establish"))
 
+    def _is_ratelimit(e):
+        # transient + model-independent: throttling or an overloaded upstream. A model fallback
+        # can't fix it (same key, same limit), so don't waste probes cycling models.
+        return e and any(s in e for s in ("HTTP 429", "rate_limit", "overloaded", "HTTP 500",
+                                          "HTTP 502", "HTTP 503", "HTTP 504", "HTTP 529"))
+
     bad_arm, err = _preflight(replay_model)
     if bad_arm and _is_transport(err):
         # not a model problem — a model fallback can't fix an unreachable endpoint
         console.print(f"[red]{bad_arm} is unreachable[/]: [dim]{err[:160]}[/]\n"
                       f"[yellow]connectivity issue, not a model one — check the {bad_arm} "
                       f"endpoint/proxy is up (not the model). Aborting before any spend.[/]")
+        raise SystemExit(1)
+    if bad_arm and _is_ratelimit(err):
+        # NOT a "can't serve this model" — the key is being throttled. Switching models is
+        # pointless; the real replay would 429 on every step. Say so, and point at the usual
+        # cause: a concurrent full run drawing on the same key/limit.
+        console.print(f"[red]{bad_arm} is rate-limited[/] (HTTP 429 / overloaded) — [yellow]not a "
+                      f"model problem, so switching models won't help.[/]\n[yellow]Your key is "
+                      f"being throttled. If a full run is going on the SAME key, it's competing "
+                      f"for the same limit — pause it, use a separate key, or switch to your "
+                      f"Claude Code subscription (--auth subscription), then retry.[/]\n"
+                      f"[dim]{err[:160]}[/]")
         raise SystemExit(1)
     if bad_arm:
         console.print(f"[yellow]{bad_arm} can't serve {replay_model}[/] (the session's own "
