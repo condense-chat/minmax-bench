@@ -390,7 +390,23 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
         return e and any(s in e for s in ("HTTP 429", "rate_limit", "overloaded", "HTTP 500",
                                           "HTTP 502", "HTTP 503", "HTTP 504", "HTTP 529"))
 
+    def _is_billing(e):
+        # out of credits / quota — model-independent (every fallback fails identically). Comes
+        # back as a 400 invalid_request, so it must be caught BEFORE the model-fallback branch.
+        return e and any(s in e.lower() for s in ("credit balance", "billing", "quota",
+                                                  "insufficient", "payment"))
+
     bad_arm, err = _preflight(replay_model)
+    if bad_arm and _is_billing(err):
+        cred = ("your API key" if eng.auth_mode(env) == "api-key"
+                else "your Claude Code subscription")
+        console.print(f"[red]{bad_arm}: out of credits / quota[/] — [yellow]not a model problem, "
+                      f"so switching models won't help.[/]\n[yellow]The credential in use ("
+                      f"[bold]{cred}[/], auth={eng.auth_mode(env) or 'none'}) has no balance. Add "
+                      f"credits, or switch to a funded credential (a different key, or a refreshed "
+                      f"Claude Code login via `claude setup-token` + --auth subscription).[/]\n"
+                      f"[dim]{err[:180]}[/]")
+        raise SystemExit(1)
     if bad_arm and _is_transport(err):
         # not a model problem — a model fallback can't fix an unreachable endpoint
         console.print(f"[red]{bad_arm} is unreachable[/]: [dim]{err[:160]}[/]\n"
