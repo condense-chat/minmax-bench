@@ -72,7 +72,7 @@ actually active.
 
 | feature | credentials |
 |---|---|
-| `report` / `replay` reference runs, offline demo, `run --dataset sample` | **none** |
+| `report` / `replay` reference runs, offline demo, `cost run --dataset sample` | **none** |
 | your sessions' *recorded* cost (the counterfactual `recorded` row) | **none** |
 | replays: `quality incremental` (your own sessions) + cost-bench proxy runs | `ANTHROPIC_API_KEY`, **or a Claude Code login** (see below) |
 | the quality-bench condense arm | + `CONDENSE_API_KEY` (cost-bench condense uses the `dense` CLI login) |
@@ -101,12 +101,17 @@ uv run minmax-bench strategies                                    # list strateg
 uv run minmax-bench info                                          # configured keys/endpoints
 ```
 
-A `run` on the built-in sample computes the baseline offline (every comparison
+The two benches each have a guided run: **`cost run`** (token/$ savings, below) and
+**`quality run`** ([trajectory preservation](#quality--trajectory-preservation-bench)). Bare
+**`minmax-bench run`** just asks which and forwards — so `cost run` / `quality run` are the
+direct entry points, and `run` is the front door.
+
+A `cost run` on the built-in sample computes the baseline offline (every comparison
 strategy is a proxy that needs keys — see below — so those turns are skipped
 without them):
 
 ```bash
-uv run minmax-bench run --dataset sample
+uv run minmax-bench cost run --dataset sample
 ```
 
 ## Running against real strategies
@@ -114,13 +119,13 @@ uv run minmax-bench run --dataset sample
 ```bash
 # headroom (proxy): pip install "headroom-ai[proxy]" then run the proxy
 headroom proxy --port 8787 --mode cache      # or --mode token (max compression)
-uv run minmax-bench run -d swe-chat:32 -s headroom -m claude-haiku-4-5
+uv run minmax-bench cost run -d swe-chat:32 -s headroom -m claude-haiku-4-5
 
 # condense (proxy): creds are read from the local `dense` CLI config (~/.config/dense)
-uv run minmax-bench run -d swe-chat:32 -s condense-async -m claude-haiku-4-5
+uv run minmax-bench cost run -d swe-chat:32 -s condense-async -m claude-haiku-4-5
 
 # gemini (direct, OpenAI-compatible chat/completions): set GEMINI_API_KEY in .env
-uv run minmax-bench run -d swe-chat:32 -s gemini -m gemini-3.1-flash-lite
+uv run minmax-bench cost run -d swe-chat:32 -s gemini -m gemini-3.1-flash-lite
 ```
 
 > **Proxy runs cost real money.** Each request hits the real upstream (with
@@ -166,7 +171,7 @@ Produce your own run — each is written under `runs/run-<uuid>/` and is itself
 replayable and re-scorable exactly like the reference runs above:
 
 ```bash
-uv run minmax-bench run -d swe-chat:32 \
+uv run minmax-bench cost run -d swe-chat:32 \
   -s headroom -s headroom-kompress -s condense-async \
   -m claude-haiku-4-5 --token-budget 190k
 ```

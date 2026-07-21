@@ -40,6 +40,12 @@ console = Console()
 quality_app = typer.Typer(add_completion=False, help="Quality / trajectory-preservation bench.")
 app.add_typer(quality_app, name="quality")
 
+# The cost bench's guided run lives under `cost run` (mirrors `quality run`); bare
+# `minmax-bench run` asks which bench and forwards. report/replay/runs/strategies stay
+# top-level (they read stored cost runs) and are unaffected.
+cost_app = typer.Typer(add_completion=False, help="Cost / token-savings bench.")
+app.add_typer(cost_app, name="cost")
+
 # defaults mirror minmax_bench.quality.generate's argparse — kept in sync there
 _Q_DATASET = "terminal-bench/terminal-bench-2-1"
 
@@ -75,7 +81,7 @@ def quality_run(
 ):
     """Run the agents end-to-end via Harbor and compare trajectories (SPENDS).
 
-    The quality analog of `minmax-bench run`: bare `quality run` launches a guided
+    The quality analog of `minmax-bench cost run`: bare `quality run` launches a guided
     wizard; or drive it with flags, e.g. `-m claude-haiku-4-5 --tasks 5 --milestones`.
     """
     from minmax_bench.quality.generate import main
@@ -316,7 +322,27 @@ def _resolve_setup(opt: str, strategies: list[str]) -> list[str]:
     return [t.strip() for t in o.split(",") if t.strip()]
 
 
-@app.command("run")
+@app.command("run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def run_dispatch(ctx: typer.Context):
+    """Choose a benchmark — cost or quality — and launch its guided run.
+
+    Skip the prompt with the bench directly: `minmax-bench cost run` /
+    `minmax-bench quality run` (both take flags; this chooser forwards any you pass)."""
+    if not sys.stdin.isatty():
+        console.print("[yellow]non-interactive — pick a bench explicitly:[/] "
+                      "[cyan]minmax-bench cost run[/] … | [cyan]minmax-bench quality run[/] …")
+        raise typer.Exit(2)
+    from rich.prompt import Prompt
+    console.print("[bold]which benchmark?[/]\n"
+                  "  [cyan]cost[/]     token & $ savings of context-reduction proxies\n"
+                  "  [cyan]quality[/]  does compaction preserve the trajectory (does it still work)?")
+    choice = Prompt.ask("[cyan]bench[/]", choices=["cost", "quality"], default="cost",
+                        console=console)
+    import subprocess
+    raise typer.Exit(subprocess.run([sys.argv[0], choice, "run", *ctx.args]).returncode)
+
+
+@cost_app.command("run")
 def run_cmd(
     dataset: str = typer.Option("sample", "--dataset", "-d", help="Dataset spec, e.g. sample | swe-chat:50 | claude-code:/path/*.jsonl"),
     strategy: list[str] = typer.Option(None, "--strategy", "-s", help="Strategy name(s); repeatable. Default: headroom condense."),
@@ -569,7 +595,7 @@ Only raw token usage is stored; cost is always recomputed from it, per model.
 
 ## Resume (reuse caches, add strategies/models, spend only on what's missing)
 
-    minmax-bench run --run {m.uuid} -s condense
+    minmax-bench cost run --run {m.uuid} -s condense
 """
 
 
