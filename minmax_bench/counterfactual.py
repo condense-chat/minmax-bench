@@ -398,15 +398,20 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int, eve
                       f"endpoint/proxy is up (not the model). Aborting before any spend.[/]")
         raise SystemExit(1)
     if bad_arm and _is_ratelimit(err):
-        # NOT a "can't serve this model" — the key is being throttled. Switching models is
-        # pointless; the real replay would 429 on every step. Say so, and point at the usual
-        # cause: a concurrent full run drawing on the same key/limit.
+        # NOT a "can't serve this model" — the credential is being throttled. Switching models is
+        # pointless; the real replay would 429 on every step. Say so, and tailor the fix to the
+        # auth actually in use (advising "switch to subscription" is nonsense if already on it).
+        if eng.auth_mode(env) == "subscription":
+            fix = ("You're on your Claude Code subscription — its usage window is throttling you. "
+                   "A concurrent full run on the SAME login competes for it: pause it, wait for "
+                   "the window to reset, or use an API key (set ANTHROPIC_API_KEY / --auth api-key).")
+        else:
+            fix = ("Your API key is being throttled. If a full run is going on the SAME key it's "
+                   "competing for the same limit: pause it, use a separate key, or switch to your "
+                   "Claude Code subscription (--auth subscription).")
         console.print(f"[red]{bad_arm} is rate-limited[/] (HTTP 429 / overloaded) — [yellow]not a "
-                      f"model problem, so switching models won't help.[/]\n[yellow]Your key is "
-                      f"being throttled. If a full run is going on the SAME key, it's competing "
-                      f"for the same limit — pause it, use a separate key, or switch to your "
-                      f"Claude Code subscription (--auth subscription), then retry.[/]\n"
-                      f"[dim]{err[:160]}[/]")
+                      f"model problem, so switching models won't help.[/]\n[yellow]{fix}[/] "
+                      f"Then retry.\n[dim]{err[:160]}[/]")
         raise SystemExit(1)
     if bad_arm:
         console.print(f"[yellow]{bad_arm} can't serve {replay_model}[/] (the session's own "
