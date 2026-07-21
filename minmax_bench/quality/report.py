@@ -212,6 +212,29 @@ def _is_sidechain(path):
     return False
 
 
+def _trial_metrics(trial_dir):
+    """cost_usd + total tokens + wall-clock seconds from a trial's result.json ({} if absent).
+    Tokens = input + cache + output (the whole trajectory's spend), matching the cost basis."""
+    try:
+        r = json.load(open(os.path.join(trial_dir, "result.json")))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    ar = r.get("agent_result") or {}
+    m = {}
+    if ar.get("cost_usd") is not None:
+        m["cost"] = ar["cost_usd"]
+        m["tok"] = (ar.get("n_input_tokens", 0) + ar.get("n_cache_tokens", 0)
+                    + ar.get("n_output_tokens", 0))
+    try:
+        from datetime import datetime
+        s = datetime.fromisoformat(r["started_at"].replace("Z", "+00:00"))
+        f = datetime.fromisoformat(r["finished_at"].replace("Z", "+00:00"))
+        m["lat"] = (f - s).total_seconds()
+    except (KeyError, ValueError, TypeError):
+        pass
+    return m
+
+
 def index_runs(root, agent):
     """One walk of the results tree -> {'<arm>-<task>': {'runs': [...], 'attempted': n}}.
 
@@ -235,7 +258,7 @@ def index_runs(root, agent):
         cell = idx.setdefault(key, {"runs": [], "attempted": None, "seen": set()})
         if s not in cell["seen"]:
             cell["seen"].add(s)
-            cell["runs"].append((s, open(rt).read().strip()))
+            cell["runs"].append((s, open(rt).read().strip(), _trial_metrics(inst)))
     for ap in glob.glob(f"{root}/**/attempted.json", recursive=True):
         key = os.path.basename(os.path.dirname(ap))
         try:
@@ -252,11 +275,18 @@ def index_runs(root, agent):
 def _cell_stats(cell):
     runs = cell["runs"] if cell else []
     lens, rws, peaks = [], [], []
-    for p, _ in runs:
+    costs, toks, lats = [], [], []
+    for p, _, m in runs:
         acts = actions(p)
         lens.append(len(acts))
         rws.append(rework_count(acts))
         peaks.append(peak_ctx(p))
+        if m.get("cost") is not None:
+            costs.append(m["cost"])
+        if m.get("tok") is not None:
+            toks.append(m["tok"])
+        if m.get("lat") is not None:
+            lats.append(m["lat"])
     n = len(runs)
     attempted = cell["attempted"] if cell and cell["attempted"] else n
     started = n  # trial dirs that actually opened (reward or not); >n means some crashed
@@ -270,9 +300,11 @@ def _cell_stats(cell):
         "n": n, "attempted": max(attempted, n), "lost": max(attempted, n) - n,
         "started": started,
         # a trial that never finished is a failure on the solve axis, not missing data
-        "solve": sum(r == "1" for _, r in runs),
+        "solve": sum(r == "1" for _, r, _m in runs),
         "length": band(lens), "rework": band(rws), "_lens": lens,
         "peak_ctx": max(peaks, default=0),
+        # cost/token/latency for the $ and tokens columns; lists so a band can be shown
+        "_costs": costs, "_toks": toks, "_lats": lats,
     }
 
 
@@ -551,7 +583,10 @@ _FULL_LEGEND = (
     "crashed; — = not run in this pass). length = arm trajectory length vs control's median "
     "(+longer / −shorter; ✓/✗ = within control's noise band, needs ≥2 runs/arm; ⊘ short = "
     "control never crossed the compaction gate, so nothing compacted and any change is "
-    "behavioural). No model was called.")
+    "behavioural). tokens / $ = the arm's mean total tokens and USD/trial, signed vs control "
+    "and coloured INDEPENDENTLY (green below control's spread = saved, red above = costlier, dim "
+    "within) — so an arm that cuts tokens yet costs more, the cache-bust tax, shows green next "
+    "to red. No model was called.")
 _INCR_LEGEND = (
     "teacher-forced per-step run of a recorded session. control = the baseline (its own row); "
     "its faithful is the noise floor, its s/step the latency baseline. Every delta is vs "
@@ -606,6 +641,36 @@ def _len_delta(v, a, sub_gate):
     if a["length_ok"] is not None:
         core += f" {_icon(a['length_ok'])}"
     return _colok(core, a["length_ok"])
+
+
+def _metric_base(lst, fmt):
+    """Control's own metric value (the reference), dim."""
+    return f"[dim]{fmt(sum(lst) / len(lst))}[/]" if lst else _DASH
+
+
+def _metric_cell(ctrl_list, arm_list, fmt):
+    """Arm metric vs control's band: green below control's spread (saved), red above (costlier),
+    dim within. Shows the value + signed % vs control's mean. Colored INDEPENDENTLY per metric,
+    so an arm that cuts tokens (green) yet costs more (red) — the cache-bust tax — shows both."""
+    if not ctrl_list or not arm_list:
+        return _DASH
+    lo, hi = min(ctrl_list), max(ctrl_list)
+    cm, am = sum(ctrl_list) / len(ctrl_list), sum(arm_list) / len(arm_list)
+    val = fmt(am)
+    tag = f"{(am / cm - 1) * 100:+.0f}%" if cm else ""
+    if am > hi:
+        return f"[red]{val}[/] [red]{tag}[/]"
+    if am < lo:
+        return f"[green]{val}[/] [green]{tag}[/]"
+    return f"{val} [dim]{tag}[/]"
+
+
+def _TOKFMT(x):
+    return f"{x / 1e6:.1f}M"
+
+
+def _USDFMT(x):
+    return f"${x:.2f}"
 
 
 def _engaged(inc):
@@ -705,16 +770,20 @@ def _full_table(console, d, model):
     t = Table(title=title, caption=_FULL_LEGEND, caption_justify="left", caption_style="dim")
     for col in ("task", "arm"):
         t.add_column(col, no_wrap=True)
-    for col in ("runs", "solve", "length"):
+    for col in ("runs", "solve", "length", "tokens", "$"):
         t.add_column(col, justify="right")
 
     def render_row(r):
         v, sub = r["vanilla"], r["sub_gate"]
         base = f"{v['length'][1]:.0f}" if v["length"] else _DASH
-        yield True, "control", (_runs(v), _solve_pct(v), f"[dim]{base}[/]")
+        yield True, "control", (_runs(v), _solve_pct(v), f"[dim]{base}[/]",
+                                _metric_base(v["_toks"], _TOKFMT),
+                                _metric_base(v["_costs"], _USDFMT))
         for arm in d["arms"]:
             a = r["arms"][arm]
-            yield False, arm, (_runs(a), _solve_pct(a), _len_delta(v, a, sub))
+            yield False, arm, (_runs(a), _solve_pct(a), _len_delta(v, a, sub),
+                               _metric_cell(v["_toks"], a["_toks"], _TOKFMT),
+                               _metric_cell(v["_costs"], a["_costs"], _USDFMT))
 
     _grouped(t, rows, render_row)
     console.print(t)
