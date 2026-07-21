@@ -382,6 +382,7 @@ class QualityWizardResult:
     budget_usd: float = 5.0
     milestones: bool = True
     force: bool = False              # True = full re-run (redo completed cells); False = resume
+    retries: int = 0                 # extra re-attempts for a crashed/timed-out cell
     # incremental
     source: str = ""                # "own" | "file" | "swechat"
     session: str | None = None
@@ -603,6 +604,14 @@ def _full_wizard(console: Console) -> QualityWizardResult:
     force = Confirm.ask(
         "[cyan]full retry?[/] (re-run ALL cells incl. completed — [red]re-spends everything[/]; "
         "default No = resume, only fill missing)", default=False, console=console)
+    # auto-retry transient failures: a cell that crashes or times out (no reward.txt) is
+    # re-attempted until it resolves to a verdict (reward 0 or 1) or the attempts run out.
+    # A trial that ran and scored — even 0 — is a real result and is NOT retried.
+    retries = 0
+    if Confirm.ask("[cyan]auto-retry failed cells?[/] (re-attempt crashes/timeouts until they "
+                   "resolve — genuine reward-0 fails are kept, not retried)",
+                   default=False, console=console):
+        retries = _ask_int(console, "  [cyan]max extra attempts per cell[/]", 2, lo=1)
     _quality_preflight(console, arms, need_docker=True)
     ntasks = len(task_list)
     kv = k + 1
@@ -613,13 +622,15 @@ def _full_wizard(console: Console) -> QualityWizardResult:
         f"[bold]k[/] {k} (vanilla {kv})\n[bold]tasks[/] ({ntasks}) {shown}\n"
         f"[bold]arms[/] vanilla + {', '.join(arms)}\n"
         f"[bold]milestones[/] {'yes' if milestones else 'no'}   [bold]out[/] {out}\n"
-        f"[bold]mode[/] {'[red]full retry (re-run all)[/]' if force else 'resume (fill missing)'}\n"
+        f"[bold]mode[/] {'[red]full retry (re-run all)[/]' if force else 'resume (fill missing)'}"
+        f"{f'  ·  auto-retry ×{retries}' if retries else ''}\n"
         f"[bold]{trials} trials[/], cost ceiling ~[bold]${trials * budget:.0f}[/] "
         f"(${budget:g}/trial cap)", title="ready", border_style="green"))
     if not Confirm.ask("[cyan]run it?[/]", default=False, console=console):
         raise KeyboardInterrupt
     return QualityWizardResult(mode="full", arms=",".join(arms), tasks=tasks, model=model,
-                               k=k, budget_usd=budget, milestones=milestones, out=out, force=force)
+                               k=k, budget_usd=budget, milestones=milestones, out=out,
+                               force=force, retries=retries)
 
 
 def _incremental_wizard(console: Console) -> QualityWizardResult:

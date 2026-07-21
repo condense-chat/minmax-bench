@@ -413,15 +413,6 @@ def full(args, env):
                         grid.set(arm, task, "skip", done)
                         live.update(grid.render())
                         continue
-                    grid.set(arm, task, "running", done, start=time.monotonic())
-                    live.update(grid.render())
-                    # record intent BEFORE running so killed/crashed trials still count as
-                    # attempted — report.py exposes survivorship instead of silently shrinking n
-                    os.makedirs(cell, exist_ok=True)
-                    json.dump({"k": k, "arm": arm, "task": task, "model": model,
-                               "started_utc": datetime.now(UTC).isoformat(timespec="seconds")},
-                              open(f"{cell}/attempted.json", "w"))
-                    timed_out = False
                     # per-trial wall budget AUTO-SIZED to the task's own author budget so a long
                     # task is never guillotined below what it was designed for — the harness cap
                     # must cover agent EXECUTION (task timeout_sec × this arm's exec multiplier,
@@ -430,35 +421,67 @@ def full(args, env):
                     # 2400s default silently killed every task whose author budget (some 3600s)
                     # exceeded it, for every arm. See _wall_cap.
                     per_trial = _wall_cap(args, eng.task_meta(task)[0], mult or 1)
-                    # tracked Popen (not subprocess.run) so an interrupt/timeout terminates the
-                    # harbor child and waits for its container/network teardown BEFORE the reaper.
-                    with open(f"{out}/_runlog.txt", "a") as runlog:
-                        proc = subprocess.Popen(cmd, env=renv, stdout=runlog,
-                                                stderr=subprocess.STDOUT)
-                        _HARBOR[0] = proc
-                        cap = per_trial * run_k
-                        cell_start = grid.state[(arm, task)]["start"]
-                        try:
-                            while proc.poll() is None:
-                                # count reward.txt live so the trials column ticks (0/4 → 1/4
-                                # → …) as harbor finishes each trial, not just at the end
-                                grid.set(arm, task, "running",
-                                         len(glob.glob(f"{cell}/*/*/verifier/reward.txt")))
-                                live.update(grid.render())
-                                try:
-                                    proc.wait(timeout=0.5)
-                                except subprocess.TimeoutExpired:
-                                    if time.monotonic() - cell_start >= cap:
-                                        proc.terminate()
-                                        try:
-                                            proc.wait(timeout=20)
-                                        except subprocess.TimeoutExpired:
-                                            proc.kill()
-                                        timed_out = True
-                                        break
-                        finally:
-                            _HARBOR[0] = None
-                    ntrials = len(glob.glob(f"{cell}/*/*/verifier/reward.txt"))
+                    # RETRY loop — a crashed/timed-out trial leaves its slot with no reward.txt;
+                    # re-attempt up to --retries EXTRA times until every trial resolves to a real
+                    # verdict (reward 0 OR 1). A trial that ran and scored — even 0 — is resolved
+                    # and never retried: "retry until it succeeds or GENUINELY fails", not "until
+                    # it passes". Each attempt re-runs only what's still missing (harbor -k =
+                    # k - done), so a retry never re-spends a resolved trial. --retries 0 = the
+                    # old single-pass behavior. Bounded on purpose: a task that always times out
+                    # gives up after the budget instead of looping forever.
+                    ntrials, timed_out = done, False
+                    for attempt in range(1, 2 + max(0, args.retries)):
+                        att_done = len(glob.glob(f"{cell}/*/*/verifier/reward.txt"))
+                        att_k = k if (args.force and attempt == 1) else max(0, k - att_done)
+                        if att_k <= 0:
+                            break  # every trial already resolved
+                        cmd[cmd.index("-k") + 1] = str(att_k)  # only the still-missing trials
+                        if attempt > 1:
+                            with open(f"{out}/_runlog.txt", "a") as rl:
+                                rl.write(f"\n### RETRY {attempt - 1} {arm}/{task} "
+                                         f"({att_done}/{k} resolved, re-running {att_k}) ###\n")
+                        grid.set(arm, task, "running", att_done, start=time.monotonic())
+                        live.update(grid.render())
+                        # record intent BEFORE running so killed/crashed trials still count as
+                        # attempted — report.py exposes survivorship instead of shrinking n
+                        os.makedirs(cell, exist_ok=True)
+                        json.dump({"k": k, "arm": arm, "task": task, "model": model,
+                                   "attempt": attempt,
+                                   "started_utc": datetime.now(UTC).isoformat(timespec="seconds")},
+                                  open(f"{cell}/attempted.json", "w"))
+                        timed_out = False
+                        # tracked Popen (not subprocess.run) so an interrupt/timeout terminates the
+                        # harbor child and waits for container/network teardown BEFORE the reaper.
+                        with open(f"{out}/_runlog.txt", "a") as runlog:
+                            proc = subprocess.Popen(cmd, env=renv, stdout=runlog,
+                                                    stderr=subprocess.STDOUT)
+                            _HARBOR[0] = proc
+                            cap = per_trial * att_k
+                            cell_start = grid.state[(arm, task)]["start"]
+                            try:
+                                while proc.poll() is None:
+                                    # count reward.txt live so the trials column ticks (0/4 → 1/4
+                                    # → …) as harbor finishes each trial, not just at the end
+                                    grid.set(arm, task, "running",
+                                             len(glob.glob(f"{cell}/*/*/verifier/reward.txt")))
+                                    live.update(grid.render())
+                                    try:
+                                        proc.wait(timeout=0.5)
+                                    except subprocess.TimeoutExpired:
+                                        if time.monotonic() - cell_start >= cap:
+                                            proc.terminate()
+                                            try:
+                                                proc.wait(timeout=20)
+                                            except subprocess.TimeoutExpired:
+                                                proc.kill()
+                                            timed_out = True
+                                            break
+                            finally:
+                                _HARBOR[0] = None
+                        ntrials = len(glob.glob(f"{cell}/*/*/verifier/reward.txt"))
+                        if ntrials >= k:
+                            break  # every trial resolved (succeeded or genuinely failed)
+                        # still missing trials → transient failure, retry if attempts remain
                     status = "timeout" if timed_out else ("done" if ntrials >= k else "failed")
                     grid.set(arm, task, status, ntrials)
                     live.update(grid.render())
@@ -743,6 +766,11 @@ def main(argv=None):
                     help="trials for the vanilla baseline (default k+1: the noise floor "
                          "is shared by every comparison)")
     ap.add_argument("--budget-usd", type=float, default=5.0)
+    ap.add_argument("--retries", type=int, default=0,
+                    help="extra re-attempts for a cell that CRASHED or TIMED OUT (no reward.txt) "
+                         "— retry until every trial resolves to a verdict (reward 0 or 1) or the "
+                         "attempts run out. A trial that ran and scored (even 0) is NOT retried. "
+                         "0 = single pass.")
     ap.add_argument("--wall-timeout", type=int, default=2400,
                     help="PER-TRIAL wall budget in seconds (the cell gets wall_timeout * k)")
     ap.add_argument("--concurrency", type=int, default=1,
