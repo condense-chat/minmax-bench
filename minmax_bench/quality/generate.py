@@ -40,6 +40,7 @@ from datetime import UTC, datetime
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
+from rich.text import Text
 
 from minmax_bench.quality import engine as eng  # the teacher-forced replay engine
 from minmax_bench.quality.engine import DEFAULT_TASKS, dataset_tasks, resolve_tasks
@@ -52,6 +53,9 @@ class _CellGrid:
     _S = {"pending": ("dim", "· pending"), "running": ("cyan", "▶ running"),
           "done": ("green", "✓ done"), "skip": ("blue", "⤺ cached"),
           "failed": ("red", "✗ failed"), "timeout": ("red", "✗ timeout")}
+    # single-char glyphs for the compact (many-cell) view
+    _G = {"pending": ("dim", "·"), "running": ("cyan", "▶"), "done": ("green", "✓"),
+          "skip": ("blue", "◦"), "failed": ("red", "✗"), "timeout": ("red", "⨯")}
 
     def __init__(self, arms, tasks, kv, k, budget):
         self.order = [(a, t) for a in arms for t in tasks]
@@ -69,6 +73,18 @@ class _CellGrid:
 
     def render(self):
         now = time.monotonic()
+        # a Live region can't scroll: a table taller than the terminal is cropped to "…" and
+        # HIDES rows. When the cell list wouldn't fit, collapse to one glyph row per arm (always
+        # fits vertically) so every cell's status stays visible. Detailed table when it fits.
+        try:
+            avail = _console.size.height
+        except Exception:
+            avail = 0
+        if avail and len(self.order) + 6 > avail:
+            return self._render_compact(now)
+        return self._render_table(now)
+
+    def _render_table(self, now):
         t = Table(title="[bold]quality run — full trajectories")
         for c, j in (("#", "right"), ("arm", "left"), ("task", "left"),
                      ("status", "left"), ("trials", "right"), ("elapsed", "right")):
@@ -84,6 +100,35 @@ class _CellGrid:
                       f"{s['trials']}/{self.kof[arm]}", el)
         t.caption = (f"{n_done}/{len(self.order)} cells · {int(now - self.run_start)}s elapsed · "
                      f"ceiling ${sum(self.kof.values()) * self.budget:.0f}")
+        return t
+
+    def _render_compact(self, now):
+        """One row per arm, each cell a colored status glyph in task order — fits any height."""
+        finished = {"done", "skip", "failed", "timeout"}
+        by_arm = {}
+        for (arm, task) in self.order:
+            by_arm.setdefault(arm, []).append(task)
+        t = Table(title="[bold]quality run — full trajectories [dim](compact — many cells)")
+        t.add_column("arm", justify="left")
+        t.add_column("cells", justify="left")
+        t.add_column("done", justify="right")
+        n_done = 0
+        for arm, arm_tasks in by_arm.items():
+            glyphs = Text()
+            done = 0
+            for task in arm_tasks:
+                s = self.state[(arm, task)]
+                style, ch = self._G[s["status"]]
+                glyphs.append(ch, style=style)
+                done += s["status"] in finished
+            n_done += done
+            t.add_row(arm, glyphs, f"{done}/{len(arm_tasks)}")
+        running = next((f"{a}/{tk}" for (a, tk) in self.order
+                        if self.state[(a, tk)]["status"] == "running"), None)
+        t.caption = (f"{n_done}/{len(self.order)} cells · {int(now - self.run_start)}s · "
+                     + (f"▶ {running} · " if running else "")
+                     + "✓done ▶run ✗fail ⨯timeout ◦cached ·pending · "
+                     + f"ceiling ${sum(self.kof.values()) * self.budget:.0f}")
         return t
 
 DEFAULT_DATASET = "terminal-bench/terminal-bench-2-1"  # the only validated dataset so far
