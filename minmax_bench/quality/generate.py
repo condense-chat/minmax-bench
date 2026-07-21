@@ -757,7 +757,19 @@ def judge_milestones(args, env):
         sys.exit("milestone judge needs an API key:\n  - " + "\n  - ".join(problems))
     arms = ["vanilla"] + [a for a in args.arms.split(",") if a]
     result, mpath = {}, f"{args.out}/milestones.json"
+    # CACHE judge results: a judge call is real spend, so reuse already-judged tasks from a
+    # prior milestones.json and only judge what's missing — unless --force (the wizard's "full
+    # retry"), which re-judges everything. Failed/skipped tasks aren't cached (never entered
+    # result), so they retry next run — which is what you want after a transient 4xx.
+    if os.path.exists(mpath) and not args.force:
+        try:
+            result = json.load(open(mpath)) or {}
+        except (OSError, json.JSONDecodeError):
+            result = {}
     for task in resolve_tasks(args.tasks, args.dataset.split('/', 1)[0]):
+        if task in result and not args.force:
+            print(f"[milestones] {task}: cached — skipping (use full retry / --force to re-judge)")
+            continue
         sess = {arm: _runs(args.out, arm, task) for arm in arms}  # glob once per (task, arm)
         ref = next((p for p, r in sess["vanilla"] if r == "1"), None)
         if not ref:

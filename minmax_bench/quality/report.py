@@ -578,15 +578,15 @@ def main(argv=None):
 # and INCREMENTAL teacher-forced per-step (scoring, compression, faithfulness, cost) — each
 # with control on its own row. rework/milestone/ctx detail stays in report.html.
 _FULL_LEGEND = (
-    "control = the vanilla baseline (its own row); each arm is measured against it. "
-    "runs = finished trials. solve = % of trials that passed the task's verifier (⚠ = some "
-    "crashed; — = not run in this pass). length = arm trajectory length vs control's median "
-    "(+longer / −shorter; ✓/✗ = within control's noise band, needs ≥2 runs/arm; ⊘ short = "
-    "control never crossed the compaction gate, so nothing compacted and any change is "
-    "behavioural). tokens / $ = the arm's mean total tokens and USD/trial, signed vs control "
-    "and coloured INDEPENDENTLY (green below control's spread = saved, red above = costlier, dim "
-    "within) — so an arm that cuts tokens yet costs more, the cache-bust tax, shows green next "
-    "to red. No model was called.")
+    "one table per arm; each row a task. van len/tok/$ = the vanilla baseline (mean steps, "
+    "total tokens, USD/trial) — the shared reference, dim. The arm's len/tok/$ are its mean vs "
+    "vanilla, signed and coloured INDEPENDENTLY: green below vanilla's spread (shorter / saved), "
+    "red above (longer / costlier), dim within — so an arm that cuts tokens yet costs more, the "
+    "cache-bust tax, shows green next to red. verdict = length preservation (the load-bearing "
+    "axis): same work (within vanilla's band) / drifted ↑ longer / shorter ↓ / ⊘ too short "
+    "(vanilla never crossed the compaction gate — nothing compacted, so any change is "
+    "behavioural, not compaction). n1 = single run, a trend not a verdict (needs ≥2/arm). "
+    "Under each task: peak context + solve rate (⚠lost trials count as fails). No model was called.")
 _INCR_LEGEND = (
     "teacher-forced per-step run of a recorded session. control = the baseline (its own row); "
     "its faithful is the noise floor, its s/step the latency baseline. Every delta is vs "
@@ -762,31 +762,64 @@ def _grouped(t, rows, render_row):
             t.add_row(r["task"] if first else "", arm, *cells)
 
 
+def _LENFMT(x):
+    return f"{x:.0f}"
+
+
+def _verdict_cell(v, a, sub_gate):
+    """Length-preservation verdict (the load-bearing axis): same work / drifted ↑ / shorter ↓ /
+    ⊘ too short / — not run. Statistical (band overlap) when both arms have ≥2 runs; otherwise
+    DIRECTIONAL vs vanilla's spread and tagged n1 (a single run reads a trend, not significance)."""
+    if not a["_lens"] or not v["length"]:
+        return _DASH
+    if sub_gate:
+        return "[dim]⊘ too short[/]"
+    lo, hi, am = v["length"][0], v["length"][2], a["length"][1]
+    if a["length_ok"] is True:
+        return "[green]same work[/]"
+    if a["length_ok"] is False:
+        return "[red]drifted ↑ longer[/]" if am > hi else "[yellow]shorter ↓[/]"
+    n1 = "[dim] n1[/]"                                    # k<2 → directional, not a real verdict
+    if am > hi:
+        return "[red]drifted ↑ longer[/]" + n1
+    if am < lo:
+        return "[yellow]shorter ↓[/]" + n1
+    return "[green]~ same[/]" + n1
+
+
 def _full_table(console, d, model):
+    """One table PER ARM: each row a task, vanilla's length/tokens/$ then the arm's (colored
+    vs vanilla), verdict last. Vanilla is the shared reference, repeated in each arm's table."""
     rows = [r for r in d["rows"] if _has_full(r, d["arms"])]
     if not rows:
         return
-    title = "[bold]quality — full trajectories" + (f" · {model}" if model else "") + "[/]"
-    t = Table(title=title, caption=_FULL_LEGEND, caption_justify="left", caption_style="dim")
-    for col in ("task", "arm"):
-        t.add_column(col, no_wrap=True)
-    for col in ("runs", "solve", "length", "tokens", "$"):
-        t.add_column(col, justify="right")
-
-    def render_row(r):
-        v, sub = r["vanilla"], r["sub_gate"]
-        base = f"{v['length'][1]:.0f}" if v["length"] else _DASH
-        yield True, "control", (_runs(v), _solve_pct(v), f"[dim]{base}[/]",
-                                _metric_base(v["_toks"], _TOKFMT),
-                                _metric_base(v["_costs"], _USDFMT))
-        for arm in d["arms"]:
-            a = r["arms"][arm]
-            yield False, arm, (_runs(a), _solve_pct(a), _len_delta(v, a, sub),
-                               _metric_cell(v["_toks"], a["_toks"], _TOKFMT),
-                               _metric_cell(v["_costs"], a["_costs"], _USDFMT))
-
-    _grouped(t, rows, render_row)
-    console.print(t)
+    for ai, arm in enumerate(d["arms"]):
+        arm_rows = [r for r in rows if r["arms"][arm]["_lens"] or r["arms"][arm]["n"]]
+        if not arm_rows:
+            continue
+        title = f"[bold]{arm} vs vanilla" + (f" · {model}" if model else "") + "[/]"
+        t = Table(title=title, caption=_FULL_LEGEND if ai == len(d["arms"]) - 1 else None,
+                  caption_justify="left", caption_style="dim", pad_edge=False)
+        t.add_column("task", no_wrap=True)
+        for c in ("len", "tok", "$"):
+            t.add_column(f"van {c}", justify="right", style="dim")
+        for c in ("len", "tok", "$"):
+            t.add_column(f"{arm[:8]} {c}", justify="right")
+        t.add_column("verdict", justify="left", no_wrap=True)
+        for r in arm_rows:
+            v, a, sub = r["vanilla"], r["arms"][arm], r["sub_gate"]
+            peak = v["peak_ctx"] // 1000
+            taskcell = (f"{r['task']}\n[dim]peak {peak}k{' ⊘' if sub else ''} · "
+                        f"solve {a['solve']}/{a['attempted']}[/]")
+            t.add_row(
+                taskcell,
+                f"[dim]{v['length'][1]:.0f}[/]" if v["length"] else _DASH,
+                _metric_base(v["_toks"], _TOKFMT), _metric_base(v["_costs"], _USDFMT),
+                _metric_cell(v["_lens"], a["_lens"], _LENFMT),
+                _metric_cell(v["_toks"], a["_toks"], _TOKFMT),
+                _metric_cell(v["_costs"], a["_costs"], _USDFMT),
+                _verdict_cell(v, a, sub))
+        console.print(t)
 
 
 def _incremental_table(console, d, model):
