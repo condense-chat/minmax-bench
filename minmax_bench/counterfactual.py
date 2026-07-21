@@ -182,9 +182,13 @@ def pick_session(console: Console) -> Path:
 
 # --------------------------------------------------------------------------- session meta
 def session_meta(path: Path) -> dict:
-    """cwd + recorded model + Claude Code version from a session (first occurrence wins);
-    version picks the exact binary to capture the request from."""
-    cwd, model, version = None, None, None
+    """cwd + recorded model + Claude Code version from a session. cwd/version are first-
+    occurrence; model is the DOMINANT one (most assistant turns), so a session that mixes
+    models — a main model plus fast-mode/helper turns (e.g. fable-5) — inherits the model it
+    mostly ran on, not whichever happened to answer first. <synthetic> and any <…> placeholder
+    are skipped: Claude Code stamps those on messages it injects locally (interrupts, hook
+    output, compact notices), not real API responses."""
+    cwd, version, models = None, None, {}
     with path.open(encoding="utf-8") as fh:
         for line in fh:
             try:
@@ -194,9 +198,10 @@ def session_meta(path: Path) -> dict:
             cwd = cwd or rec.get("cwd")
             version = version or rec.get("version")
             if rec.get("type") == "assistant":
-                model = model or rec.get("message", {}).get("model")
-            if cwd and model and version:
-                break
+                m = rec.get("message", {}).get("model")
+                if m and not m.startswith("<"):
+                    models[m] = models.get(m, 0) + 1
+    model = max(models, key=models.get) if models else None
     return {"cwd": cwd, "model": model, "version": version}
 
 
