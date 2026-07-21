@@ -526,26 +526,133 @@ def render_md(d):
     return "\n".join(o) + "\n"
 
 
+_HTML_STYLE = """
+:root{--bg:#f7f9fb;--panel:#fff;--panel2:#f1f4f8;--line:#e2e7ee;--ink:#17202e;--ink2:#586274;
+--ink3:#8a94a5;--good:#1f9d5b;--bad:#d1453a;--warn:#b9812a;--mut:#8791a2;
+--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:system-ui,-apple-system,sans-serif}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1219;--panel:#151d27;--panel2:#1b2530;
+--line:#28323f;--ink:#e2e8f1;--ink2:#9aa6b6;--ink3:#6b7686;--good:#33c37e;--bad:#f26a5c;
+--warn:#e0a93f;--mut:#7d8798}}
+:root[data-theme=dark]{--bg:#0d1219;--panel:#151d27;--panel2:#1b2530;--line:#28323f;--ink:#e2e8f1;
+--ink2:#9aa6b6;--ink3:#6b7686;--good:#33c37e;--bad:#f26a5c;--warn:#e0a93f;--mut:#7d8798}
+:root[data-theme=light]{--bg:#f7f9fb;--panel:#fff;--panel2:#f1f4f8;--line:#e2e7ee;--ink:#17202e;
+--ink2:#586274;--ink3:#8a94a5;--good:#1f9d5b;--bad:#d1453a;--warn:#b9812a;--mut:#8791a2}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+font-size:14px;line-height:1.5}.wrap{max-width:1000px;margin:0 auto;padding:28px 20px 80px}
+h1{font-family:var(--mono);font-size:19px;margin:0 0 4px}h2{font-family:var(--mono);font-size:15px;
+margin:30px 0 8px}.dim{color:var(--ink3);font-weight:400}.sub{color:var(--ink2);max-width:70ch;font-size:13px}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;background:var(--panel);
+border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink3);font-weight:600;
+text-align:right;padding:9px 11px;background:var(--panel2);border-bottom:1px solid var(--line)}
+th.l{text-align:left}td{padding:9px 11px;text-align:right;border-bottom:1px solid var(--line);
+font-family:var(--mono);font-size:12.5px}td.l{text-align:left;font-family:var(--sans)}
+tr.row{cursor:pointer}tr.row:hover td{background:var(--panel2)}tr.row.open td{background:var(--panel2)}
+.task b{font-weight:600}.task .s{display:block;font-family:var(--mono);font-size:10.5px;color:var(--ink3)}
+.v{color:var(--ink3)}.d{font-size:11px;display:block}.good{color:var(--good)}.bad{color:var(--bad)}
+.warn{color:var(--warn)}.mut{color:var(--ink2)}
+.pill{font-family:var(--sans);font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:20px;
+white-space:nowrap;display:inline-block}.pill.good{background:color-mix(in srgb,var(--good) 16%,transparent);color:var(--good)}
+.pill.bad{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}
+.pill.warn{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn)}
+.pill.na{background:var(--panel2);color:var(--ink2)}
+tr.det td{background:var(--panel2);font-family:var(--sans);text-align:left;font-size:12.5px;color:var(--ink2)}
+.det .grid{display:flex;flex-wrap:wrap;gap:8px 22px;padding:4px 2px}.det b{color:var(--ink)}
+.det .k{color:var(--ink3);font-size:11px;text-transform:uppercase;letter-spacing:.03em}
+.caret{color:var(--ink3);display:inline-block;width:12px}tr.row.open .caret{transform:rotate(90deg)}
+.foot{margin-top:22px;font-size:12px;color:var(--ink3)}
+"""
+
+
+def _html_report_body(d):
+    """Interactive per-arm HTML derived from the SAME _cmp/_verdict the console uses."""
+    import html as H
+
+    def fL(x):
+        return f"{x:.0f}"
+
+    def fT(x):
+        return f"{x / 1e6:.1f}M"
+
+    def fU(x):
+        return f"${x:.2f}"
+
+    ST = {"good": "good", "bad": "bad", "within": "mut", "warn": "warn", "na": "mut"}
+
+    def mcell(ctrl, arm, fmt):
+        c = _cmp(ctrl, arm)
+        if not c:
+            return '<td>—</td>'
+        st = ST[c["state"]]
+        return (f'<td><span class="v">{fmt(c["van"])}→</span><span class="{st}">{fmt(c["arm"])}</span>'
+                f'<span class="d {st}">{c["pct"]:+.0f}%</span></td>')
+
+    def detail(v, a):
+        bits = [f'<span><span class="k">length</span> vanilla [{", ".join(map(str, v["_lens"]))}] '
+                f'· arm [{", ".join(map(str, a["_lens"]))}]</span>',
+                f'<span><span class="k">$/trial</span> vanilla [{", ".join(f"{x:.2f}" for x in v["_costs"])}] '
+                f'· arm [{", ".join(f"{x:.2f}" for x in a["_costs"])}]</span>']
+        if a.get("_lats") and v.get("_lats"):
+            bits.append(f'<span><span class="k">latency</span> vanilla '
+                        f'{sum(v["_lats"]) / len(v["_lats"]):.0f}s · arm '
+                        f'{sum(a["_lats"]) / len(a["_lats"]):.0f}s</span>')
+        inc = a.get("incr") or {}
+        if inc.get("fid") is not None:
+            bits.append(f'<span><span class="k">incremental</span> compaction '
+                        f'<b>{_pct(inc.get("comp"))}</b> · faithful <b>{inc["fid"]:.0%}</b> '
+                        f'(ctrl {inc.get("fid_ctrl", 0):.0%}) · $ savings <b>{_pct(inc.get("costd"))}</b></span>')
+        return '<div class="grid">' + "".join(bits) + '</div>'
+
+    secs = []
+    for arm in d["arms"]:
+        arm_rows = [r for r in d["rows"] if r["arms"][arm]["_lens"] or r["arms"][arm]["n"]]
+        if not arm_rows:
+            continue
+        msh = '<th>milestone</th>' if d["has_milestone"] else ''
+        span = 6 if d["has_milestone"] else 5
+        trs = []
+        for r in arm_rows:
+            v, a, sub = r["vanilla"], r["arms"][arm], r["sub_gate"]
+            label, state = _verdict(v, a, sub)
+            pk = v["peak_ctx"] // 1000
+            ms = ""
+            if d["has_milestone"]:
+                m = a.get("milestone")
+                mst = ("good" if a.get("milestone_ok") else "bad"
+                       if a.get("milestone_ok") is False else "mut")
+                ms = f'<td><span class="{mst}">{m[1] * 100:.0f}%</span></td>' if m else '<td>—</td>'
+            trs.append(
+                f'<tr class="row" onclick="tg(this)"><td class="l task"><span class="caret">▸</span> '
+                f'<b>{H.escape(r["task"])}</b><span class="s">peak {pk}k{" ⊘" if sub else ""} · '
+                f'solve {a["solve"]}/{a["attempted"]}</span></td>'
+                + mcell(v["_lens"], a["_lens"], fL) + mcell(v["_toks"], a["_toks"], fT)
+                + mcell(v["_costs"], a["_costs"], fU)
+                + f'<td class="l"><span class="pill {state}">{H.escape(label)}</span></td>{ms}</tr>'
+                + f'<tr class="det" style="display:none"><td class="l" colspan="{span}">{detail(v, a)}</td></tr>')
+        secs.append(f'<h2>{H.escape(arm)} <span class="dim">vs vanilla</span></h2>'
+                    f'<table><thead><tr><th class="l">task ▸</th><th>length</th><th>tokens</th>'
+                    f'<th>$</th><th class="l">verdict</th>{msh}</tr></thead><tbody>'
+                    + "".join(trs) + '</tbody></table>')
+    return "".join(secs)
+
+
 def render_html(d):
     import html as H
-    head, rows = table(d)
-    cls = {True: "ok", False: "bad", None: ""}
-    trs = ["<tr>" + "".join(
-        f"<td><span class='{cls[ok]}'>{H.escape(c)}</span></td>" if ok is not None
-        else f"<td>{H.escape(c)}</td>" for c, ok in row) + "</tr>" for row in rows]
-    style = ("body{font:13px/1.5 -apple-system,Segoe UI,sans-serif;margin:24px;"
-             "background:#0f1117;color:#d8dce6} h1{font-size:19px}"
-             ".sub{color:#8b93a3;margin-bottom:14px;max-width:900px}"
-             "table{border-collapse:collapse} th,td{border:1px solid #232838;"
-             "padding:6px 10px;text-align:center;font-size:12px}"
-             "th{background:#161a22;color:#9aa4b5} .ok{color:#3fb950;font-weight:700}"
-             ".bad{color:#e5534b;font-weight:700}")
-    ths = "".join(f"<th>{H.escape(h)}</th>" for h in head)
-    return ("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-            "<title>Trajectory preservation</title>"
-            f"<style>{style}</style></head><body><h1>Trajectory preservation</h1>"
-            f"<div class=\"sub\">{H.escape(SUB)}</div>"
-            f"<table><tr>{ths}</tr>{''.join(trs)}</table></body></html>")
+    model = d.get("model") or ""
+    title = "Trajectory preservation" + (f" · {model}" if model else "")
+    return (f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" '
+            f'content="width=device-width,initial-scale=1"><title>{H.escape(title)}</title>'
+            f'<style>{_HTML_STYLE}</style></head><body><div class="wrap">'
+            f'<h1>trajectory preservation <span class="dim">{H.escape("· " + model) if model else ""}</span></h1>'
+            f'<div class="sub">{H.escape(SUB)}</div>'
+            + _html_report_body(d)
+            + '<div class="foot">length/tokens/$ show vanilla→arm with the signed delta, coloured '
+            'green (shorter/saved) / red (longer/costlier) / grey (within vanilla\'s band) '
+            '— independently, so token-savings that cost more show green next to red. '
+            'Click a row for per-trial values and incremental compaction / faithful / $ savings.</div>'
+            '</div><script>function tg(r){var d=r.nextElementSibling;'
+            'var o=d.style.display!=="none";d.style.display=o?"none":"";'
+            'r.classList.toggle("open",!o);}</script></body></html>')
 
 
 def main(argv=None):
@@ -646,39 +753,25 @@ def _len_delta(v, a, sub_gate):
     return _colok(core, a["length_ok"])
 
 
-def _metric_base(lst, fmt):
-    """Control's own metric value (the reference), dim."""
-    return f"[dim]{fmt(sum(lst) / len(lst))}[/]" if lst else _DASH
-
-
-def _metric_cell(ctrl_list, arm_list, fmt):
-    """Arm metric vs control's band: green below control's spread (saved), red above (costlier),
-    dim within. Shows the value + signed % vs control's mean. Colored INDEPENDENTLY per metric,
-    so an arm that cuts tokens (green) yet costs more (red) — the cache-bust tax — shows both."""
+def _cmp(ctrl_list, arm_list):
+    """The ONE metric comparison both the console and HTML derive from, so they can't drift.
+    Returns {van, arm, pct, state} or None. state: good = arm below vanilla's spread
+    (shorter/saved), bad = above (longer/costlier), within = inside the band."""
     if not ctrl_list or not arm_list:
-        return _DASH
+        return None
     lo, hi = min(ctrl_list), max(ctrl_list)
     cm, am = sum(ctrl_list) / len(ctrl_list), sum(arm_list) / len(arm_list)
-    val = fmt(am)
-    tag = f"{(am / cm - 1) * 100:+.0f}%" if cm else ""
-    if am > hi:
-        return f"[red]{val}[/] [red]{tag}[/]"
-    if am < lo:
-        return f"[green]{val}[/] [green]{tag}[/]"
-    return f"{val} [dim]{tag}[/]"
+    state = "good" if am < lo else "bad" if am > hi else "within"
+    return {"van": cm, "arm": am, "pct": (am / cm - 1) * 100 if cm else 0.0, "state": state}
 
 
 def _cmp_cell(ctrl_list, arm_list, fmt):
-    """vanilla→arm for one metric on line 1, the signed delta below. arm value + delta coloured
-    vs vanilla's band: green below the spread (shorter/saved), red above (longer/costlier), dim
-    within. One column per metric instead of two, so the table stays readable."""
-    if not ctrl_list or not arm_list:
+    """Console cell: vanilla→arm on line 1, signed delta below, coloured by _cmp's state."""
+    c = _cmp(ctrl_list, arm_list)
+    if not c:
         return _DASH
-    lo, hi = min(ctrl_list), max(ctrl_list)
-    cm, am = sum(ctrl_list) / len(ctrl_list), sum(arm_list) / len(arm_list)
-    color = "green" if am < lo else "red" if am > hi else "dim"
-    tag = f"{(am / cm - 1) * 100:+.0f}%" if cm else ""
-    return f"[dim]{fmt(cm)}[/]→[{color}]{fmt(am)}[/]\n[{color}]{tag}[/]"
+    color = {"good": "green", "bad": "red", "within": "dim"}[c["state"]]
+    return f"[dim]{fmt(c['van'])}[/]→[{color}]{fmt(c['arm'])}[/]\n[{color}]{c['pct']:+.0f}%[/]"
 
 
 def _milestone_cell(a):
@@ -791,25 +884,31 @@ def _LENFMT(x):
     return f"{x:.0f}"
 
 
-def _verdict_cell(v, a, sub_gate):
-    """Length-preservation verdict (the load-bearing axis): same work / drifted ↑ / shorter ↓ /
-    ⊘ too short / — not run. Statistical (band overlap) when both arms have ≥2 runs; otherwise
-    DIRECTIONAL vs vanilla's spread and tagged n1 (a single run reads a trend, not significance)."""
+def _verdict(v, a, sub_gate):
+    """Shared length-preservation verdict → (label, state). state ∈ good|bad|warn|na. Statistical
+    (band overlap) when both arms have ≥2 runs; else DIRECTIONAL vs vanilla's spread, tagged n1 (a
+    single run reads a trend, not significance). Both console and HTML render from this."""
     if not a["_lens"] or not v["length"]:
-        return _DASH
+        return ("—", "na")
     if sub_gate:
-        return "[dim]⊘ too short[/]"
+        return ("⊘ too short", "na")
     lo, hi, am = v["length"][0], v["length"][2], a["length"][1]
     if a["length_ok"] is True:
-        return "[green]same work[/]"
+        return ("same work", "good")
     if a["length_ok"] is False:
-        return "[red]drifted ↑ longer[/]" if am > hi else "[yellow]shorter ↓[/]"
-    n1 = "[dim] n1[/]"                                    # k<2 → directional, not a real verdict
-    if am > hi:
-        return "[red]drifted ↑ longer[/]" + n1
+        return ("drifted ↑ longer", "bad") if am > hi else ("shorter ↓", "warn")
+    if am > hi:                                           # k<2 → directional, not a real verdict
+        return ("drifted ↑ longer n1", "bad")
     if am < lo:
-        return "[yellow]shorter ↓[/]" + n1
-    return "[green]~ same[/]" + n1
+        return ("shorter ↓ n1", "warn")
+    return ("~ same n1", "good")
+
+
+def _verdict_cell(v, a, sub_gate):
+    """Console verdict cell — rich-markup wrapper around the shared _verdict."""
+    label, state = _verdict(v, a, sub_gate)
+    color = {"good": "green", "bad": "red", "warn": "yellow", "na": "dim"}[state]
+    return f"[{color}]{label}[/]"
 
 
 def _full_table(console, d, model):
