@@ -32,7 +32,7 @@ from rich import box
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
@@ -121,9 +121,9 @@ def _peek(path: Path, max_lines: int = 300) -> tuple[str, str | None, bool, int,
     return " ".join(prompt.split())[:90], cwd, has_assistant, peak, total, turns, capped
 
 
-def scan_sessions(root: Path = CC_PROJECTS, limit: int = 40) -> list[LocalSession]:
+def scan_sessions(root: Path = CC_PROJECTS, limit: int = 100) -> list[LocalSession]:
     """Most-recent real sessions (skips sub-agent sidechains and empty files). The picker
-    paginates these, so the limit is generous."""
+    paginates these, so the limit is generous; _peek is byte-capped so even 100 stays cheap."""
     found: list[LocalSession] = []
     for f in sorted(root.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
         if len(found) >= limit:
@@ -269,7 +269,11 @@ def _interactive_pick(console: Console, sessions: list[LocalSession]) -> Path | 
 
 
 def pick_session(console: Console) -> Path:
-    sessions = scan_sessions()
+    # scanning up to 100 transcripts (each byte-capped) can take a beat — show a spinner
+    with Progress(SpinnerColumn(), TextColumn("[cyan]scanning local sessions…"),
+                  console=console, transient=True) as prog:
+        prog.add_task("", total=None)
+        sessions = scan_sessions()
     if not sessions:
         console.print(f"[red]no Claude Code sessions found under {CC_PROJECTS}[/]")
         raise SystemExit(1)
