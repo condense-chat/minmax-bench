@@ -187,9 +187,16 @@ def _arm_wiring(arm, env):
         return (f"http://host.docker.internal:{PTPORT}", "host.docker.internal",
                 "claude-code", [])
     if arm == "condense":
-        tok = env.get("CONDENSE_API_KEY", "")
-        return ("https://api.condense.chat/anthropic", "api.condense.chat", "claude-code",
-                ["--ae", f"ANTHROPIC_CUSTOM_HEADERS=X-Condense-Auth-Token: {tok}"])
+        # creds come from the user's local `dense` CLI profile (~/.config/dense), exactly like
+        # a real dense run — no condense key in .env. CONDENSE_API_KEY is only a headless
+        # fallback. Pass BOTH headers dense sends (auth token + user id) into the container.
+        creds = eng.condense_creds(env) or {}
+        hdr = f"X-Condense-Auth-Token: {creds.get('token', '')}"
+        if creds.get("user"):
+            hdr += f"\nX-Condense-User-Id: {creds['user']}"
+        base = creds.get("url", "https://api.condense.chat/anthropic")
+        host = base.split("://", 1)[-1].split("/", 1)[0]
+        return (base, host, "claude-code", ["--ae", f"ANTHROPIC_CUSTOM_HEADERS={hdr}"])
     if arm == "headroom":
         # regular headroom = the full product: token-mode proxy + the MCP retrieve
         # loop (Compress-Cache-Retrieve), via the CCR agent
@@ -315,9 +322,11 @@ def _validate_full(args, env):
         sys.exit("no Anthropic auth — set ANTHROPIC_API_KEY, or log in to Claude Code "
                  "(run `claude setup-token` + `export CLAUDE_CODE_OAUTH_TOKEN=…`); the "
                  "container's agent needs it to run.")
-    if "condense" in arms and not env.get("CONDENSE_API_KEY") and not args.dry_run:
-        sys.exit("CONDENSE_API_KEY missing — the condense arm would run with an EMPTY auth "
-                 "token and silently produce garbage. Set it in .env or drop the arm.")
+    if "condense" in arms and not eng.condense_creds(env) and not args.dry_run:
+        sys.exit("condense arm has no creds — it would run with an EMPTY auth token and "
+                 "silently produce garbage. condense authenticates via the local `dense` CLI: "
+                 "install it (curl -fsSL https://cli.condense.chat/unix | sh) and run "
+                 "`dense login`. (Headless fallback: set CONDENSE_API_KEY.) Or drop the arm.")
     return arms
 
 
@@ -345,8 +354,10 @@ def _preflight_full(arms, env):
          eng.auth_mode(env) or "ANTHROPIC_API_KEY or `claude setup-token`", True),
     ]
     if "condense" in arms:
-        rows.append(("CONDENSE_API_KEY", bool(env.get("CONDENSE_API_KEY")),
-                     "the condense arm", True))
+        creds = eng.condense_creds(env)
+        via = (f"dense profile ({creds['user'][:8]}…)" if creds and creds.get("user")
+               else "CONDENSE_API_KEY (headless)" if creds else "run `dense login`")
+        rows.append(("condense creds (dense)", bool(creds), via, True))
     if any(a in HEADROOM_MODES for a in arms):
         rows.append(("headroom / uvx", bool(shutil.which("headroom") or shutil.which("uvx")),
                      "the headroom proxy", True))
@@ -458,9 +469,12 @@ def full(args, env):
                     if args.dry_run:
                         print(f"### {arm} / {task} (k={k}, base={base}) ###")
                         shown = " ".join(cmd)
-                        tok = env.get("CONDENSE_API_KEY")
-                        if tok:  # never echo a live key into the terminal/logs
-                            shown = shown.replace(tok, tok[:6] + "…")
+                        # never echo a live credential into the terminal/logs — mask whichever
+                        # condense token is actually in the command (dense profile or the key)
+                        _cc = eng.condense_creds(env) or {}
+                        for tok in (_cc.get("token"), env.get("CONDENSE_API_KEY")):
+                            if tok:
+                                shown = shown.replace(tok, tok[:6] + "…")
                         print("   " + shown)
                         continue
                     if run_k <= 0:

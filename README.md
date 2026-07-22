@@ -75,7 +75,7 @@ actually active.
 | `report` / `replay` reference runs, offline demo, `cost run --dataset sample` | **none** |
 | your sessions' *recorded* cost (the counterfactual `recorded` row) | **none** |
 | replays: `quality incremental` (your own sessions) + cost-bench proxy runs | `ANTHROPIC_API_KEY`, **or a Claude Code login** (see below) |
-| the quality-bench condense arm | + `CONDENSE_API_KEY` (cost-bench condense uses the `dense` CLI login) |
+| the condense arm (quality **and** cost bench) | the local **`dense` CLI** login — install it (`curl -fsSL https://cli.condense.chat/unix \| sh`) and run `dense login` (no key in `.env`; `CONDENSE_API_KEY` is a headless-only fallback) |
 | `--mode full` (Harbor) | Docker + `uv tool install harbor` + the above |
 
 **No API key? Your Claude Code subscription works.** When `ANTHROPIC_API_KEY` is unset, the

@@ -179,6 +179,33 @@ def load_env(path=".env"):
     return env
 
 
+def condense_creds(env):
+    """condense caller creds, resolved the SAME way a real ``dense`` run resolves them.
+
+    PRIMARY source is the local ``dense`` CLI profile under ``~/.config/dense`` (written by
+    ``dense login``) — the whole point is that condense authenticates as the user's own
+    ``dense`` session, with NO condense key in ``.env``. Install the CLI
+    (https://cli.condense.chat/unix) and run ``dense login`` once.
+
+    Falls back to ``CONDENSE_API_KEY`` (+ optional ``CONDENSE_USER_ID``) only for a headless/CI
+    box that has no dense profile on disk. Returns ``{token, user, url}`` or ``None`` if neither
+    is configured. ``CONDENSE_PROFILE`` selects a non-default dense profile.
+    """
+    try:
+        from minmax_bench.dense import load_profile
+        p = load_profile(env.get("CONDENSE_PROFILE") or None)
+        if p.auth_token:
+            return {"token": p.auth_token, "user": p.user_id or "",
+                    "url": p.api_url.rstrip("/") + "/anthropic"}
+    except Exception:  # noqa: BLE001 — dense not installed / no profile: fall back to the key
+        pass
+    tok = env.get("CONDENSE_API_KEY")
+    if tok:
+        return {"token": tok, "user": env.get("CONDENSE_USER_ID", ""),
+                "url": "https://api.condense.chat/anthropic"}
+    return None
+
+
 _CC_TOKEN_CACHE = ["unset"]  # one keychain read per process, not per request
 
 
@@ -267,8 +294,11 @@ def check_arms(arms, env):
             "    - use your Claude Code subscription: run `claude setup-token` and\n"
             "      `export CLAUDE_CODE_OAUTH_TOKEN=<the printed token>` "
             "(it is not persisted where the bench can read it otherwise)")
-    if any(ARMS.get(a, {}).get("condense_auth") for a in arms) and not env.get("CONDENSE_API_KEY"):
-        problems.append("CONDENSE_API_KEY missing — needed for the condense arm")
+    if any(ARMS.get(a, {}).get("condense_auth") for a in arms) and not condense_creds(env):
+        problems.append(
+            "condense arm has no creds. It authenticates via the local `dense` CLI, not a "
+            "key: install it (curl -fsSL https://cli.condense.chat/unix | sh) and run "
+            "`dense login`. (Headless fallback: set CONDENSE_API_KEY.)")
     return problems
 
 
@@ -883,7 +913,11 @@ def read_sse(resp):
 
 
 def call_api(arm, req, tmpl_headers, env):
-    url = ARMS[arm]["base"] + "/v1/messages?beta=true"
+    base = ARMS[arm]["base"]
+    creds = condense_creds(env) if ARMS[arm].get("condense_auth") else None
+    if creds:  # honour the dense profile's api_url (a non-prod profile can point elsewhere)
+        base = creds["url"]
+    url = base + "/v1/messages?beta=true"
     headers = {
         "content-type": "application/json",
         "anthropic-version": tmpl_headers.get("anthropic-version", "2023-06-01"),
@@ -898,8 +932,10 @@ def call_api(arm, req, tmpl_headers, env):
         beta = headers.get("anthropic-beta", "")
         if "oauth-2025-04-20" not in beta:
             headers["anthropic-beta"] = (beta + "," if beta else "") + "oauth-2025-04-20"
-    if ARMS[arm].get("condense_auth"):
-        headers["X-Condense-Auth-Token"] = env["CONDENSE_API_KEY"]
+    if creds:
+        headers["x-condense-auth-token"] = creds["token"]
+        if creds["user"]:  # dense sends the user id too; the key-only fallback may lack it
+            headers["x-condense-user-id"] = creds["user"]
     data = json.dumps(req).encode()
     for attempt in range(3):
         try:

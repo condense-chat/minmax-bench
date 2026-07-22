@@ -262,19 +262,49 @@ def test_scoring_infers_llm_judge():
     assert report._scoring(equiv) == "llm:equiv"
 
 
-def test_check_arms_catches_unknown_arm_and_missing_keys():
+def test_check_arms_catches_unknown_arm_and_missing_keys(monkeypatch):
     # force "no subscription token" so the check is hermetic — cc_oauth_token reads the ambient
     # environment (os.environ / .env / keychain), which the dev machine may actually have
     eng._CC_TOKEN_CACHE[0] = None
+    # and force "no condense creds": condense_creds reads the real ~/.config/dense, which the
+    # dev machine may have logged in — pin it to None so the missing-creds branch is exercised
+    monkeypatch.setattr(eng, "condense_creds", lambda env: None)
     try:
         # headroom-kompress is a full-mode-only arm — not a valid teacher-forced replay arm
         problems = eng.check_arms(["control", "headroom-kompress", "condense"], {})
         text = "\n".join(problems)
         assert "headroom-kompress" in text
-        assert "ANTHROPIC_API_KEY" in text and "CONDENSE_API_KEY" in text
+        assert "ANTHROPIC_API_KEY" in text  # anthropic auth missing
+        assert "dense login" in text and "CONDENSE_API_KEY" in text  # condense creds missing
         assert not eng.check_arms(["control"], {"ANTHROPIC_API_KEY": "k"})
     finally:
         eng._CC_TOKEN_CACHE[0] = "unset"
+
+
+def _pin_dense_home(monkeypatch, home):
+    """Point dense.load_profile at a temp home (its default home= is bound at def-time, so
+    patch the function to inject home instead of patching DENSE_HOME)."""
+    from minmax_bench import dense as dm
+    orig = dm.load_profile
+    monkeypatch.setattr(dm, "load_profile", lambda name=None: orig(name, home=home))
+
+
+def test_condense_creds_prefers_dense_profile_over_key(monkeypatch, tmp_path):
+    # a logged-in dense profile (prod: token + user files under ~/.config/dense)
+    (tmp_path / "token").write_text("tok-from-dense\n")
+    (tmp_path / "user").write_text("user-123\n")
+    _pin_dense_home(monkeypatch, tmp_path)
+    # even with CONDENSE_API_KEY set, the local dense profile wins and carries the user id
+    creds = eng.condense_creds({"CONDENSE_API_KEY": "ak_headless"})
+    assert creds["token"] == "tok-from-dense" and creds["user"] == "user-123"
+    assert creds["url"].endswith("/anthropic")
+
+
+def test_condense_creds_falls_back_to_key_when_no_profile(monkeypatch, tmp_path):
+    _pin_dense_home(monkeypatch, tmp_path)  # empty dense home -> no profile
+    creds = eng.condense_creds({"CONDENSE_API_KEY": "ak_headless", "CONDENSE_USER_ID": "u9"})
+    assert creds["token"] == "ak_headless" and creds["user"] == "u9"
+    assert eng.condense_creds({}) is None  # nothing configured at all
 
 
 # ---------------------------------------------------------------- offline demo end-to-end

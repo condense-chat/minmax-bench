@@ -471,7 +471,11 @@ def _quality_preflight(console: Console, arms: list[str], *, need_docker: bool) 
         rows = [("Anthropic auth", bool(auth_mode(env)),
                  auth_mode(env) or "ANTHROPIC_API_KEY or Claude Code login")]
         if "condense" in arms:
-            rows.append(("CONDENSE_API_KEY", bool(env.get("CONDENSE_API_KEY")), "the condense arm"))
+            from .quality.engine import condense_creds
+            cc = condense_creds(env)
+            via = ("dense profile" if cc and cc.get("user")
+                   else "CONDENSE_API_KEY (headless)" if cc else "run `dense login`")
+            rows.append(("condense creds (dense)", bool(cc), via))
         if any(a.startswith("headroom") for a in arms):
             rows.append(("headroom / uvx", bool(shutil.which("headroom") or shutil.which("uvx")),
                          "the headroom proxy"))
@@ -815,7 +819,7 @@ def run_setup_wizard(console: Console) -> None:
     Idempotent: existing secrets are shown masked and kept unless explicitly replaced."""
     import os
 
-    from .quality.engine import auth_mode, cc_oauth_token, load_env
+    from .quality.engine import auth_mode, cc_oauth_token, condense_creds, load_env
     env_path = Path(".env")
     console.print(Panel.fit(
         Text.assemble(("minmax-bench · setup\n", "bold magenta"),
@@ -825,11 +829,15 @@ def run_setup_wizard(console: Console) -> None:
     env = {**load_env(), **os.environ}
     mask = lambda v: ("…" + v[-4:]) if v and len(v) > 4 else ("set" if v else "[dim]—[/]")
     am, sub = auth_mode(env), bool(cc_oauth_token())
+    cc = condense_creds(env)
+    cc_status = ("[green]dense profile[/]" if cc and cc.get("user")
+                 else "[green]CONDENSE_API_KEY (headless)[/]" if cc
+                 else "[dim]not logged in — `dense login`[/]")
     t = Table(title="[bold]detected", show_header=False, box=None)
     t.add_row("Anthropic auth", f"[green]{am}[/]" if am else "[red]none[/]")
     t.add_row("  ANTHROPIC_API_KEY", mask(env.get("ANTHROPIC_API_KEY")))
     t.add_row("  Claude Code login", "[green]available[/]" if sub else "[dim]not found[/]")
-    t.add_row("CONDENSE_API_KEY", mask(env.get("CONDENSE_API_KEY")))
+    t.add_row("condense (dense CLI)", cc_status)
     t.add_row("HF_TOKEN", mask(env.get("HF_TOKEN")))
     console.print(t)
 
@@ -866,10 +874,18 @@ def run_setup_wizard(console: Console) -> None:
                           "subscription per-run in the wizard's auth toggle or with "
                           "--auth subscription.[/]")
 
-    console.print("\n[bold]2) condense arm[/] — the quality-bench condense arm sends this to "
-                  "api.condense.chat (skip if you won't run condense).")
-    if Confirm.ask("  set CONDENSE_API_KEY?", default=not bool(env.get("CONDENSE_API_KEY")),
-                   console=console):
+    console.print("\n[bold]2) condense arm[/] — condense authenticates via the local "
+                  "[bold]dense[/] CLI (no key in .env). Install it and run [bold]dense login[/]; "
+                  "skip if you won't run condense.")
+    if cc and cc.get("user"):
+        console.print("  [green]dense profile detected[/] — the condense arm uses it "
+                      "automatically, nothing to set.")
+    elif Confirm.ask("  set up dense now (install the CLI + log in)?", default=not bool(cc),
+                     console=console):
+        from .provision import ensure_dense
+        ensure_dense(console)  # installs `dense` if missing, then runs `dense login`
+    elif Confirm.ask("  headless box — set CONDENSE_API_KEY instead?", default=False,
+                     console=console):
         k = Prompt.ask("  [cyan]CONDENSE_API_KEY[/] (ak_…)", password=True, default="",
                        console=console).strip()
         if k:
