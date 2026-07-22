@@ -236,6 +236,21 @@ def _task_hint(msgs: list[dict]) -> str:
                  and not b.get("text", "").lstrip().startswith("<")), "")
 
 
+# order matters: index = severity (good is best). A redundant re-fetch is compaction
+# amnesia — pure waste the arm caused by forgetting context it already had — so it drops
+# the goal-judge verdict one notch (good→degraded→bad). This folds the ↻ signal INTO the
+# headline quality instead of leaving it a separate footnote the eye skips.
+_QUAL_ORDER = ["good", "degraded", "bad"]
+
+
+def _penalize_redundant(q: str | None, redundant: bool) -> str | None:
+    """Down-rank a goal-judge verdict by one notch when the step redundantly re-fetched
+    context an earlier original turn already held. Non-redundant verdicts pass through."""
+    if not q or not redundant or q not in _QUAL_ORDER:
+        return q
+    return _QUAL_ORDER[min(_QUAL_ORDER.index(q) + 1, len(_QUAL_ORDER) - 1)]
+
+
 def rejudge_run(run_dir: str, *, judge: str, env: dict, console: Console,
                 session_root: Path = CC_PROJECTS) -> float:
     """Re-score an existing incremental run's per-step quality WITHOUT re-replaying. Re-runs the
@@ -275,7 +290,10 @@ def rejudge_run(run_dir: str, *, judge: str, env: dict, console: Console,
                     q, c = eng.judge_action_quality(task_hint, situ, rep, env)
                 spent += c
                 if q:
-                    r["quality"], n = q, n + 1
+                    # keep the redundancy penalty consistent with the live replay so a
+                    # recalibration doesn't silently drop the ↻ down-rank
+                    r["quality_raw"] = q
+                    r["quality"], n = _penalize_redundant(q, r.get("redundant")), n + 1
             with open(f, "w") as out:
                 out.write("\n".join(json.dumps(r) for r in recs) + "\n")
             scored = sum("quality" in r for r in recs)
@@ -599,12 +617,15 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
                                    "kompress (no retrieve)[/]")
             tid = prog.add_task("", total=len(arm_sel), stat="")
             consec_err = 0
+            stop_reason = "complete"  # why the arm stopped: complete | budget | errors
             for step, i in enumerate(arm_sel):
                 if spent >= budget_usd:
                     prog.update(tid, stat=f"budget ${budget_usd} reached")
+                    stop_reason = "budget"
                     break
                 if consec_err >= 5:
                     prog.update(tid, stat=f"aborted: {consec_err} consecutive errors")
+                    stop_reason = "errors"
                     break
                 rec = {"arm": arm, "step": step, "msg_index": i}
                 nr = 0
@@ -682,10 +703,14 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
                                     task_hint, eng.recent_context(msgs, i), rep, env)
                             judge_spent += jc
                             spent += jc
-                            rec["quality"] = q
-                            by_step[step]["quality"] = q
-                            if q in qual:
-                                qual[q] += 1
+                            # a redundant re-fetch is compaction amnesia — down-rank the
+                            # verdict one notch (raw kept for transparency / rejudge)
+                            q_adj = _penalize_redundant(q, redundant)
+                            rec["quality_raw"] = q
+                            rec["quality"] = q_adj
+                            by_step[step]["quality"] = q_adj
+                            if q_adj in qual:
+                                qual[q_adj] += 1
                 except Exception as e:  # noqa: BLE001 — record & continue, never abort the run
                     rec["error"] = f"replay exception: {type(e).__name__}: {e}"[:250]
                     n_err += 1
@@ -700,11 +725,20 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
                 f.flush()
                 prog.update(tid, advance=1,
                             stat=f"agree {n_action}/{n_ok or 1} ${spent:.2f}")
+        # if the arm bailed on consecutive errors, name the actual cause (a rate-limit or an
+        # out-of-credits API error is NOT a budget cap) so the summary stops mislabeling it
+        if stop_reason == "errors":
+            stop_reason = ("out of credits" if _is_billing(first_err)
+                           else "rate-limited" if _is_ratelimit(first_err)
+                           else "unreachable" if _is_transport(first_err) else "errors")
         summary["arms"][arm] = {
             "steps_ok": n_ok, "agree_action": n_action, "agree_exact": n_exact,
             # faithful = agreed AND not a redundant re-fetch; redundant = the ↻ count
             "faithful": n_faithful, "redundant": n_redund,
             "errors": n_err, "first_error": (first_err or "")[:300],
+            # why this arm stopped where it did — distinguishes a real budget cap from an
+            # API failure (rate-limit / no credits) so the summary attributes the cap right
+            "stop_reason": stop_reason,
             "avg_ctx_tokens": (ctx_total // n_ok) if n_ok else 0,
             "avg_latency_s": round(lat_total / n_ok, 3) if n_ok else 0.0,
             "ctx_series": ctx_series, "quality": qual, "by_step": by_step,
@@ -799,7 +833,8 @@ def _render_goal_quality(summary: dict, console: Console, common: set) -> None:
                           f"vs control {cgood:.0%}   →   {verdict}")
     console.print("[dim]goal-based: each action judged a valid step toward the task on its own "
                   "merits (not vs the original) — control scores ~100%, so an arm only 'loses' by "
-                  "taking WORSE steps. More robust than same-action agreement.[/]")
+                  "taking WORSE steps. More robust than same-action agreement. A ↻ redundant "
+                  "re-fetch (compaction amnesia) is down-ranked one notch (good→degraded→bad).[/]")
 
 
 def _common_steps(arms: dict) -> set:
@@ -822,9 +857,23 @@ def _over(a: dict, common: set):
             "latency": (sum(lats) / len(lats)) if lats else None}
 
 
+# human labels for an arm's stop cause — keeps "budget cap" from swallowing API failures
+_STOP_LABEL = {"complete": "ran full window", "budget": "budget cap",
+               "out of credits": "out of API credits", "rate-limited": "rate-limited (API)",
+               "unreachable": "endpoint unreachable", "errors": "consecutive errors"}
+
+
 def render_summary(summary: dict, console: Console) -> None:
     ctrl = summary["arms"].get("control", {})
     common = _common_steps(summary["arms"])
+    is_goal = summary.get("judge") == "goal"
+    # lead with the metric the user actually chose: when --judge goal, the goal-based
+    # per-step quality is the HEADLINE and the structural table below is secondary. (When
+    # the judge is off/equivalence, structural agreement IS the headline.)
+    if is_goal:
+        console.print("[bold]HEADLINE — goal-based quality (judge=goal)[/]")
+        _render_goal_quality(summary, console, common)
+        console.print("[dim]— secondary: structural agreement vs the original trajectory —[/]")
     ctrl_c = _over(ctrl, common)
     floor = (ctrl_c["agree"] if ctrl_c else
              ctrl.get("agree_action", 0) / ctrl["steps_ok"] if ctrl.get("steps_ok") else None)
@@ -834,7 +883,12 @@ def render_summary(summary: dict, console: Console) -> None:
     cap_n = len(common)
     capper = min(reaches, key=reaches.get) if reaches else None
     capped = capper and len(set(reaches.values())) > 1
-    cap_txt = f", where {capper} hit its budget" if capped else ""
+    # name the cap by its ACTUAL cause — a rate-limit / out-of-credits API error is not a
+    # budget cap, and calling it one is exactly the misattribution to avoid
+    cap_reason = (summary["arms"].get(capper, {}).get("stop_reason", "budget")
+                  if capper else "budget")
+    cap_txt = (f", where {capper} stopped ({_STOP_LABEL.get(cap_reason, cap_reason)})"
+               if capped else "")
     t = Table(title=f"[bold]incremental — {Path(summary['session']).name} "
                     f"({summary['model']}, {summary['steps']} decision points; "
                     f"all deltas over the first {cap_n} steps{cap_txt})")
@@ -879,8 +933,10 @@ def render_summary(summary: dict, console: Console) -> None:
         # contradicts a per-step saving). The 'steps' column shows the arm's own reach.
         ctx_cell = f"{round(ac['ctx']):,}" if ac else f"{a['avg_ctx_tokens']:,}"
         cost_cell = f"${ac['cost']:.2f}" if ac else f"${a['cost_usd']:.2f}"
-        # 'reached' = how far this arm got; mark the arm that capped the window (hit budget)
-        reached_cell = (f"[yellow]{n} ◀ budget cap[/]"
+        # 'reached' = how far this arm got; mark the arm that capped the window, labelled by
+        # its real stop cause (budget vs a rate-limit / out-of-credits API error)
+        reason = a.get("stop_reason", "complete")
+        reached_cell = (f"[yellow]{n} ◀ {_STOP_LABEL.get(reason, reason)}[/]"
                         if capper == arm and len(set(reaches.values())) > 1 else str(n))
         # per-step wall-clock: common-step aggregate, else the arm's own average (old artifacts
         # have no by_step latency); compaction (esp. condense-sync) and CCR round-trips add to it
@@ -902,10 +958,18 @@ def render_summary(summary: dict, console: Console) -> None:
     reach = {arm: a.get("steps_ok", 0) for arm, a in summary["arms"].items() if a.get("by_step")}
     if reach and len(set(reach.values())) > 1:
         short = min(reach, key=reach.get)
+        sr = summary["arms"].get(short, {}).get("stop_reason", "budget")
+        cause = _STOP_LABEL.get(sr, sr)
+        # if the short arm bailed on an API error (rate-limit / credits) it was NOT out of
+        # budget — surface the real reason and, where relevant, the underlying error line
+        api_err = sr in ("rate-limited", "out of credits", "unreachable")
+        errline = summary["arms"][short].get("first_error", "")[:140]
+        detail = f" [dim]{errline}[/]" if api_err else ""
         console.print(f"[yellow]note:[/] arms stopped at different depths "
-                      f"({', '.join(f'{k} {v}' for k, v in reach.items())}) — likely a budget/"
-                      f"error cap on [bold]{short}[/]. All vs-control deltas use the "
-                      f"{len(common)} steps every arm reached, so they stay apples-to-apples.")
+                      f"({', '.join(f'{k} {v}' for k, v in reach.items())}) — "
+                      f"[bold]{short}[/] stopped ([bold]{cause}[/]).{detail} All vs-control deltas "
+                      f"use the {len(common)} steps every arm reached, so they stay "
+                      f"apples-to-apples.")
     for arm, a in summary["arms"].items():
         if arm != "headroom" or not a.get("by_step"):
             continue
@@ -923,10 +987,8 @@ def render_summary(summary: dict, console: Console) -> None:
         console.print(f"[dim]LLM judge ({summary.get('judge')}): [bold]${judge_total:.2f}[/] "
                       f"total across arms (haiku, per step) — billed against the budget cap, "
                       f"excluded from the arm cost columns above.[/]")
-    if summary.get("judge") == "goal":
-        _render_goal_quality(summary, console, common)
     if floor is not None:
-        label = "(secondary — structural) " if summary.get("judge") == "goal" else ""
+        label = "(secondary — structural) " if is_goal else ""
         console.print(f"[dim]{label}the control arm runs the SAME session with NO compaction; its "
                       f"{floor:.0%} agreement with the original is the NOISE FLOOR (sampling + "
                       f"free-running divergence), not 100%. An arm only loses the trajectory to "

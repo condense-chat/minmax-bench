@@ -518,6 +518,26 @@ def test_step_verdict_prefers_goal_quality():
     assert cf._step_verdict(rec) == "bad"
 
 
+def test_redundant_refetch_downranks_goal_quality_one_notch():
+    from minmax_bench import counterfactual as cf
+    # a redundant re-fetch (compaction amnesia) drops the judge verdict one severity notch
+    assert cf._penalize_redundant("good", True) == "degraded"
+    assert cf._penalize_redundant("degraded", True) == "bad"
+    assert cf._penalize_redundant("bad", True) == "bad"          # already floored
+    # non-redundant steps and unknown/None verdicts pass through untouched
+    assert cf._penalize_redundant("good", False) == "good"
+    assert cf._penalize_redundant(None, True) is None
+
+
+def test_stop_reason_labels_distinguish_api_errors_from_budget():
+    from minmax_bench import counterfactual as cf
+    # a rate-limit / out-of-credits stop must NOT read as a budget cap
+    assert cf._STOP_LABEL["budget"] == "budget cap"
+    assert "credits" in cf._STOP_LABEL["out of credits"]
+    assert "rate-limited" in cf._STOP_LABEL["rate-limited"]
+    assert cf._STOP_LABEL["budget"] != cf._STOP_LABEL["rate-limited"]
+
+
 def test_judge_text_match_compares_to_original(monkeypatch):
     import minmax_bench.quality.engine as e
     monkeypatch.setattr(e, "call_api",
