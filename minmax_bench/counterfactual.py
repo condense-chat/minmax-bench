@@ -28,7 +28,9 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from rich.console import Console
+from rich import box
+from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.prompt import Confirm, Prompt
@@ -55,6 +57,7 @@ class LocalSession:
     cwd: str | None
     peak_ctx: int         # peak per-request context tokens the session actually used
     total_ctx: int        # sum of per-request context across all turns (cumulative volume)
+    turns: int            # assistant decision points (negative = capped read, a lower bound)
 
 
 # cap the per-file read that computes peak context, so a multi-GB transcript
@@ -62,16 +65,19 @@ class LocalSession:
 _PEEK_BYTE_CAP = 12_000_000
 
 
-def _peek(path: Path, max_lines: int = 300) -> tuple[str, str | None, bool, int, int, bool]:
-    """(prompt, cwd, has_assistant, peak_ctx, total_ctx, capped) from a session file.
+def _peek(path: Path, max_lines: int = 300) -> tuple[str, str | None, bool, int, int, int, bool]:
+    """(prompt, cwd, has_assistant, peak_ctx, total_ctx, turns, capped) from a session file.
 
     peak_ctx is the largest per-request context (input + cache read + cache write) across the
     session's assistant turns — it decides whether a replay would ever cross a compaction
     threshold. total_ctx sums that per-request context over ALL turns — the cumulative volume
-    the session churned (≈ avg context × turns), a different axis from peak. Only lines with a
-    usage block are parsed, and the read stops at _PEEK_BYTE_CAP so giant transcripts stay cheap.
+    the session churned (≈ avg context × turns), a different axis from peak. turns counts the
+    assistant decision points (usage-bearing turns). Only lines with a usage block are parsed,
+    and the read stops at _PEEK_BYTE_CAP so giant transcripts stay cheap (turns is then a lower
+    bound, marked like the capped ctx reads).
     """
-    prompt, cwd, has_assistant, peak, total, capped, read = "", None, False, 0, 0, False, 0
+    prompt, cwd, read = "", None, 0
+    has_assistant, peak, total, turns, capped = False, 0, 0, 0, False
     try:
         with path.open(encoding="utf-8") as fh:
             for n, line in enumerate(fh):
@@ -87,7 +93,7 @@ def _peek(path: Path, max_lines: int = 300) -> tuple[str, str | None, bool, int,
                 except json.JSONDecodeError:
                     continue
                 if rec.get("isSidechain"):
-                    return "", None, False, 0, 0, False  # sub-agent transcript
+                    return "", None, False, 0, 0, 0, False  # sub-agent transcript
                 if head:
                     cwd = cwd or rec.get("cwd")
                     if rec.get("type") == "assistant":
@@ -106,29 +112,33 @@ def _peek(path: Path, max_lines: int = 300) -> tuple[str, str | None, bool, int,
                 u = rec.get("message", {}).get("usage") if rec.get("type") == "assistant" else None
                 if isinstance(u, dict):
                     has_assistant = True
+                    turns += 1
                     ct = eng.ctx_tokens(u)
                     peak = max(peak, ct)
                     total += ct
     except OSError:
-        return "", None, False, 0, 0, False
-    return " ".join(prompt.split())[:90], cwd, has_assistant, peak, total, capped
+        return "", None, False, 0, 0, 0, False
+    return " ".join(prompt.split())[:90], cwd, has_assistant, peak, total, turns, capped
 
 
-def scan_sessions(root: Path = CC_PROJECTS, limit: int = 25) -> list[LocalSession]:
-    """Most-recent real sessions (skips sub-agent sidechains and empty files)."""
+def scan_sessions(root: Path = CC_PROJECTS, limit: int = 40) -> list[LocalSession]:
+    """Most-recent real sessions (skips sub-agent sidechains and empty files). The picker
+    paginates these, so the limit is generous."""
     found: list[LocalSession] = []
     for f in sorted(root.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
         if len(found) >= limit:
             break
-        prompt, cwd, has_assistant, peak, total, capped = _peek(f)
+        prompt, cwd, has_assistant, peak, total, turns, capped = _peek(f)
         if not has_assistant:
             continue
         found.append(LocalSession(
             path=f, project=cwd or f.parent.name,  # cwd is exact; the dir name is a lossy slug
             mtime=f.stat().st_mtime, size=f.stat().st_size, prompt=prompt, cwd=cwd,
-            # negative marks a capped (lower-bound) read for BOTH: total truncates at the byte cap
+            # negative marks a capped (lower-bound) read for ALL three: total/turns truncate
+            # at the byte cap, peak is a lower bound too
             peak_ctx=peak if not capped else -peak,
             total_ctx=total if not capped else -total,
+            turns=turns if not capped else -turns,
         ))
     return found
 
@@ -151,24 +161,126 @@ def _fmt_ctx(v: int) -> str:
     return (">" + body) if v < 0 else body
 
 
+def _fmt_turns(v: int) -> str:
+    """Turn count for the picker; a capped read (v < 0) shows '>' (a lower bound)."""
+    return (">" + str(-v)) if v < 0 else str(v)
+
+
+_PER_PAGE = 12  # rows per picker page
+
+
+def _raw_supported() -> bool:
+    """True when we can read single keystrokes (a real TTY on a POSIX terminal)."""
+    try:
+        import sys
+        import termios  # noqa: F401 — POSIX only; absent on Windows
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _read_key() -> str:
+    """One keypress in raw mode → a token: up/down/left/right, enter, or the char itself.
+    Arrow keys and PgUp/PgDn come in as CSI escape sequences; everything else is the literal."""
+    import sys
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x03":                      # ctrl-c
+            raise KeyboardInterrupt
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == "\x1b":                      # escape / CSI sequence
+            if sys.stdin.read(1) != "[":
+                return "esc"
+            code = sys.stdin.read(1)
+            if code.isdigit():                # PgUp=[5~ PgDn=[6~ — consume the trailing ~
+                sys.stdin.read(1)
+                return {"5": "pgup", "6": "pgdn"}.get(code, "esc")
+            return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(code, "esc")
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _session_table(sessions: list[LocalSession], cursor: int | None) -> Table:
+    """Compact one-page table. cursor (absolute index) highlights a row for the interactive
+    picker; cursor=None renders a plain static page (the non-TTY fallback shows page 0)."""
+    per = _PER_PAGE
+    pages = max(1, (len(sessions) + per - 1) // per)
+    page = (cursor // per) if cursor is not None else 0
+    lo = page * per
+    rows = sessions[lo: lo + per]
+    title = (f"[bold]local Claude Code sessions[/] [dim]· page {page + 1}/{pages} · "
+             f"{len(sessions)} total[/]")
+    # expand=True + a single ratio column: the prompt absorbs/yields all the slack so the
+    # small fixed columns (when/turns/ctx) never get squeezed to ellipses on a narrow terminal
+    t = Table(title=title, box=box.SIMPLE_HEAD, padding=(0, 1), expand=True)
+    t.add_column("#", justify="right", style="dim", no_wrap=True)
+    t.add_column("when", style="dim", no_wrap=True)
+    t.add_column("turns", justify="right", no_wrap=True)         # decision points
+    t.add_column("project", no_wrap=True)
+    t.add_column("ctx", justify="right", no_wrap=True)           # peak · total
+    t.add_column("first prompt", ratio=1, no_wrap=True, overflow="ellipsis")
+    for idx in range(lo, lo + len(rows)):
+        s = sessions[idx]
+        sel = idx == cursor
+        num = f"[cyan]▸ {idx + 1}[/]" if sel else str(idx + 1)
+        proj = ("…" + s.project[-26:]) if len(s.project) > 27 else s.project
+        ctx = f"{_fmt_ctx(s.peak_ctx)} [dim]· {_fmt_ctx(s.total_ctx)}[/]"
+        t.add_row(num, datetime.fromtimestamp(s.mtime).strftime("%m-%d %H:%M"),
+                  _fmt_turns(s.turns), proj, ctx,
+                  s.prompt or "[dim](no text prompt)[/]",
+                  style="reverse" if sel else None)
+    return t
+
+
+def _interactive_pick(console: Console, sessions: list[LocalSession]) -> Path | None:
+    """Arrow-key paginated picker. Returns the chosen path, or None if the user asked to type
+    a path (`/`) so the caller can fall back to the prompt. Raises SystemExit(0) on quit."""
+    cursor = 0
+    last = len(sessions) - 1
+    hint = ("[dim]↑/↓ move · ←/→ page · enter select · [bold]/[/] type a path · q quit[/]")
+    with Live(console=console, auto_refresh=False, transient=True) as live:
+        while True:
+            live.update(Group(_session_table(sessions, cursor), hint), refresh=True)
+            try:
+                key = _read_key()
+            except KeyboardInterrupt:
+                raise SystemExit(0) from None
+            if key in ("up", "k"):
+                cursor = max(0, cursor - 1)
+            elif key in ("down", "j"):
+                cursor = min(last, cursor + 1)
+            elif key in ("left", "h", "pgup"):
+                cursor = max(0, cursor - _PER_PAGE)
+            elif key in ("right", "l", "pgdn"):
+                cursor = min(last, cursor + _PER_PAGE)
+            elif key == "enter":
+                return sessions[cursor].path
+            elif key == "/":
+                return None
+            elif key in ("q", "esc"):
+                raise SystemExit(0)
+
+
 def pick_session(console: Console) -> Path:
     sessions = scan_sessions()
     if not sessions:
         console.print(f"[red]no Claude Code sessions found under {CC_PROJECTS}[/]")
         raise SystemExit(1)
-    t = Table(title="[bold]local Claude Code sessions — newest first")
-    t.add_column("#", justify="right", style="dim")
-    t.add_column("when", style="dim")
-    t.add_column("project")
-    t.add_column("peak ctx", justify="right")   # largest single-turn context — gates compaction
-    t.add_column("total ctx", justify="right")  # cumulative context across all turns (volume)
-    t.add_column("first prompt", max_width=48)
-    for i, s in enumerate(sessions, 1):
-        t.add_row(str(i), datetime.fromtimestamp(s.mtime).strftime("%m-%d %H:%M"),
-                  ("…" + s.project[-38:]) if len(s.project) > 39 else s.project,
-                  _fmt_ctx(s.peak_ctx), f"[dim]{_fmt_ctx(s.total_ctx)}[/]",
-                  s.prompt or "[dim](no text prompt)[/]")
-    console.print(t)
+    if _raw_supported():
+        chosen = _interactive_pick(console, sessions)
+        if chosen is not None:
+            console.print(f"[green]session[/] [dim]{chosen.name}[/]")
+            return chosen
+        # None -> user pressed '/' to type a path; fall through to the prompt
+    else:
+        console.print(_session_table(sessions, None))  # static first page (non-TTY)
     raw = Prompt.ask("[cyan]session[/] (number or a /path/to/session.jsonl)",
                      console=console).strip()
     if raw.isdigit() and 1 <= int(raw) <= len(sessions):

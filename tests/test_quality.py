@@ -427,9 +427,10 @@ def test_peek_reports_peak_context(tmp_path):
                                                     "cache_read_input_tokens": 8000}}},  # after
     ]
     sess.write_text("\n".join(json.dumps(x) for x in lines))
-    prompt, cwd, has_assistant, peak, total, capped = _peek(sess)
+    prompt, cwd, has_assistant, peak, total, turns, capped = _peek(sess)
     assert has_assistant and peak == 40020 and not capped  # peak, not last, not first
     assert total == 5010 + 40020 + 8020  # total = every turn's context summed
+    assert turns == 3  # three usage-bearing assistant decision points
 
 
 def test_step_verdict_and_redundancy():
@@ -527,6 +528,22 @@ def test_redundant_refetch_downranks_goal_quality_one_notch():
     # non-redundant steps and unknown/None verdicts pass through untouched
     assert cf._penalize_redundant("good", False) == "good"
     assert cf._penalize_redundant(None, True) is None
+
+
+def test_session_picker_paginates_and_shows_turns(tmp_path):
+    from pathlib import Path
+
+    from minmax_bench import counterfactual as cf
+    sess = [cf.LocalSession(path=Path(f"/x/s{i}.jsonl"), project=f"/p/{i}", mtime=0.0,
+                            size=1, prompt=f"p{i}", cwd="/p", peak_ctx=1000, total_ctx=2000,
+                            turns=i) for i in range(cf._PER_PAGE + 3)]
+    # a page holds _PER_PAGE rows; a cursor on the 2nd page renders that page's slice
+    t0 = cf._session_table(sess, 0)
+    t1 = cf._session_table(sess, cf._PER_PAGE)          # cursor into page 2
+    assert t0.row_count == cf._PER_PAGE                 # full first page
+    assert t1.row_count == 3                            # remainder on page 2
+    # turns render as a lower bound when the peek read was capped (negative)
+    assert cf._fmt_turns(80) == "80" and cf._fmt_turns(-50) == ">50"
 
 
 def test_stop_reason_labels_distinguish_api_errors_from_budget():
