@@ -560,6 +560,26 @@ def test_redundant_refetch_downranks_goal_quality_one_notch():
     assert cf._penalize_redundant(None, True) is None
 
 
+def test_quality_run_dir_auto_mints_under_configured_root(monkeypatch):
+    from minmax_bench import config
+    from minmax_bench.quality import paths
+    # point the quality runs root somewhere custom (as QUALITY_RUNS_DIR / the wizard would)
+    config.get_settings.cache_clear()
+    monkeypatch.setenv("QUALITY_RUNS_DIR", "custom/runroot")
+    try:
+        assert paths.quality_runs_root() == "custom/runroot"
+        d1 = paths.new_run_dir("incremental", "sess,name!")
+        d2 = paths.new_run_dir("incremental", "sess,name!")
+        assert d1.startswith("custom/runroot/incremental/")
+        assert "sess-name-" in d1 and "!" not in d1  # slug sanitized
+        assert d1 != d2  # a uid suffix guards against same-second collisions
+        # discovery roots lead with the configured root and de-dup
+        roots = paths.default_run_roots()
+        assert roots[0] == "custom/runroot" and len(set(roots)) == len(roots)
+    finally:
+        config.get_settings.cache_clear()
+
+
 def test_session_picker_paginates_and_shows_turns(tmp_path):
     from pathlib import Path
 

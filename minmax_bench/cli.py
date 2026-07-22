@@ -69,7 +69,7 @@ def quality_run(
     retries: int = typer.Option(0, "--retries", help="Extra re-attempts for a cell that crashed or timed out (no reward.txt), until every trial resolves to a verdict (reward 0 or 1) or attempts run out. A trial that ran and scored — even 0 — is NOT retried. 0 = single pass."),
     concurrency: int = typer.Option(1, "--concurrency", help="Parallel trials per cell (harbor -n)."),
     milestones: bool = typer.Option(False, "--milestones", help="Also run the LLM milestone judge."),
-    out: str = typer.Option("results/jobs/run", "--out", help="Results root."),
+    out: str | None = typer.Option(None, "--out", help="Results root (default: a fresh auto-minted dir under settings.quality_runs_dir, like the cost bench — never clobbers)."),
     seed: int | None = typer.Option(None, "--seed", help="Seed for --tasks random:N."),
     agent_timeout_mult: int | None = typer.Option(None, "--agent-timeout-mult", help="Harbor agent EXECUTION timeout multiplier (headroom auto-3)."),
     setup_timeout_mult: float = typer.Option(3.0, "--setup-timeout-mult", help="Harbor agent SETUP timeout multiplier, all arms (slow container installs; 3 = ~18min)."),
@@ -112,6 +112,9 @@ def quality_run(
         arms, tasks, model, k, budget_usd, milestones, out, force, retries, auth = (
             w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out, w.force, w.retries,
             w.auth)
+    if not out:  # auto-mint a fresh dir under the configured root, like the cost bench
+        from minmax_bench.quality.paths import new_run_dir
+        out = new_run_dir("full", (tasks or dataset).replace(",", "-"))
     argv = ["--mode", "full", "--arms", arms, "--dataset", dataset, "--out", out,
             "--k", str(k), "--budget-usd", str(budget_usd), "--concurrency", str(concurrency),
             "--wall-timeout", str(wall_timeout), "--retries", str(retries)]
@@ -151,7 +154,7 @@ def quality_report(
 
 @quality_app.command("runs")
 def quality_runs(
-    roots: str = typer.Option("results,runs/quality-sample", "--roots", help="Comma list of dirs to scan for quality result dirs."),
+    roots: str | None = typer.Option(None, "--roots", help="Comma list of dirs to scan (default: settings.quality_runs_dir + the legacy results tree)."),
     limit: int = typer.Option(20, "--limit", "-n", help="Max runs to list (newest first)."),
 ):
     """List stored quality runs (full + incremental) — pure filesystem walk, never spends."""
@@ -160,7 +163,8 @@ def quality_runs(
     from rich.table import Table
 
     from minmax_bench.quality.report import discover_runs
-    infos = discover_runs([r.strip() for r in roots.split(",") if r.strip()])
+    rlist = [r.strip() for r in roots.split(",") if r.strip()] if roots else None
+    infos = discover_runs(rlist)
     if not infos:
         console.print("[yellow]no quality runs found — generate one with "
                       "`minmax-bench quality run`[/]")
@@ -248,7 +252,7 @@ def quality_incremental(
     limit: int = typer.Option(0, "--limit", "-n", help="Max decision points, contiguous from the start (0 = all). Strided sampling was removed — it distorted the cost/compaction numbers."),
     budget_usd: float = typer.Option(2.0, "--budget-usd", help="Per-arm spend cap (control included)."),
     max_tokens: int = typer.Option(6000, "--max-tokens", help="Per-step output cap."),
-    out: str | None = typer.Option(None, "--out", help="Output dir (default results/incremental/<session>-<ts>)."),
+    out: str | None = typer.Option(None, "--out", help="Output dir (default: a fresh auto-minted dir under settings.quality_runs_dir/incremental/, like the cost bench — never clobbers)."),
     task: str = typer.Option("session", "--task", help="Task label for the report join."),
     auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force the Claude Code login)."),
     judge: str = typer.Option("off", "--judge", help="Per-step LLM judge: off | goal (rate each action good/degraded/bad toward the task — robust, recommended) | equivalence (upgrade grep-vs-rg near-misses to 'agrees')."),
@@ -269,9 +273,9 @@ def quality_incremental(
     This is what used to be the `counterfactual` command — the incremental mode on
     YOUR own sessions.
     """
-    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    from minmax_bench.quality.paths import new_run_dir
     stem = Path(session).stem[:8] if session else "picked"
-    out_dir = out or str(Path("results/incremental") / f"{stem}-{stamp}")
+    out_dir = out or new_run_dir("incremental", stem)
     _run_incremental(session=session, arms=arms, model=model, limit=limit,
                      budget_usd=budget_usd, max_tokens=max_tokens, out=out_dir, task=task,
                      auth=auth, assume_yes=yes, judge=judge, steps=steps, capture=capture,

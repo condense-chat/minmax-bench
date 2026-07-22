@@ -60,6 +60,8 @@ def split_cell(name):
     return None, name
 
 
+# legacy static default; the settings-aware default (incl. quality_runs_dir) is
+# paths.default_run_roots(), used when discover_runs is called with roots=None
 DEFAULT_RUN_ROOTS = ("results", "runs/quality-sample")
 
 
@@ -93,14 +95,19 @@ def _run_info(d):
             "tasks": sorted(tasks), "model": model}
 
 
-def discover_runs(roots=DEFAULT_RUN_ROOTS):
+def discover_runs(roots=None):
     """Quality result dirs under `roots`, newest first — pure filesystem walk, never spends.
 
     A run dir is any directory holding full-mode artifacts (run-manifest.json /
     attempted.json cells / verifier rewards) or incremental artifacts
     (incremental/*.jsonl, summary.json). Used by `quality runs` and the wizard's
-    view mode so stored results are discoverable without remembering paths.
+    view mode so stored results are discoverable without remembering paths. `roots=None`
+    uses the settings-aware default (the configured quality_runs_dir first, then the
+    legacy results tree) so freshly-saved runs are found without passing --roots.
     """
+    if roots is None:
+        from .paths import default_run_roots
+        roots = default_run_roots()
     dirs = set()
     for root in roots:
         if not os.path.isdir(root):

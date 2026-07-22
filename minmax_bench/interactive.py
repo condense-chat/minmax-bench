@@ -521,8 +521,7 @@ def _view_wizard(console: Console) -> QualityWizardResult:
     from .quality.report import discover_runs
     infos = discover_runs()
     if not infos:
-        console.print("[yellow]no stored quality runs found under results/ — "
-                      "generate one first[/]")
+        console.print("[yellow]no stored quality runs found — generate one first[/]")
         raise KeyboardInterrupt
     opts = []
     for i in infos[:20]:
@@ -602,7 +601,9 @@ def _full_wizard(console: Console) -> QualityWizardResult:
     budget = _ask_float(console, "[cyan]per-trial $ cap[/]", 5.0)
     milestones = Confirm.ask("[cyan]also run the LLM milestone judge?[/]", default=True,
                              console=console)
-    out = Prompt.ask("[cyan]output dir[/]", default="results/jobs/run", console=console).strip()
+    from .quality.paths import new_run_dir  # fresh auto-minted dir (never clobbers)
+    out = Prompt.ask("[cyan]output dir[/]", default=new_run_dir("full", tasks or "run"),
+                     console=console).strip()
     auth = _auth_choice(console)  # only prompts when both an API key AND a subscription exist
     # resume vs full retry: by default an existing out dir is RESUMED — only cells missing
     # trials (crashes, timeouts, interrupts) re-run; completed cells (incl. reward-0) are kept
@@ -736,7 +737,9 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         ("off", "structural only — exact same-action match, free (read vs control floor)", True),
         ("equivalence", "structural + LLM upgrade of near-misses (grep vs rg) to 'agrees'", True),
     ])
-    out = Prompt.ask("[cyan]output dir[/]", default="results/jobs/run", console=console).strip()
+    from .quality.paths import new_run_dir  # fresh auto-minted dir (never clobbers)
+    out = Prompt.ask("[cyan]output dir[/]", default=new_run_dir("incremental", task or "run"),
+                     console=console).strip()
     # resume: re-running to the same out skips arms that already finished (a .done sentinel),
     # so a cancel mid-run resumes at the next arm instead of re-running control. An interrupted
     # arm has no sentinel and re-runs. Only meaningful when reusing an out; harmless otherwise.
@@ -898,6 +901,17 @@ def run_setup_wizard(console: Console) -> None:
                        console=console).strip()
         if k:
             updates["HF_TOKEN"] = k
+
+    console.print("\n[bold]4) advanced[/] [dim](optional)[/] — where quality runs are saved. Each "
+                  "run auto-mints a fresh timestamped dir under this root (like the cost bench), "
+                  "so re-runs never clobber.")
+    from .config import get_settings
+    cur_root = get_settings().quality_runs_dir
+    if Confirm.ask(f"  change the quality runs dir? [dim](current: {cur_root})[/]", default=False,
+                   console=console):
+        r = Prompt.ask("  [cyan]QUALITY_RUNS_DIR[/]", default=cur_root, console=console).strip()
+        if r and r != cur_root:
+            updates["QUALITY_RUNS_DIR"] = r
 
     if not updates:
         console.print("\n[dim]no changes to write.[/]")

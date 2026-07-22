@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     # (baseline + per-strategy measurement caches; cost is recomputed from them).
     runs_dir: str = "runs"
 
+    # Root under which each QUALITY-bench run (full + incremental) auto-mints a fresh,
+    # unique, timestamped directory — the same auto-mint convention the cost bench uses
+    # for runs_dir, so a re-run never clobbers the last one. Override via QUALITY_RUNS_DIR
+    # in .env or the setup wizard's advanced step.
+    quality_runs_dir: str = "runs/quality"
+
     # Default request cap for proxy executor (Anthropic requires >= 1).
     proxy_max_tokens: int = 1
 
