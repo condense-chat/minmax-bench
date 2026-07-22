@@ -642,6 +642,36 @@ def test_common_step_aggregation_is_fair_when_an_arm_stops_early():
     assert abs((1 - c["cost"] / ctrl["cost"]) - 0.6) < 1e-9
 
 
+def test_goal_mode_suppresses_the_same_action_verdict():
+    from rich.console import Console
+
+    from minmax_bench import counterfactual as cf
+
+    def summary(judge):
+        def arm(n, ctx, agree_frac, good):
+            return {"steps_ok": n, "agree_action": int(n * agree_frac), "agree_exact": 0,
+                    "quality": {"good": good, "degraded": 0, "bad": n - good},
+                    "by_step": {i: {"ctx": ctx, "cost": 0.1, "agree": i < n * agree_frac,
+                                    "quality": "good" if i < good else "bad"} for i in range(n)},
+                    "avg_ctx_tokens": ctx, "cost_usd": 1.0, "errors": 0}
+        return {"session": "/x/s.jsonl", "model": "opus", "steps": 50, "judge": judge,
+                "arms": {"control": arm(50, 200, 0.5, 45), "condense": arm(50, 100, 0.25, 46)}}
+
+    def render(judge):
+        con = Console(width=100, record=True)
+        cf.render_summary(summary(judge), con)
+        return con.export_text()
+
+    goal = render("goal")
+    # goal is the chosen metric: the same-action "below the floor → trajectory loss" verdict
+    # (low same-action reads as failure) must NOT appear; the goal verdict must
+    assert "trajectory loss" not in goal and "same action vs original" not in goal
+    assert "degrade" in goal  # the goal-based verdict line is present
+
+    off = render("off")  # structural is the metric here, so the same-action verdict SHOULD show
+    assert "same action vs original" in off
+
+
 def test_ccr_step_executes_retrieve_then_scores_the_real_action(monkeypatch):
     import minmax_bench.quality.engine as e
     calls = {"n": 0}

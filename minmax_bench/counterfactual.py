@@ -839,8 +839,14 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
                 _mark_seen(rec.get("orig"), seen_files, seen_cmds)
                 f.write(json.dumps(rec) + "\n")
                 f.flush()
-                prog.update(tid, advance=1,
-                            stat=f"agree {n_action}/{n_ok or 1} ${spent:.2f}")
+                # progress readout tracks the CHOSEN metric: goal-quality (good steps)
+                # when judge=goal, else same-action agreement. Showing "agree N/M" during a
+                # goal run is misleading — same-action is expected to be low even for control.
+                if judge == "goal":
+                    live_stat = f"good {qual['good']}/{n_ok or 1} ${spent:.2f}"
+                else:
+                    live_stat = f"agree {n_action}/{n_ok or 1} ${spent:.2f}"
+                prog.update(tid, advance=1, stat=live_stat)
         # if the arm bailed on consecutive errors, name the actual cause (a rate-limit or an
         # out-of-credits API error is NOT a budget cap) so the summary stops mislabeling it
         if stop_reason == "errors":
@@ -1035,10 +1041,15 @@ def render_summary(summary: dict, console: Console) -> None:
         errs = a.get("errors", 0)
         # colour each arm's vs-original agreement AGAINST the control floor: at/above the
         # floor is green (no measurable loss), below is red. control itself is the floor.
+        # BUT when judge=goal, same-action is NOT the chosen metric (goal-quality is the
+        # headline table above), so show it as neutral data — never red-flag it, or a low
+        # same-action reads as a failure when the goal verdict was actually a pass.
         if agree is None:
             agree_cell = "—"
         elif arm == "control":
             agree_cell = f"[dim]{agree:.0%} (floor)[/]"
+        elif is_goal:
+            agree_cell = f"[dim]{agree:.0%}[/]"
         elif floor is not None:
             agree_cell = (f"[green]{agree:.0%}[/]" if agree >= floor - 0.02
                           else f"[red]{agree:.0%}[/]")
@@ -1117,10 +1128,13 @@ def render_summary(summary: dict, console: Console) -> None:
             console.print(f"[red]{arm} FAILED every step ({a.get('errors', 0)} errors)[/] — "
                           f"no verdict is possible. First error: {a.get('first_error', '?')}")
             continue
-        # headline verdict: the arm's vs-original agreement against the control floor
+        # headline verdict: the arm's vs-original agreement against the control floor.
+        # SKIP it entirely when judge=goal — same-action is not the chosen metric there and
+        # is expected to be low even for control, so "-23% below the floor → trajectory loss"
+        # is actively misleading. The goal-based verdict (_render_goal_quality) is the headline.
         _ac = _over(a, common)
         agree = _ac["agree"] if _ac else a["agree_action"] / a["steps_ok"]
-        if floor is not None:
+        if floor is not None and not is_goal:
             delta = agree - floor
             if delta >= -0.02:
                 verdict = ("[green]at/above the noise floor → no measurable trajectory loss[/]")
