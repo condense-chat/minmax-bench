@@ -28,10 +28,20 @@ class Settings(BaseSettings):
     anthropic_base_url: str = "https://api.anthropic.com"
     openai_base_url: str = "https://api.openai.com/v1"
 
+    # count_tokens must always hit the real Anthropic API, even when
+    # ANTHROPIC_BASE_URL points a shell at a proxy (e.g. condense).
+    count_tokens_base_url: str = "https://api.anthropic.com"
+
     # Google Gemini via its OpenAI-compatible chat/completions endpoint. A cheap
     # direct executor for evaluating the anatomy without Anthropic spend.
     gemini_api_key: str | None = None
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+    # Transport for the bench's own direct-to-Anthropic calls (the "upstream"
+    # strategy): "anthropic" or "bedrock" (Anthropic-compatible endpoint on
+    # bedrock-runtime, bearer auth from the AWS credential chain).
+    upstream_via: str = "anthropic"
+    bedrock_region: str = "eu-south-2"
 
     # headroom proxy endpoint.
     headroom_base_url: str = "http://127.0.0.1:8787"
@@ -70,6 +80,12 @@ class Settings(BaseSettings):
     # Root under which each benchmark run gets its own run-<uuid>/ directory
     # (baseline + per-strategy measurement caches; cost is recomputed from them).
     runs_dir: str = "runs"
+
+    # Root under which each QUALITY-bench run (full + incremental) auto-mints a fresh,
+    # unique, timestamped directory — the same auto-mint convention the cost bench uses
+    # for runs_dir, so a re-run never clobbers the last one. Override via QUALITY_RUNS_DIR
+    # in .env or the setup wizard's advanced step.
+    quality_runs_dir: str = "runs/quality"
 
     # Default request cap for proxy executor (Anthropic requires >= 1).
     proxy_max_tokens: int = 1

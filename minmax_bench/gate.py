@@ -41,6 +41,7 @@ class EndpointGate:
         self._cap = backoff_cap
         self._penalty_initial = penalty_initial
         self._decay = decay
+        self._last_escalation = 0.0
         self.penalties = 0                    # observability: rate-limit hits seen
 
     def raise_interval(self, interval: float) -> None:
@@ -50,12 +51,22 @@ class EndpointGate:
             self._interval = max(self._interval, self._base)
 
     def penalize(self, retry_after: float | None = None) -> float:
-        """A rate-limit was hit — widen spacing for everyone on this host (AIMD)."""
+        """A rate-limit hit — widen spacing for everyone on this host (AIMD).
+
+        Concurrent 429s from one burst were all in flight before the first
+        penalty landed, so they carry no evidence the widened interval is
+        still too fast — collapse them into one escalation per 1s window.
+        """
         with self._lock:
-            cur = self._interval
-            bumped = cur * 2 if cur > 0 else self._penalty_initial
-            bumped = max(bumped, self._penalty_initial, retry_after or 0.0)
-            self._interval = min(self._cap, bumped)
+            now = time.monotonic()
+            if now - self._last_escalation >= 1.0:
+                cur = self._interval
+                bumped = cur * 2 if cur > 0 else self._penalty_initial
+                bumped = max(bumped, self._penalty_initial, retry_after or 0.0)
+                self._interval = min(self._cap, bumped)
+                self._last_escalation = now
+            else:
+                self._interval = min(self._cap, max(self._interval, retry_after or 0.0))
             self.penalties += 1
             return self._interval
 

@@ -122,8 +122,10 @@ def start_headroom(console: Console) -> subprocess.Popen | None:
     log = tempfile.NamedTemporaryFile(prefix="headroom-", suffix=".log", delete=False)
     # No global --mode: the headroom/headroom-kompress strategies pick their mode
     # per request via the x-headroom-mode header.
+    # --no-rate-limit: headroom defaults to 60 rpm per key:ip bucket, and the
+    # whole bench shares one bucket — the gate in gate.py does our pacing.
     proc = subprocess.Popen(
-        [exe, "proxy", "--host", host, "--port", str(port)],
+        [exe, "proxy", "--host", host, "--port", str(port), "--no-rate-limit"],
         stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy(),
     )
     deadline = time.monotonic() + 25.0

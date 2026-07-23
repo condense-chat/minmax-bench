@@ -18,6 +18,7 @@ from collections.abc import Callable
 
 import httpx
 
+from ..auth import anthropic_auth_headers
 from ..gate import EndpointGate
 from ..models import Provider, RequestPoint, Session, Usage
 from ..pricing import cost_usd
@@ -41,14 +42,17 @@ def _endpoint(base_url: str, provider: Provider, path: str | None = None) -> str
 def _headers(strategy: Strategy) -> dict[str, str]:
     cfg = strategy.proxy
     assert cfg is not None
-    key = os.environ.get(cfg.api_key_env, "")
     headers = {"content-type": "application/json"}
     if cfg.provider == Provider.openai:
+        key = os.environ.get(cfg.api_key_env, "") if cfg.api_key_env else ""
         headers["authorization"] = f"Bearer {key}"
     else:
-        headers["x-api-key"] = key
         headers["anthropic-version"] = cfg.anthropic_version
-        if cfg.anthropic_beta:
+        if cfg.api_key_env:
+            # API key, or the user's Claude Code subscription OAuth token — the
+            # proxies forward whichever auth header we send, like a real dense run.
+            headers.update(anthropic_auth_headers(cfg.anthropic_beta, key_env=cfg.api_key_env))
+        elif cfg.anthropic_beta:
             headers["anthropic-beta"] = cfg.anthropic_beta
     headers.update(cfg.extra_headers)
     return headers
@@ -99,6 +103,8 @@ class ProxyExecutor:
             body = render_request(
                 session, p.prefix, max_tokens=self.max_tokens, cache=True, flatten_tools=flatten
             )
+            if strategy.proxy.model_id_map and body.get("model"):
+                body["model"] = strategy.proxy.model_id_map(body["model"])
             if not body.get("messages"):
                 # Degenerate prefix (e.g. mid-session capture that is all orphaned
                 # tool_results). Skip but keep alignment with the baseline list.
@@ -130,9 +136,12 @@ class ProxyExecutor:
         if wait > 0:
             time.sleep(wait)
 
-    def _post_with_retry(self, url, body, headers, strategy):
+    def _post_with_retry(self, url, body, headers, strategy, parse=None):
         """POST with bounded retry on 429/529, honoring Retry-After. Each attempt
-        passes through the shared endpoint gate (concurrency + spacing)."""
+        passes through the shared endpoint gate (concurrency + spacing).
+        ``parse`` overrides response parsing for callers that make two differently
+        shaped calls per point (e.g. rewrite fetch + upstream invoke)."""
+        parse = parse or (lambda resp: self._parse_response(strategy, resp))
         gate_slot = self.gate.slot if self.gate else contextlib.nullcontext
         for attempt in range(self.max_retries + 1):
             try:
@@ -152,7 +161,7 @@ class ProxyExecutor:
                 resp.raise_for_status()
                 if self.gate:  # endpoint is healthy — relax spacing back down
                     self.gate.reward()
-                return usage_from_response(strategy.proxy.provider, resp.json()), None
+                return parse(resp), None
             except httpx.HTTPStatusError as e:
                 return None, f"{e.response.status_code}: {e.response.text[:200]}"
             except Exception as e:  # transport error — retry a couple times
@@ -161,6 +170,9 @@ class ProxyExecutor:
                     continue
                 return None, str(e)
         return None, "retries exhausted"
+
+    def _parse_response(self, strategy: Strategy, resp: httpx.Response):
+        return usage_from_response(strategy.proxy.provider, resp.json())
 
     def close(self) -> None:
         self._client.close()

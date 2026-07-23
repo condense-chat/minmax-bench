@@ -26,9 +26,272 @@ from .runner import key as track_key
 from .runner import run as run_bench
 from .runstore import BASELINE, RunStore
 from .strategies import STRATEGY_MATRIX, default_selected, has_entry, matrix_names
+from .strategies.base import MODES, TRANSPORTS
+from .tokens import parse_token_count as _parse_token_budget
 
 app = typer.Typer(add_completion=False, help="Estimated token/cost savings benchmark for agent-session proxies.")
 console = Console()
+
+# ---- quality / trajectory-preservation bench ---------------------------------
+# The cost bench (`run`, `report`, `replay`, …) measures how much a proxy SAVES.
+# The quality bench measures whether the compressed session still does the same
+# work. It lives in minmax_bench.quality; these commands surface it under one
+# entrypoint. `run`/`report` are first-class (typed options, like the cost bench);
+# they translate to the driver's argv so defaults/validation stay in one place.
+quality_app = typer.Typer(add_completion=False, help="Quality / trajectory-preservation bench.")
+app.add_typer(quality_app, name="quality")
+
+# The cost bench's guided run lives under `cost run` (mirrors `quality run`); bare
+# `minmax-bench run` asks which bench and forwards. report/replay/runs/strategies stay
+# top-level (they read stored cost runs) and are unaffected.
+cost_app = typer.Typer(add_completion=False, help="Cost / token-savings bench.")
+app.add_typer(cost_app, name="cost")
+
+# defaults mirror minmax_bench.quality.generate's argparse — kept in sync there
+_Q_DATASET = "terminal-bench/terminal-bench-2-1"
+
+
+def _flag(argv: list[str], name: str, value, default=None) -> None:
+    """Append `--name value` to argv unless value is the driver's default/None."""
+    if value is not None and value != default:
+        argv += [name, str(value)]
+
+
+@quality_app.command("run")
+def quality_run(
+    tasks: str | None = typer.Option(None, "--tasks", help="N recommended | random:N (with --seed) | group (all|long|short|hard|medium) | a,b,c | omitted = 5. `long`=author timeout ≥30m, biasing toward sessions long enough to compact. See --list-tasks."),
+    arms: str = typer.Option("condense,headroom", "--arms", help="Methods to run; vanilla baseline always included. Also: headroom-kompress (ablation), vanilla-proxy (passthrough control — isolates the proxy-wiring confound)."),
+    model: str | None = typer.Option(None, "--model", "-m", help="Model id (default claude-sonnet-4-6)."),
+    dataset: str = typer.Option(_Q_DATASET, "--dataset", "-d", help="Harbor dataset (only the default is validated)."),
+    k: int = typer.Option(4, "--k", help="Trials per arm/task."),
+    k_vanilla: int | None = typer.Option(None, "--k-vanilla", help="Trials for the vanilla baseline (default k+1)."),
+    budget_usd: float = typer.Option(5.0, "--budget-usd", help="Per-trial spend cap (Harbor max_budget_usd)."),
+    wall_timeout: int = typer.Option(2400, "--wall-timeout", help="Per-trial wall-clock FLOOR (seconds). The effective cap auto-sizes up to each task's own author budget (× the arm's exec multiplier) + build/setup/verify overhead, so long tasks aren't guillotined; raise this to give slow arms even more room."),
+    retries: int = typer.Option(0, "--retries", help="Extra re-attempts for a cell that crashed or timed out (no reward.txt), until every trial resolves to a verdict (reward 0 or 1) or attempts run out. A trial that ran and scored — even 0 — is NOT retried. 0 = single pass."),
+    concurrency: int = typer.Option(1, "--concurrency", help="Parallel trials per cell (harbor -n)."),
+    milestones: bool = typer.Option(False, "--milestones", help="Also run the LLM milestone judge."),
+    out: str | None = typer.Option(None, "--out", help="Results root (default: a fresh auto-minted dir under settings.quality_runs_dir, like the cost bench — never clobbers)."),
+    seed: int | None = typer.Option(None, "--seed", help="Seed for --tasks random:N."),
+    agent_timeout_mult: int | None = typer.Option(None, "--agent-timeout-mult", help="Harbor agent EXECUTION timeout multiplier (headroom auto-3)."),
+    setup_timeout_mult: float = typer.Option(3.0, "--setup-timeout-mult", help="Harbor agent SETUP timeout multiplier, all arms (slow container installs; 3 = ~18min)."),
+    list_tasks: bool = typer.Option(False, "--list-tasks", help="Print the known tasks and exit."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the Harbor commands without running."),
+    auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force Claude Code login; no API key needed)."),
+    force: bool = typer.Option(False, "--force", help="Full retry: re-run ALL cells including completed ones (re-spends the whole run). Default resumes — only cells missing trials re-run."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the guided wizard; use flags/defaults."),
+):
+    """Run the agents end-to-end via Harbor and compare trajectories (SPENDS).
+
+    The quality analog of `minmax-bench cost run`: bare `quality run` launches a guided
+    wizard; or drive it with flags, e.g. `-m claude-haiku-4-5 --tasks 5 --milestones`.
+    """
+    from minmax_bench.quality.generate import main
+    if list_tasks:
+        main(["--list-tasks", "--dataset", dataset])
+        return
+    # bare + interactive → guided wizard (like the cost bench's `run`). The wizard
+    # can pick EITHER full or incremental trajectories and its own source.
+    if (sys.stdin.isatty() and not yes and not dry_run and tasks is None and model is None
+            and arms == "condense,headroom" and dataset == _Q_DATASET):
+        from .interactive import run_quality_wizard
+        try:
+            w = run_quality_wizard(console)
+        except (KeyboardInterrupt, EOFError):
+            console.print("[yellow]aborted.[/]")
+            raise typer.Exit(1) from None
+        if w.mode == "view":  # display-only: re-render a stored run, never spends
+            from minmax_bench.quality.report import main as report_main
+            report_main(["--from", w.out, "--arms", w.arms, "--tasks", w.tasks])
+            return
+        if w.mode == "incremental":
+            _run_incremental(session=w.session, arms=w.arms, model=w.model,
+                             limit=w.limit, budget_usd=w.budget_usd, max_tokens=6000,
+                             out=w.out, task=w.task, auth=w.auth, assume_yes=True, judge=w.judge,
+                             capture=w.capture, ctx_gate=w.ctx_gate,
+                             independent_budgets=w.independent_budgets, resume=w.resume)
+            return
+        arms, tasks, model, k, budget_usd, milestones, out, force, retries, auth = (
+            w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out, w.force, w.retries,
+            w.auth)
+    if not out:  # auto-mint a fresh dir under the configured root, like the cost bench
+        from minmax_bench.quality.paths import new_run_dir
+        out = new_run_dir("full", (tasks or dataset).replace(",", "-"))
+    argv = ["--mode", "full", "--arms", arms, "--dataset", dataset, "--out", out,
+            "--k", str(k), "--budget-usd", str(budget_usd), "--concurrency", str(concurrency),
+            "--wall-timeout", str(wall_timeout), "--retries", str(retries)]
+    _flag(argv, "--tasks", tasks)
+    _flag(argv, "--model", model)
+    _flag(argv, "--k-vanilla", k_vanilla)
+    _flag(argv, "--seed", seed)
+    _flag(argv, "--agent-timeout-mult", agent_timeout_mult)
+    _flag(argv, "--setup-timeout-mult", setup_timeout_mult, default=3.0)
+    if auth != "auto":
+        argv += ["--auth", auth]
+    if milestones:
+        argv.append("--milestones")
+    if force:
+        argv.append("--force")
+    if dry_run:
+        argv.append("--dry-run")
+    main(argv)
+
+
+@quality_app.command("report")
+def quality_report(
+    from_: str = typer.Option("results/jobs", "--from", help="Results root produced by `quality run`."),
+    tasks: str | None = typer.Option(None, "--tasks", help="N | a,b,c | omitted = 5 (must cover what was run)."),
+    arms: str = typer.Option("condense,headroom", "--arms", help="Arms to display."),
+    fmt: str = typer.Option("html", "--format", help="html | md."),
+    out: str | None = typer.Option(None, "--out", help="Output path (default report.<format>)."),
+    ctx_gate: int = typer.Option(50_000, "--ctx-gate", help="Peak-ctx threshold below which compaction can't fire (⊘)."),
+):
+    """Render the quality bench from stored artifacts — never spends."""
+    from minmax_bench.quality.report import main
+    argv = ["--from", from_, "--arms", arms, "--format", fmt, "--ctx-gate", str(ctx_gate)]
+    _flag(argv, "--tasks", tasks)
+    _flag(argv, "--out", out)
+    main(argv)
+
+
+@quality_app.command("runs")
+def quality_runs(
+    roots: str | None = typer.Option(None, "--roots", help="Comma list of dirs to scan (default: settings.quality_runs_dir + the legacy results tree)."),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max runs to list (newest first)."),
+):
+    """List stored quality runs (full + incremental) — pure filesystem walk, never spends."""
+    from datetime import datetime as _dt
+
+    from rich.table import Table
+
+    from minmax_bench.quality.report import discover_runs
+    rlist = [r.strip() for r in roots.split(",") if r.strip()] if roots else None
+    infos = discover_runs(rlist)
+    if not infos:
+        console.print("[yellow]no quality runs found — generate one with "
+                      "`minmax-bench quality run`[/]")
+        return
+    t = Table(title=f"[bold]quality runs ({len(infos)})[/] — newest first",
+              caption="view one: minmax-bench quality report --from <dir>",
+              caption_justify="left", caption_style="dim")
+    t.add_column("when", no_wrap=True)
+    t.add_column("dir", overflow="fold")  # the path is what feeds --from; never ellipsize it
+    for col in ("modes", "model", "arms", "tasks"):
+        t.add_column(col)
+    for i in infos[:limit]:
+        when = _dt.fromtimestamp(Path(i["dir"]).stat().st_mtime).strftime("%m-%d %H:%M")
+        shown = ", ".join(i["tasks"][:3]) + (f", … +{len(i['tasks']) - 3}"
+                                             if len(i["tasks"]) > 3 else "")
+        t.add_row(when, i["dir"], "+".join(i["modes"]), i["model"] or "[dim]?[/]",
+                  ", ".join(a for a in i["arms"] if a not in ("vanilla", "control"))
+                  or "[dim](baseline only)[/]", shown)
+    if len(infos) > limit:
+        t.add_row("…", f"(+{len(infos) - limit} more — raise --limit)", "", "", "", "")
+    console.print(t)
+
+
+@quality_app.command("rejudge")
+def quality_rejudge(
+    from_: str = typer.Option(..., "--from", help="An incremental run dir (holds incremental/<label>-<arm>.jsonl)."),
+    judge: str = typer.Option("goal", "--judge", help="Judge to (re)apply per step: goal (recommended) | off."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the spend confirmation."),
+):
+    """Re-score an existing incremental run's per-step quality with the current (recalibrated)
+    judge — WITHOUT re-replaying, so it spends only on judge calls. Applies the SAME judge to
+    every arm; control's good-rate is the calibration check (should be ≥90%)."""
+    import os
+
+    from .counterfactual import REPO_ROOT, rejudge_run
+    from .quality import engine as eng
+    env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
+    if not (env.get("ANTHROPIC_API_KEY") or eng.auth_mode(env)):
+        console.print("[red]rejudge needs auth — set ANTHROPIC_API_KEY or a Claude Code login.[/]")
+        raise typer.Exit(1)
+    if not yes and not typer.confirm(f"Re-judge {from_} with the {judge!r} judge? "
+                                     "(spends on judge calls only, no re-replay)"):
+        raise typer.Exit(0)
+    try:
+        rejudge_run(from_, judge=judge, env=env, console=console)
+    except SystemExit as e:
+        raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
+
+
+def _run_incremental(*, session: str | None, arms: str, model: str | None,
+                     limit: int, budget_usd: float, max_tokens: int, out: str, task: str,
+                     auth: str, assume_yes: bool, judge: str = "off", steps: bool = True,
+                     capture: bool = False, headroom_mode: str = "token", ccr: bool = True,
+                     ctx_gate: int = 50_000, independent_budgets: bool = False,
+                     resume: bool = True) -> None:
+    """Rich incremental (teacher-forced, per-step) run of one session — picker when no
+    --session, model auto-fallback, cost preview, per-arm progress, a summary table with the
+    recorded backtest anchor, and a per-step good/semi/bad/redundant readout. Writes
+    <out>/incremental/<task>-<arm>.jsonl for report."""
+    from .counterfactual import pick_session, render_steps, render_summary, replay
+    sp = Path(session).expanduser() if session else pick_session(console)
+    if not sp.is_file():
+        raise typer.BadParameter(f"not a session file: {sp}")
+    arm_list = [a.strip() for a in arms.split(",") if a.strip() and a.strip() != "control"]
+    try:
+        summary = replay(sp, arm_list, budget_usd=budget_usd, limit=limit,
+                         max_tokens=max_tokens, out_dir=Path(out), console=console,
+                         assume_yes=assume_yes, model=model, auth=auth, task=task, judge=judge,
+                         capture=capture, headroom_mode=headroom_mode, ccr=ccr, ctx_gate=ctx_gate,
+                         independent_budgets=independent_budgets, resume=resume)
+    except SystemExit as e:
+        raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
+    render_summary(summary, console)
+    if steps:
+        render_steps(summary, console)
+    console.print(f"[green]artifacts[/] {out}/incremental/  ([dim]report:[/] "
+                  f"minmax-bench quality report --from {out} --tasks {task} --arms {arms})")
+
+
+@quality_app.command("incremental")
+def quality_incremental(
+    session: str | None = typer.Argument(None, help="A session .jsonl (default: pick from ~/.claude/projects)."),
+    arms: str = typer.Option("condense", "--arms", help="Arms to compare besides control (condense, headroom)."),
+    model: str | None = typer.Option(None, "--model", "-m", help="Model to run the incremental on (default: the session's own, with auto-fallback if an arm can't serve it)."),
+    limit: int = typer.Option(0, "--limit", "-n", help="Max decision points, contiguous from the start (0 = all). Strided sampling was removed — it distorted the cost/compaction numbers."),
+    budget_usd: float = typer.Option(2.0, "--budget-usd", help="Per-arm spend cap (control included)."),
+    max_tokens: int = typer.Option(6000, "--max-tokens", help="Per-step output cap."),
+    out: str | None = typer.Option(None, "--out", help="Output dir (default: a fresh auto-minted dir under settings.quality_runs_dir/incremental/, like the cost bench — never clobbers)."),
+    task: str = typer.Option("session", "--task", help="Task label for the report join."),
+    auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force the Claude Code login)."),
+    judge: str = typer.Option("off", "--judge", help="Per-step LLM judge: off | goal (rate each action good/degraded/bad toward the task — robust, recommended) | equivalence (upgrade grep-vs-rg near-misses to 'agrees')."),
+    steps: bool = typer.Option(True, "--steps/--no-steps", help="Show the per-step good/semi/bad/redundant readout."),
+    capture: bool = typer.Option(False, "--capture", help="Run your version-matched Claude Code binary once (locally) to capture its system prompt + tools, instead of a stored template."),
+    headroom_mode: str = typer.Option("token", "--headroom-mode", help="For a headroom arm: token (compression — the meaningful test) or cache (~passthrough). Auto-starts the proxy."),
+    ccr: bool = typer.Option(True, "--ccr/--no-ccr", help="For the headroom arm, inject the CCR retrieve loop (via headroom mcp serve); --no-ccr runs it as kompress (compression only)."),
+    ctx_gate: int = typer.Option(50_000, "--ctx-gate", help="Skip sessions whose peak context stays below this (compaction can't fire — nothing to compare). 0 = run it anyway."),
+    independent_budgets: bool = typer.Option(False, "--independent-budgets/--cap-to-control", help="Default caps every arm at the steps control reached within budget (the paired comparison window — no wasted spend past it). --independent-budgets lets each arm run to its own budget instead (e.g. a 'how far can each arm get' reach test), at the cost of ragged, partly-uncomparable step counts."),
+    resume: bool = typer.Option(True, "--resume/--no-resume", help="Re-running to the SAME --out skips arms that already finished cleanly (a .done sentinel), so a cancel mid-run picks up at the next arm instead of re-running control. An interrupted arm has no sentinel and re-runs. --no-resume always starts fresh."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+):
+    """Incremental (teacher-forced per-step) trajectories — the paired counterpart
+    to `run`'s full trajectories. Runs one session through control + each arm,
+    with the session's own model (auto-falling back if an arm can't serve it), a
+    cost preview, and a summary table incl. the recorded backtest anchor (SPENDS).
+
+    This is what used to be the `counterfactual` command — the incremental mode on
+    YOUR own sessions.
+    """
+    from minmax_bench.quality.paths import new_run_dir
+    stem = Path(session).stem[:8] if session else "picked"
+    out_dir = out or new_run_dir("incremental", stem)
+    _run_incremental(session=session, arms=arms, model=model, limit=limit,
+                     budget_usd=budget_usd, max_tokens=max_tokens, out=out_dir, task=task,
+                     auth=auth, assume_yes=yes, judge=judge, steps=steps, capture=capture,
+                     headroom_mode=headroom_mode, ccr=ccr, ctx_gate=ctx_gate,
+                     independent_budgets=independent_budgets, resume=resume)
+
+
+# judge takes niche flags; pass through to the driver (which owns its --help)
+@quality_app.command("judge", context_settings={"allow_extra_args": True,
+                                                 "ignore_unknown_options": True,
+                                                 "help_option_names": []})
+def quality_judge(ctx: typer.Context):
+    """Run the LLM milestone judge over existing full-mode runs (SPENDS)."""
+    from minmax_bench.quality.generate import main
+    main(["--mode", "judge", *ctx.args])
 
 
 def _meta(m) -> dict:
@@ -63,23 +326,27 @@ def _resolve_setup(opt: str, strategies: list[str]) -> list[str]:
     return [t.strip() for t in o.split(",") if t.strip()]
 
 
-def _parse_token_budget(raw: str | None) -> int | None:
-    """'200k'/'1.5m'/'50000' -> int tokens; None/'' -> None."""
-    if not raw:
-        return None
-    r = raw.strip().lower().replace(",", "")
-    mult = 1
-    if r.endswith("k"):
-        mult, r = 1_000, r[:-1]
-    elif r.endswith("m"):
-        mult, r = 1_000_000, r[:-1]
-    try:
-        return int(float(r) * mult)
-    except ValueError:
-        return None
+@app.command("run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def run_dispatch(ctx: typer.Context):
+    """Choose a benchmark — cost or quality — and launch its guided run.
+
+    Skip the prompt with the bench directly: `minmax-bench cost run` /
+    `minmax-bench quality run` (both take flags; this chooser forwards any you pass)."""
+    if not sys.stdin.isatty():
+        console.print("[yellow]non-interactive — pick a bench explicitly:[/] "
+                      "[cyan]minmax-bench cost run[/] … | [cyan]minmax-bench quality run[/] …")
+        raise typer.Exit(2)
+    from rich.prompt import Prompt
+    console.print("[bold]which benchmark?[/]\n"
+                  "  [cyan]cost[/]     token & $ savings of context-reduction proxies\n"
+                  "  [cyan]quality[/]  does compaction preserve the trajectory (does it still work)?")
+    choice = Prompt.ask("[cyan]bench[/]", choices=["cost", "quality"], default="cost",
+                        console=console)
+    import subprocess
+    raise typer.Exit(subprocess.run([sys.argv[0], choice, "run", *ctx.args]).returncode)
 
 
-@app.command("run")
+@cost_app.command("run")
 def run_cmd(
     dataset: str = typer.Option("sample", "--dataset", "-d", help="Dataset spec, e.g. sample | swe-chat:50 | claude-code:/path/*.jsonl"),
     strategy: list[str] = typer.Option(None, "--strategy", "-s", help="Strategy name(s); repeatable. Default: headroom condense."),
@@ -98,12 +365,26 @@ def run_cmd(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the guided wizard; use flags/defaults."),
     setup: str = typer.Option("auto", "--setup", help="Local tools to install/start: 'auto' (implied by strategies), 'none', or a comma list of headroom,dense."),
     runs_dir: str | None = typer.Option(None, "--runs-dir", help="Root for run-<uuid> dirs (default from settings)."),
+    mode: str = typer.Option("proxy", "--mode", help="Run-wide measurement method: 'proxy' (real request through each strategy's proxy; real usage, real money) or 'rewrite' (fetch the rewritten body from the strategy's rewrite function; costed offline, zero model spend)."),
+    transport: str | None = typer.Option(None, "--transport", help="Where direct model traffic lands: 'anthropic' or 'bedrock' (default from UPSTREAM_VIA in .env). With --mode proxy, bedrock EMULATES each proxy: rewritten body fetched here, invoked on Bedrock, real usage reported."),
 ):
     """Guided (or flag-driven) benchmark: measure baseline + strategies per model."""
     settings = get_settings()
     root = runs_dir or settings.runs_dir
     mt = max_tokens if max_tokens is not None else settings.proxy_max_tokens
     refresh_set = {x.strip() for x in refresh.split(",")} if refresh else set()
+
+    transport_given = transport is not None
+    transport = transport or settings.upstream_via
+    if mode not in MODES:
+        raise typer.BadParameter(f"--mode {mode}: expected one of {', '.join(MODES)}")
+    if transport not in TRANSPORTS:
+        raise typer.BadParameter(f"--transport {transport}: expected one of {', '.join(TRANSPORTS)}")
+    if mode == "rewrite" and transport == "bedrock":
+        raise typer.BadParameter(
+            "--mode rewrite is offline (nothing is sent to a model) — "
+            "--transport bedrock has no effect there; use --mode proxy --transport bedrock"
+        )
 
     chosen_s = list(strategy) if strategy else None
     chosen_m = list(model) if model else None
@@ -116,6 +397,15 @@ def run_cmd(
     wizard_setup: list[str] | None = None
     if run:
         store = RunStore.open(root, run)
+        # Cached measurements are keyed by strategy name; a resumed run MUST keep
+        # the mode/transport it was created with or numbers silently mix.
+        stored = (getattr(store.manifest, "mode", "proxy"),
+                  getattr(store.manifest, "transport", "anthropic"))
+        if (mode != "proxy" or transport_given) and (mode, transport) != stored:
+            raise typer.BadParameter(
+                f"run {run} was measured with mode={stored[0]} transport={stored[1]} — "
+                "resume keeps those; start a new run to change them"
+            )
         if chosen_s:
             store.manifest.strategies = list(dict.fromkeys(store.manifest.strategies + chosen_s))
         if chosen_m:
@@ -134,6 +424,7 @@ def run_cmd(
                 "dataset": w.dataset, "strategies": w.strategies, "models": w.models,
                 "edges": w.edges, "session_ids": w.session_ids, "token_limit": w.token_limit,
                 "count_mode": w.count_mode, "encoding": encoding, "max_tokens": mt,
+                "mode": mode, "transport": transport,
             }
             wizard_setup = w.setup
         else:
@@ -144,11 +435,17 @@ def run_cmd(
                 "session_limit": limit, "point_limit": max_points, "longest": longest,
                 "token_limit": _parse_token_budget(token_budget),
                 "count_mode": count, "encoding": encoding, "max_tokens": mt,
+                "mode": mode, "transport": transport,
             }
         store = RunStore.create(root, {"created_utc": datetime.now(UTC).isoformat(timespec="seconds"), **fields})
 
     m = store.manifest
-    console.print(f"[dim]run=[/]{m.uuid}  [dim]models=[/]{','.join(m.models)}  [dim]strategies=[/]{','.join(m.strategies)}")
+    console.print(
+        f"[dim]run=[/]{m.uuid}  [dim]models=[/]{','.join(m.models)}  "
+        f"[dim]strategies=[/]{','.join(m.strategies)}  "
+        f"[dim]mode=[/]{getattr(m, 'mode', 'proxy')}  "
+        f"[dim]transport=[/]{getattr(m, 'transport', 'anthropic')}"
+    )
 
     setup_tools = wizard_setup if wizard_setup is not None else _resolve_setup(setup, m.strategies)
 
@@ -267,6 +564,17 @@ def strategies_cmd():
             console.print(f"    [red]unavailable:[/] {e}")
 
 
+@app.command("setup")
+def setup_cmd():
+    """Guided first-run setup: detect what's configured, fill in credentials, write .env."""
+    from .interactive import run_setup_wizard
+    try:
+        run_setup_wizard(console)
+    except (KeyboardInterrupt, EOFError):
+        console.print("[yellow]setup aborted — nothing written.[/]")
+        raise typer.Exit(1) from None
+
+
 @app.command("info")
 def info_cmd():
     """Show resolved settings (keys are masked)."""
@@ -278,7 +586,18 @@ def info_cmd():
         return "set" if v else "[red]missing[/]"
 
     prof = load_profile(s.condense_profile)
+    # resolved Anthropic auth: how upstream calls will ACTUALLY authenticate (not just whether
+    # a key is set) — API key if present, else the Claude Code subscription OAuth token, else none
+    import os
+
+    from .quality import engine as _eng
+    _env = {**_eng.load_env(), **dict(os.environ)}
+    _auth = _eng.auth_mode(_env)
+    _auth_lbl = {"api-key": "[green]API key[/] (API billing)",
+                 "subscription": "[green]subscription[/] (Claude Code login, no API key)"}.get(
+                     _auth, "[red]NONE[/] — set ANTHROPIC_API_KEY or run `claude setup-token`")
     console.print("[bold]minmax-bench settings[/]")
+    console.print(f"  Anthropic auth    : {_auth_lbl}")
     console.print(f"  ANTHROPIC_API_KEY : {mask(s.anthropic_api_key)}")
     console.print(f"  OPENAI_API_KEY    : {mask(s.openai_api_key)}")
     console.print(f"  HF_TOKEN          : {mask(s.hf_token)}")
@@ -310,7 +629,7 @@ Only raw token usage is stored; cost is always recomputed from it, per model.
 
 ## Resume (reuse caches, add strategies/models, spend only on what's missing)
 
-    minmax-bench run --run {m.uuid} -s condense
+    minmax-bench cost run --run {m.uuid} -s condense
 """
 
 

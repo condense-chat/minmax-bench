@@ -12,3 +12,21 @@ out/
 *.json.local
 data/cache/
 .DS_Store
+
+# Quality bench: results/ is purely generated output (Harbor runs, replays, reports —
+# large; embed task transcripts). The committed offline demo lives in runs/quality-sample/
+# next to the cost bench's committed reference runs.
+results/
+
+# Generated cost-bench runs (each `runs/run-<uuid>/`). The committed reference runs are
+# already tracked (gitignore doesn't untrack them) and runs/quality-sample/ doesn't match,
+# so both stay; commit a NEW reference run deliberately with `git add -f`.
+runs/run-*/
+
+.headroom/
+.playwright-mcp/
+scratchpad/
+*.nohup
+**/.DS_Store
+/report.html
+/report.md

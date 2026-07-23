@@ -55,6 +55,12 @@ class RunManifest:
     token_limit: int | None = None
     # Explicit conversation ids to keep (None = all). Set by the wizard's range filter.
     session_ids: list[str] | None = None
+    # Run-wide measurement method: proxy (real upstream call) | rewrite (offline cost).
+    # Recorded here because cached measurements are keyed by strategy NAME — resuming
+    # under a different mode/transport would silently mix incomparable numbers.
+    mode: str = "proxy"
+    # Where direct model traffic lands: anthropic | bedrock.
+    transport: str = "anthropic"
     # "<model>::<session_id>" -> per-run cache-bust uuid (stamped into the request).
     session_test_uuids: dict[str, str] = field(default_factory=dict)
 

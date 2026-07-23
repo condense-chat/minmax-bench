@@ -177,3 +177,19 @@ def test_cache_roundtrip_and_recompute(tmp_path):
     back = measurements_from_json(j)["headroom"]
     b = recompute_buckets({"headroom": back})["headroom"][-1]
     assert abs(b.pct_tokens_saved_prompt - 60.0) < 1e-6
+
+
+def test_parse_token_count_forms():
+    from minmax_bench.tokens import parse_token_count
+    assert parse_token_count("190k") == 190_000
+    assert parse_token_count("1.5m") == 1_500_000
+    assert parse_token_count("50,000") == 50_000
+    assert parse_token_count("") is None
+    assert parse_token_count(None) is None
+    assert parse_token_count("garbage") is None
+
+
+def test_wizard_resolve_tasks_safe_returns_error_instead_of_exiting():
+    from minmax_bench.interactive import _resolve_tasks_safe
+    tasks, why = _resolve_tasks_safe("random:notanumber")
+    assert tasks is None and "random" in why

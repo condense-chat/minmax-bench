@@ -65,7 +65,15 @@ _LONG: dict[str, Rates] = {
 
 def _normalize(model: str) -> str:
     m = model.lower().strip()
-    for prefix in ("anthropic/", "openai/", "us.anthropic.", "claude-3-5-"):
+    for prefix in (
+        "anthropic/",
+        "openai/",
+        "global.anthropic.",
+        "eu.anthropic.",
+        "us.anthropic.",
+        "anthropic.",
+        "claude-3-5-",
+    ):
         m = m.replace(prefix, "")
     # Strip dated / -latest suffixes: claude-sonnet-4-5-20250929 -> claude-sonnet-4-5
     for base in _FALLBACK:
