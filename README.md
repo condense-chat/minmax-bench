@@ -7,9 +7,6 @@
 
 Were tokens saved? Were dollars saved? Was quality kept?
 
-<!-- TODO(img): hero — screenshot/GIF of `minmax-bench replay` (animated context + cost evolution TUI) -->
-![minmax-bench replay — animated context & cost evolution](docs/img/replay-hero.gif)
-
 ## How it works
 
 **minmax-bench** consists of two benchmark types:
