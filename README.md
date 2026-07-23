@@ -1,4 +1,7 @@
-# **minmax<span color="blue">-bench</span>**
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/logo-dark.svg">
+  <img alt="minmax-bench" src="docs/img/logo.svg" height="56">
+</picture>
 
 **A battlefield for cost-saving strategies.**
 
@@ -9,13 +12,16 @@ Were tokens saved? Were dollars saved? Was quality kept?
 
 ## How it works
 
-**minmax<span color="blue">-bench</span>** consists of two benchmark types:
+**minmax-bench** consists of two benchmark types:
 
 - **cost** — the **minimize target**: analyzes how many tokens a given **strategy**
   saves, and how much of that survives as actual dollars. The analysis is cache-aware —
   with a suboptimal strategy you can save tokens yet end up with a *larger* bill, because
   breaking the prompt cache trades cheap cache-reads for expensive cache-writes.
+  
   → [docs/cost.md](docs/cost.md)
+
+  ![cost report — per-bucket tokens & cost saved](docs/img/cost-report.png)
 
 - **quality** — the **maximize target**: analyzes how well the agent's trajectory is
   preserved under a given **strategy** compared to a control. This comes in two flavors:
@@ -25,6 +31,9 @@ Were tokens saved? Were dollars saved? Was quality kept?
     step given identical pre-/post-**strategy** input?
 
   → [docs/quality.md](docs/quality.md)
+
+  ![quality report — trajectory preservation vs the vanilla noise floor](docs/img/quality-report.png)
+  
 
 Cost tells you what a strategy saves; quality tells you whether those savings are real —
 a method that makes the agent take more turns pays back its "savings" with interest.
@@ -119,9 +128,6 @@ uv run minmax-bench report 5c61ab52-8eea-4fee-97a4-5c64ee5344af
 uv run minmax-bench replay <any of the above>                      # animated
 ```
 
-<!-- TODO(img): screenshot of the cost report bucket tables (tokens saved / cost saved) -->
-![cost report — per-bucket tokens & cost saved](docs/img/cost-report.png)
-
 - **`run-202f98bd`** — headroom vs headroom-kompress vs condense-async, Haiku 4.5,
   truncated to 190k. The clean head-to-head: condense-async saves **~28%** cost,
   headroom (cache mode) ~14%, headroom-kompress ~2% (token savings die in cache-writes).
@@ -130,16 +136,6 @@ uv run minmax-bench replay <any of the above>                      # animated
 - **`run-5c61ab52`** — Opus 4.8 over 64 sessions / \~11.7k turns in `--mode rewrite`
   (zero spend): condense-sync **\~73% tokens / \~64% cost** (\~$549 off \~$861); headroom
   slightly negative at this scale.
-
-And the quality side — does the agent still do the same work?
-
-<!-- TODO(img): screenshot of the quality report (length/rework/milestone/solve/fid table) -->
-![quality report — trajectory preservation vs the vanilla noise floor](docs/img/quality-report.png)
-
-Findings so far (impartially, including results unfavorable to condense): preservation
-holds on 8/9 tasks; one real exception where condense ~doubles a short task's trajectory
-by inducing planning behavior; and token savings ≠ dollar savings — compaction busts the
-prompt cache. Details: [docs/quality.md](docs/quality.md).
 
 ## Docs
 
