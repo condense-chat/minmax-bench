@@ -1,55 +1,59 @@
-# minmax-bench
+# **minmax<span color="blue">-bench</span>**
 
-**A token- and cost-savings benchmark for context-reduction proxies.**
+**A battlefield for cost-saving strategies.**
 
-`minmax-bench` takes real coding-agent sessions, replays them turn-by-turn the way
-a harness actually calls the model, drives each turn through a context-reduction
-**strategy**, and reports how many **tokens** and how much **USD** each strategy
-saves — bucketed by input-chain length and accounting for prompt caching.
+Were tokens saved? Were dollars saved? Was quality kept?
 
-It compares proxies like [`headroom`](https://pypi.org/project/headroom-ai/) and
-`condense` on an equal footing, using only their **public** interfaces — no access
-to any strategy's source is required.
+<!-- TODO(img): hero — screenshot/GIF of `minmax-bench replay` (animated context + cost evolution TUI) -->
+![minmax-bench replay — animated context & cost evolution](docs/img/replay-hero.gif)
 
-> **Scope.** This repo measures both halves of the trade-off: **cost** (tokens and
-> dollars, above) and **quality** — whether a compressed session stays *correct*, i.e.
-> the agent still does the same work. The quality half is the
-> [trajectory-preservation bench](#quality--trajectory-preservation-bench) below; the
-> cost numbers are only trustworthy where it confirms the trajectory is preserved.
+## How it works
 
-## Methodology
+**minmax<span color="blue">-bench</span>** consists of two benchmark types:
 
-```
-session ─▶ harness simulator ─▶ [request points] ─▶ strategy (via executor) ─▶ usage ─▶ cost ─▶ bucketed report
-```
+- **cost** — the **minimize target**: analyzes how many tokens a given **strategy**
+  saves, and how much of that survives as actual dollars. The analysis is cache-aware —
+  with a suboptimal strategy you can save tokens yet end up with a *larger* bill, because
+  breaking the prompt cache trades cheap cache-reads for expensive cache-writes.
+  → [docs/cost.md](docs/cost.md)
 
-- **Harness simulator.** A recorded session is chopped into the exact sequence of
-  model calls a real harness would make: each assistant turn is one call whose
-  request prefix is every preceding message (user → tool_use → tool_result →
-  assistant → …). Replayed deterministically from the transcript.
-- **Scored against the uncompressed baseline.** Every strategy is compared to the
-  *baseline* (no compression) for the same `(session, turn)`, then **bucketed by
-  the baseline input-chain length** so every strategy is bucketed identically and
-  comparisons are apples-to-apples.
-- **Caching is modeled, on purpose.** Savings that destroy the prompt cache aren't
-  real savings. Proxy strategies rewrite *historical* turns, which can invalidate
-  the cache from the edit point on. The proxy executor reads the upstream's real,
-  cache-aware `usage` (cache-read vs cache-write tiers); cost uses cache-aware
-  per-model pricing. That's why the **cost** tables differ from the raw-token
-  tables — a strategy can save tokens yet cost more if it trades cheap cache-reads
-  for dearer cache-writes.
-- **The 200k context cap.** Models have a hard context ceiling (Haiku: 200k). A
-  turn whose prompt exceeds it is rejected, so runs can be **truncated to a token
-  budget** (`--token-budget 190k`) to keep every scored turn valid — otherwise the
-  deepest turns of long sessions drop out and skew the buckets.
+- **quality** — the **maximize target**: analyzes how well the agent's trajectory is
+  preserved under a given **strategy** compared to a control. This comes in two flavors:
+  - **full** — run complete trajectories and compare them. Closest to reality, but
+    requires a number of reruns to eliminate variance.
+  - **incremental** — a more deterministic analysis: does the model produce the same
+    step given identical pre-/post-**strategy** input?
 
-Two measurement paths (executors):
+  → [docs/quality.md](docs/quality.md)
 
-- **proxy** — send the real request to the strategy's Anthropic/OpenAI-compatible
-  proxy, capped to 1 output token, and read the upstream's real cache-aware
-  `usage` (reflecting the proxy's server-side compression). Used for `headroom`,
-  `condense`, `upstream`, `gemini`.
-- **noop** — the uncompressed baseline (recorded usage, or a local token count).
+Cost tells you what a strategy saves; quality tells you whether those savings are real —
+a method that makes the agent take more turns pays back its "savings" with interest.
+Read them together.
+
+## Strategies
+
+The contenders, and how they line up
+(full mechanics: [docs/architecture.md](docs/architecture.md)):
+
+| strategy | what it does | source | mode | transport |
+|---|---|---|---|---|
+| `baseline` | uncompressed control — everything is scored against it | built-in | — | — |
+| `upstream` | direct call to the provider; live cache-aware baseline | built-in | proxy | anthropic, bedrock |
+| `headroom` | compression proxy, cache-optimized: freezes prior turns for prefix-cache hits | [headroom-ai](https://pypi.org/project/headroom-ai/) | proxy, rewrite | anthropic, bedrock |
+| `headroom-kompress` | the same proxy in token mode: Kompress rewrites history for max compression | [headroom-ai](https://pypi.org/project/headroom-ai/) | proxy, rewrite | anthropic, bedrock |
+| `condense-sync` | whole-conversation compaction, blocking until it lands | [condense.chat](https://condense.chat) | proxy, rewrite\* | anthropic, bedrock |
+| `condense-async` | compaction in the background, paced by realistic think time | [condense.chat](https://condense.chat) | proxy, rewrite\* | anthropic, bedrock |
+
+Legend:
+
+- **\*** — organization account only.
+- **mode** — how a strategy is measured (cost bench only). **proxy** sends the real
+  request through the strategy's proxy to the provider — real usage, real costs.
+  **rewrite** uses the strategy's rewrite API and simulates caching locally — run a much
+  larger dataset without incurring major costs.
+- **transport** — the provider API used for the bench's own model calls: the
+  **Anthropic API** (with an API key *or* your **Claude subscription** login) or
+  **AWS Bedrock**.
 
 ## Install
 
@@ -61,318 +65,84 @@ uv sync --extra hf            # + HuggingFace loaders for the SWE-chat dataset
 uv run minmax-bench setup     # guided: detect creds, fill in keys, write .env
 ```
 
-`setup` is a guided wizard — it shows what's already configured (masked), then walks you
-through Anthropic access (an API key **or** your Claude Code login), the condense-arm key, and
-the optional dataset token, and writes `.env` for you (updating keys in place, preserving the
-rest). Prefer to do it by hand? `cp .env.dist .env` and fill in only what you run.
-`minmax-bench info` prints the **resolved** state at any time — including which auth mode is
-actually active.
+`setup` walks you through Anthropic access (API key **or** Claude Code login), the
+condense arm (`dense login`), and the optional dataset token. `minmax-bench info` shows
+the resolved state at any time. Prefer manual? `cp .env.dist .env` and fill in only what
+you run.
 
-### What you need, per feature
+## Quick start
 
-| feature | credentials |
-|---|---|
-| `report` / `replay` reference runs, offline demo, `cost run --dataset sample` | **none** |
-| your sessions' *recorded* cost (the counterfactual `recorded` row) | **none** |
-| replays: `quality incremental` (your own sessions) + cost-bench proxy runs | `ANTHROPIC_API_KEY`, **or a Claude Code login** (see below) |
-| the condense arm (quality **and** cost bench) | the local **`dense` CLI** login — install it (`curl -fsSL https://cli.condense.chat/unix \| sh`) and run `dense login` (no key in `.env`; `CONDENSE_API_KEY` is a headless-only fallback) |
-| `--mode full` (Harbor) | Docker + `uv tool install harbor` + the above |
-
-**No API key? Your Claude Code subscription works.** When `ANTHROPIC_API_KEY` is unset, the
-bench authenticates the way Claude Code itself does, using your own login: it checks
-`CLAUDE_CODE_OAUTH_TOKEN` (mint one with `claude setup-token`), then
-`~/.claude/.credentials.json`, then the macOS keychain entry Claude Code maintains. Replays
-are Claude Code-shaped requests over your own sessions; usage draws on your plan, the token
-never leaves your machine except toward the endpoint an arm points at, and every run prints an
-`auth:` line so it's never implicit. If you have **both** a key and a login configured, `auto`
-prefers the key — force the other per-run with `--auth subscription` / `--auth api-key`, or the
-wizard's auth toggle (which only appears when both are present). Watch it: a subscription's
-rate limits are far tighter than API billing, so a large full matrix is better on a key.
-
-## Quick start (offline, no keys)
-
-The richest no-spend demo is re-scoring and replaying the committed reference runs
-(see [Checking the cached replays](#checking-the-cached-replays)):
+No keys? The offline demo re-scores and replays the committed reference runs:
 
 ```bash
 uv run minmax-bench report 202f98bd-a2f1-4390-8307-658b451b7727   # per-bucket tables
 uv run minmax-bench replay 202f98bd-a2f1-4390-8307-658b451b7727   # animated evolution
-uv run minmax-bench strategies                                    # list strategies
-uv run minmax-bench info                                          # configured keys/endpoints
+uv run minmax-bench strategies                                    # list the matrix
 ```
 
-The two benches each have a guided run: **`cost run`** (token/$ savings, below) and
-**`quality run`** ([trajectory preservation](#quality--trajectory-preservation-bench)). Bare
-**`minmax-bench run`** just asks which and forwards — so `cost run` / `quality run` are the
-direct entry points, and `run` is the front door.
-
-A `cost run` on the built-in sample computes the baseline offline (every comparison
-strategy is a proxy that needs keys — see below — so those turns are skipped
-without them):
+With keys, each bench has a guided run (`minmax-bench run` is the front door that asks
+which one you want):
 
 ```bash
-uv run minmax-bench cost run --dataset sample
+uv run minmax-bench run               # wizard: type, dataset, strategies, model, mode/transport
+uv run minmax-bench cost run          # wizard: dataset, strategies, model, mode/transport
+uv run minmax-bench quality run       # wizard: arms, tasks, model, k, budget → confirm
 ```
 
-## Running against real strategies
+Or drive them with flags:
 
 ```bash
-# headroom (proxy): pip install "headroom-ai[proxy]" then run the proxy
-headroom proxy --port 8787 --mode cache      # or --mode token (max compression)
-uv run minmax-bench cost run -d swe-chat:32 -s headroom -m claude-haiku-4-5
-
-# condense (proxy): creds are read from the local `dense` CLI config (~/.config/dense)
-uv run minmax-bench cost run -d swe-chat:32 -s condense-async -m claude-haiku-4-5
-
-# gemini (direct, OpenAI-compatible chat/completions): set GEMINI_API_KEY in .env
-uv run minmax-bench cost run -d swe-chat:32 -s gemini -m gemini-3.1-flash-lite
-```
-
-> **Proxy runs cost real money.** Each request hits the real upstream (with
-> `max_tokens=1`), so you pay for the *input* tokens of every replayed turn. Use
-> `--limit/-n` to cap sessions and `--token-budget` to cap chain length while
-> iterating.
-
-## Checking the cached replays
-
-`runs/` ships three committed **reference runs** you can inspect with **zero spend** —
-every number is recomputed from stored token usage, and the animated evolution is
-replayed from the same cache. No API keys or network needed.
-
-```bash
-# re-score from the stored usage (prints the per-bucket tables):
-uv run minmax-bench report 202f98bd-a2f1-4390-8307-658b451b7727
-uv run minmax-bench report cba32b86-99ba-4ed7-bf7c-e385edf2ec99
-uv run minmax-bench report 5c61ab52-8eea-4fee-97a4-5c64ee5344af
-
-# replay the animated context + cost evolution:
-uv run minmax-bench replay 202f98bd-a2f1-4390-8307-658b451b7727
-uv run minmax-bench replay cba32b86-99ba-4ed7-bf7c-e385edf2ec99
-uv run minmax-bench replay 5c61ab52-8eea-4fee-97a4-5c64ee5344af
-```
-
-- **`run-202f98bd`** — `headroom` vs `headroom-kompress` vs `condense-async` on
-  Haiku 4.5 over `swe-chat:32` (6 long sessions), **truncated to 190k** so every
-  scored turn is under the 200k cap. This is the clean head-to-head.
-- **`run-cba32b86`** — baseline + `condense-async`, **untruncated**, over the full
-  long sessions (baseline totals **~$73.6** on replay). Shows how savings grow with
-  chain length into the 200k–400k+ bands.
-- **`run-5c61ab52`** — `headroom` vs `condense-sync` on **Opus 4.8** over the full
-  **`swe-chat:64`** (64 sessions, **~11.7k scored turns**), measured in
-  **`--mode rewrite`**: each strategy's rewritten request body is fetched from its
-  rewrite API and costed from **simulated (locally counted) token usage** — nothing is
-  sent to a model, zero spend. At this scale `condense-sync` saves **~73% tokens /
-  ~64% cost** (**~$549** off an **~$861** baseline), while `headroom` nets slightly
-  negative overall — the large-dataset counterpart to the truncated head-to-head above.
-
-What to look at: each strategy gets a **tokens-saved** and a **cost-saved (USD)**
-table, bucketed by input-chain length, with an `ALL` aggregate row. Cost-saved
-trails token-saved because compression trades cheap cache-reads for dearer
-cache-writes — that gap is the point of modeling the cache.
-
-Each run directory is self-describing: `run.json` (manifest), `report.json`
-(bucketed metrics), `models/<model>/baseline.json` + `.../strategies/<name>.json`
-(raw per-turn usage), and a `README.md`.
-
-## Retesting yourself
-
-Produce your own run — each is written under `runs/run-<uuid>/` and is itself
-replayable and re-scorable exactly like the reference runs above:
-
-```bash
+# cost: the clean head-to-head, truncated under Haiku's 200k cap
 uv run minmax-bench cost run -d swe-chat:32 \
   -s headroom -s headroom-kompress -s condense-async \
   -m claude-haiku-4-5 --token-budget 190k
+
+# cost, zero model spend: rewrite mode simulates caching locally
+uv run minmax-bench cost run -d swe-chat:64 -s condense-sync -s headroom --mode rewrite
+
+# quality: how would YOUR session have played out under condense?
+uv run minmax-bench quality incremental
 ```
 
-- `--token-budget 190k` keeps every turn under Haiku's 200k cap so long sessions
-  don't drop out of the buckets.
-- `-n/--limit N` caps how many conversations load (cheaper iteration).
-- `--run <uuid>` resumes an existing run, reusing its caches and spending only on
-  what's missing.
-- Re-price or re-bucket any finished run without re-spending:
-  `uv run minmax-bench report <uuid> --edges 16000,32000,100000,200000`.
+> **Proxy runs cost real money** — you pay for the input tokens of every replayed turn.
+> Iterate with `--limit`, `--token-budget`, or `--mode rewrite`.
 
-## Reading the output
+## See cached results
 
-Per strategy, two tables bucketed by input-chain length:
-
-- **tokens saved** — baseline vs strategy prompt tokens, per-tier and percent.
-- **cost saved (USD)** — the same after cache-aware pricing.
-
-Empty buckets are dropped; the `ALL` row is the aggregate. Every run is saved under
-`runs/run-<uuid>/report.json` with the full bucket stats for further analysis.
-
-### Illustrative findings (from the reference runs)
-
-| strategy | cost saved (truncated 190k) | notes |
-|---|---|---|
-| `condense-async` | **28%** (37% untruncated) | scales *up* with chain length — 53% saved in the 400k+ band |
-| `headroom` (cache mode) | ~14% | preserves the prefix cache |
-| `headroom-kompress` (token mode) | ~2% | rewrites history, torching the cache — token savings barely survive to cost |
-
-Take these as illustrative of *this* dataset/model, not universal — rerun on your
-own sessions to compare.
-
-## Quality / trajectory-preservation bench
-
-The cost tables above assume compaction **preserves the trajectory** — the agent does the same
-work in about the same number of steps. That assumption is load-bearing: if a method makes the
-agent wander or take more turns, the "savings" is partly illusory (more turns = more cost). This
-bench tests it by running the **full agent** (not a replay) under each method on real coding tasks
-([Terminal-Bench](https://github.com/laude-institute/terminal-bench) via
-[Harbor](https://github.com/laude-institute/harbor)) and comparing the trajectories to a
-**vanilla-vs-vanilla noise floor**. The bar is not "identical to control" (two vanilla runs already
-differ) — it's **"within the vanilla-vs-vanilla spread."**
-
-The two modes test **two different claims** and are deliberately complementary:
-**full** runs catch *behavioral* changes (turn-count inflation, induced planning, solve rate) but
-can't attribute them; **incremental** (teacher-forced) runs catch *informational* loss (does
-compressing this exact history change the next decision?) but are structurally blind to behavioral
-effects on short sessions where threshold-gated compaction never fires. A method can pass one and
-fail the other — both outcomes are informative.
-
-Per task, vanilla `k≈3` sets the floor; each method's runs are tested against it, axis by axis:
-
-| axis | question |
-|---|---|
-| **length** | does compaction change the # of steps? *(the load-bearing axis)* |
-| **rework** | does it re-fetch info it already had? *(compaction amnesia; range-aware — post-edit re-inspection counts as verification, not rework)* |
-| **milestone** | does it accomplish the same subgoals? *(approach-agnostic, LLM-judged, arm-blind; the reference run is excluded from vanilla's own coverage)* |
-| **solve** | does it still pass the verifier? *(trials that crash or hit the wall timeout count as failures — `⚠ lost` in the table — not as missing data)* |
-| **fid** | teacher-forced per-step action agreement, shown next to the **control incremental run's** agreement (the noise floor) — only the gap below the floor is signal |
-
-**When does context-reduction actually trigger?** Both products are gated to act only where
-reduction pays off, and a small task structurally cannot exercise them: condense compacts the
-*whole conversation* only past an internal size threshold (its savings appear in the 100k+ bands),
-and headroom's token mode compresses *individual tool outputs* only when they exceed ~200 tokens
-(`min_tokens_to_crush`, v0.28 defaults) and score as stale/irrelevant. The report therefore shows
-vanilla's **peak context** per task and marks tasks **⊘** when it stays under the compaction gate
-(`--ctx-gate`, default 50k): on a ⊘ task no compaction/compression fired, so a length ✗ there
-measures the arm's *wiring and behavioral* side-effects, not compaction damage. (One such effect
-we measured: Claude Code composes a ~8-9k-token-larger request whenever `ANTHROPIC_BASE_URL` is
-non-default, a flat confound shared by every proxy arm. The **`vanilla-proxy` arm** isolates it:
-vanilla routed through a do-nothing local forwarder — same wiring, zero content change — so
-vanilla-proxy vs vanilla is the wiring effect alone, and a proxy arm read against vanilla-proxy
-has the confound subtracted. Add it with `--arms condense,headroom,vanilla-proxy` or tick it in
-the wizard.) Compaction *quality* claims must come from
-tasks whose vanilla runs clear the gate — the long half of the curated list.
-
-A verdict is **✓** if the method's band *overlaps* vanilla's, **✗** if disjoint — and needs
-**≥ 2 finished runs per arm** (a single run can't be told from a fluke; this kills the k=1 mirage
-where length and cost swing wildly). Read ✓ honestly: with k≈3, band overlap only detects *gross*
-divergence — it means "no detectable divergence at this k", not statistical equivalence.
-Quality arms: `headroom` = the token-mode proxy *plus* the MCP retrieve loop — the full
-Compress-Cache-Retrieve (CCR) product; `headroom-kompress` = token-mode compression *without*
-retrieval, kept only as an ablation (judging headroom's quality by it would be a strawman).
-Note the same names carry different meanings across the two benches: in the **cost** bench
-`headroom` is the cache-mode strategy and `headroom-kompress` is token-mode; only
-`headroom-kompress` (token, no retrieval) means the same thing in both. The quality bench's
-`headroom` (token + CCR) has no cost-bench counterpart, because CCR needs a running agent.
-Full tooling + reproduction: [`docs/quality.md`](docs/quality.md).
-
-**Generate your own** (Docker + `uv tool install harbor` + `.env` keys):
+`runs/` ships three committed **reference runs** — every number recomputes from stored
+usage, no keys, no network, zero spend:
 
 ```bash
-# `quality run` is the analog of the cost bench's `run` — bare, it launches a
-# guided wizard (arms, tasks, model, k, budget, preflight, cost ceiling → confirm):
-uv run minmax-bench quality run
-# or drive it with flags (skips the wizard); the default is the first 5 recommended
-# tasks (--list-tasks shows all; --tasks 2, --tasks random:8 --seed 42, or a,b):
-uv run minmax-bench quality run -m claude-haiku-4-5 --tasks 5 --milestones --out results/jobs/run1
-uv run minmax-bench quality report --from results/jobs/run1 --tasks 5     # pure display, free
-uv run minmax-bench quality runs        # list every stored quality run (full + incremental), free
-# also: `quality incremental --session <f> --task <t>` (teacher-forced per-step), `quality judge`.
+uv run minmax-bench report 202f98bd-a2f1-4390-8307-658b451b7727
+uv run minmax-bench report cba32b86-99ba-4ed7-bf7c-e385edf2ec99
+uv run minmax-bench report 5c61ab52-8eea-4fee-97a4-5c64ee5344af
+uv run minmax-bench replay <any of the above>                      # animated
 ```
 
-`generate` prints its plan up front (arms × tasks × k = N trials + the cost ceiling from
-`--budget-usd`) before spending anything. Defaults: k=4 trials per arm and k+1 for the
-vanilla baseline (the noise floor every arm is judged against — the extra run sharpens
-every verdict). `--dataset` selects the harbor dataset; only
-`terminal-bench/terminal-bench-2-1` is validated so far.
+<!-- TODO(img): screenshot of the cost report bucket tables (tokens saved / cost saved) -->
+![cost report — per-bucket tokens & cost saved](docs/img/cost-report.png)
 
-**Run control** (full mode) — all exposed in the wizard and as flags:
+- **`run-202f98bd`** — headroom vs headroom-kompress vs condense-async, Haiku 4.5,
+  truncated to 190k. The clean head-to-head: condense-async saves **~28%** cost,
+  headroom (cache mode) ~14%, headroom-kompress ~2% (token savings die in cache-writes).
+- **`run-cba32b86`** — untruncated long sessions (~$73.6 baseline): condense's savings
+  *grow* with chain length — 53% in the 400k+ band.
+- **`run-5c61ab52`** — Opus 4.8 over 64 sessions / \~11.7k turns in `--mode rewrite`
+  (zero spend): condense-sync **\~73% tokens / \~64% cost** (\~$549 off \~$861); headroom
+  slightly negative at this scale.
 
-- **Resume is automatic.** Re-run the *same command / `--out`* and finished cells (any with a
-  verifier result, pass or fail) are skipped — only cells missing trials re-run. `--force`
-  ("full retry" in the wizard) re-runs everything from scratch instead.
-- **`--retries N`** re-attempts a cell that *crashed or timed out* (no verifier result) until
-  every trial resolves to a verdict or the attempts run out — a trial that ran and scored (even
-  0) is a real result and is **not** retried.
-- **`--wall-timeout`** is a per-trial floor; the effective cap **auto-sizes** to each task's own
-  author budget (× the arm's exec multiplier) + build/setup/verify overhead, so a long task is
-  never guillotined below what it was designed for.
+And the quality side — does the agent still do the same work?
 
-For **incremental**, arms run control-first and each later arm is **capped at the steps control
-reached** within budget (the paired comparison window — no spend on steps with no control
-counterpart); `--independent-budgets` restores per-arm budgets. `--resume`/`--no-resume` skips
-arms already finished (a cancel mid-run picks up at the next arm instead of re-running control).
+<!-- TODO(img): screenshot of the quality report (length/rework/milestone/solve/fid table) -->
+![quality report — trajectory preservation vs the vanilla noise floor](docs/img/quality-report.png)
 
-The quality bench is **pure standard library** — nothing to install to *analyze* runs; Docker + Harbor
-are only needed to *generate* them.
+Findings so far (impartially, including results unfavorable to condense): preservation
+holds on 8/9 tasks; one real exception where condense ~doubles a short task's trajectory
+by inducing planning behavior; and token savings ≠ dollar savings — compaction busts the
+prompt cache. Details: [docs/quality.md](docs/quality.md).
 
-### Run your own session incrementally — `quality incremental`
+## Docs
 
-How would one of your real sessions have played out under condense? Pick any session from
-`~/.claude/projects` and teacher-force it step-by-step through each arm, next to a control
-incremental run (the noise floor). No Docker, no Harbor — just auth (an API key **or** your Claude Code login). It
-auto-detects the session's model, shows a cost estimate, and asks before spending:
-
-```bash
-uv run minmax-bench quality incremental                       # interactive picker + confirm
-uv run minmax-bench quality incremental ~/.claude/projects/<proj>/<id>.jsonl --arms condense -n 30
-```
-
-Per arm you get **same-action agreement** (did it still make the same next move? read it against
-the control floor, not 100%) or, with `--judge goal`, a per-step good/degraded/bad quality rating;
-plus **avg context tokens**, **$ vs control** (over the steps every arm reached), and a **recorded**
-row showing what those turns *actually* consumed when the session ran — so the table is both an
-incremental comparison and a backtest. `--capture` runs your version-matched Claude Code binary once,
-locally, to reconstruct the exact system prompt + tools your session used instead of a stored
-template. Note the condense arm sends your session content to `api.condense.chat`.
-
-### Quality findings (so far)
-
-Reported impartially, including results unfavorable to condense.
-
-- **Preservation mostly holds** — on 8/9 tasks with enough runs, condense's trajectory length is
-  within the vanilla-vs-vanilla spread (no detectable divergence at k≈3), redundant re-work is zero,
-  and the same subgoals are reached. A per-turn cost claim is sound *where both arms solve reliably.*
-- **One real exception — short tasks (`kv-store`):** condense consistently ~doubles the trajectory
-  (5 → 12 steps) by **inducing todo-tool planning + verification** — behavioral, *not* amnesia. This
-  *explains* that task's large full-run cost gap (which looked like noise at k=1).
-- **Token savings ≠ dollar savings** — compaction busts the prompt cache (the same effect behind the
-  `headroom-kompress` (token-mode) cost result above); verified two ways (teacher-forced incremental + real runs).
-
-## Layout
-
-```
-minmax_bench/
-  models.py        normalized session/message/usage model
-  harness/         session -> request points (harness simulator)
-  strategies/      strategy registry: noop, upstream, headroom, condense, gemini
-  executors/       proxy | noop measurement
-  providers.py     normalized -> Anthropic/OpenAI request bodies (+ cache breakpoints)
-  chain.py         exact cache-aware costing of a full reconstructed chain
-  tokens.py        local token counting + incremental cache model
-  pricing.py       cache-aware per-model cost
-  report/          bucketing + rich tables + JSON
-  data/            dataset loaders + offline sample
-  cli.py           `minmax-bench` entrypoint
-runs/              committed reference runs (replayable, no spend)
-
-minmax_bench/quality/   quality / trajectory-preservation bench (pure stdlib; see docs/quality.md)
-  generate.py      GENERATE data (spends): --mode full|incremental, --arms, --agent
-  engine.py        teacher-forced incremental engine (session I/O, scoring, pricing)
-  report.py        DISPLAY (pure, never spends): reads artifacts -> html/md
-harbor_agents/     custom Harbor agent (self-contained headroom-CCR wiring)
-```
-
-## Status / caveats
-
-- Offline token counts use `tiktoken` (an approximation for Claude); the proxy
-  executor supplies exact provider numbers when you need them.
-- The cost tables answer "how much does it save"; "does it still work" is the
-  [quality / trajectory-preservation bench](#quality--trajectory-preservation-bench)
-  above — read cost savings only where the quality bench confirms preservation
-  (and where the task actually cleared the compaction gate, ⊘).
+- [docs/cost.md](docs/cost.md) — cost-bench methodology: harness simulation, bucketing, cache modeling, run store.
+- [docs/quality.md](docs/quality.md) — quality-bench methodology: noise floor, axes, compaction gate, full + incremental.
+- [docs/architecture.md](docs/architecture.md) — how strategies, mode, and transport come together; module map.
