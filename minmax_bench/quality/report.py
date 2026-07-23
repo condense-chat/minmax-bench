@@ -17,8 +17,8 @@ Offline axes (always, no model calls): length / rework / solve, each vs the vani
 only if their artifacts exist. Verdicts are deliberately coarse: with k≈3 runs, band overlap can
 only catch GROSS divergence — "OK" means "no detectable divergence at this k", not equivalence.
 
-  python3 scripts/report.py --from results/jobs/run1 --tasks kv-store-grpc
-  python3 scripts/report.py --from results/jobs --tasks a,b --arms condense,headroom --format md
+  minmax-bench quality report --from results/jobs/run1 --tasks kv-store-grpc
+  minmax-bench quality report --from results/jobs --tasks a,b --arms condense,headroom --format md
 """
 import argparse
 import glob

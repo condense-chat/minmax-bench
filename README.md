@@ -269,7 +269,7 @@ Note the same names carry different meanings across the two benches: in the **co
 `headroom` is the cache-mode strategy and `headroom-kompress` is token-mode; only
 `headroom-kompress` (token, no retrieval) means the same thing in both. The quality bench's
 `headroom` (token + CCR) has no cost-bench counterpart, because CCR needs a running agent.
-Full tooling + reproduction: [`scripts/README.md`](scripts/README.md).
+Full tooling + reproduction: [`docs/quality.md`](docs/quality.md).
 
 **Generate your own** (Docker + `uv tool install harbor` + `.env` keys):
 
@@ -283,7 +283,6 @@ uv run minmax-bench quality run -m claude-haiku-4-5 --tasks 5 --milestones --out
 uv run minmax-bench quality report --from results/jobs/run1 --tasks 5     # pure display, free
 uv run minmax-bench quality runs        # list every stored quality run (full + incremental), free
 # also: `quality incremental --session <f> --task <t>` (teacher-forced per-step), `quality judge`.
-# The scripts/ wrappers (`python3 scripts/generate.py …`) still work identically.
 ```
 
 `generate` prints its plan up front (arms × tasks × k = N trials + the cost ceiling from
@@ -362,11 +361,10 @@ minmax_bench/
   cli.py           `minmax-bench` entrypoint
 runs/              committed reference runs (replayable, no spend)
 
-minmax_bench/quality/   quality / trajectory-preservation bench (pure stdlib; see scripts/README.md)
+minmax_bench/quality/   quality / trajectory-preservation bench (pure stdlib; see docs/quality.md)
   generate.py      GENERATE data (spends): --mode full|incremental, --arms, --agent
   engine.py        teacher-forced incremental engine (session I/O, scoring, pricing)
   report.py        DISPLAY (pure, never spends): reads artifacts -> html/md
-scripts/           thin `python3 scripts/{generate,report}.py` wrappers around the above
 harbor_agents/     custom Harbor agent (self-contained headroom-CCR wiring)
 ```
 

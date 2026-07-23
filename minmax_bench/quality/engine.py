@@ -16,7 +16,7 @@ information preserved in context, not end-to-end outcome — agents recover from
 flipped actions, and per-step agreement doesn't capture compounding.
 
 This module is the LIBRARY: session I/O, request building, calling, scoring.
-The drivers are `scripts/generate.py --mode incremental` (batch, artifacts for
+The drivers are `generate.py --mode incremental` (batch, artifacts for
 report.py) and `minmax-bench quality incremental` (interactive, local sessions).
 
 Template = a real CC request captured via a local recording server (has the
