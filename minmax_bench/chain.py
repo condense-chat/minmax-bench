@@ -19,6 +19,7 @@ same tokenizer the proxies' real usage uses) or locally with tiktoken (offline).
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable
 
 import httpx
@@ -42,6 +43,28 @@ class LocalCounter:
             total += self.tc.count_json([t.model_dump() for t in session.tools])
         for m in messages:
             total += self.tc.count_message(m)
+        return total
+
+    def count_body(self, body: dict) -> int:
+        """Count a raw Anthropic request body (e.g. one returned by a rewrite API)."""
+        total = 0
+        system = body.get("system")
+        if system:
+            total += (
+                self.tc.count_text(system)
+                if isinstance(system, str)
+                else self.tc.count_json(system)
+            )
+        tools = body.get("tools")
+        if tools:
+            total += self.tc.count_json(tools)
+        for m in body.get("messages", []):
+            content = m.get("content")
+            if isinstance(content, str):
+                total += self.tc.count_text(content)
+            elif content:
+                total += self.tc.count_json(content)
+            total += 4  # same per-message framing overhead as count_message
         return total
 
 
@@ -70,6 +93,27 @@ class AnthropicCounter:
         body.pop("thinking", None)
         if not body.get("messages"):
             return 0
+        got = self._post_count(body)
+        if got is None:
+            # Rare rejects (a content shape count_tokens dislikes) must not kill
+            # the run — fall back to the offline count for this one point.
+            self.fallbacks += 1
+            return self._fallback.count(session, messages)
+        return got
+
+    def count_body(self, body: dict) -> int:
+        """Count a raw Anthropic request body (e.g. one returned by a rewrite API)."""
+        clean = {k: v for k, v in body.items() if k in ("model", "messages", "system", "tools")}
+        if not clean.get("messages"):
+            return 0
+        got = self._post_count(clean)
+        if got is None:
+            self.fallbacks += 1
+            return self._fallback.count_body(clean)
+        return got
+
+    def _post_count(self, body: dict) -> int | None:
+        """POST to count_tokens, retrying rate limits; None when truly rejected."""
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
@@ -77,18 +121,46 @@ class AnthropicCounter:
         }
         if self.beta:
             headers["anthropic-beta"] = self.beta
-        try:
-            resp = self._client.post(self.url, json=body, headers=headers)
-            resp.raise_for_status()
+        for attempt in range(6):
+            try:
+                resp = self._client.post(self.url, json=body, headers=headers)
+            except Exception:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if resp.status_code in (429, 500, 502, 503, 529):
+                retry_after = resp.headers.get("retry-after")
+                delay = float(retry_after) if retry_after else 1.5 * 2**attempt
+                time.sleep(min(delay, 60.0))
+                continue
+            if resp.status_code != 200:
+                return None
             return int(resp.json().get("input_tokens", 0))
-        except Exception:
-            # Rare rejects (a content shape count_tokens dislikes) must not kill
-            # the run — fall back to the offline count for this one point.
-            self.fallbacks += 1
-            return self._fallback.count(session, messages)
+        return None
 
     def close(self) -> None:
         self._client.close()
+
+
+def iter_chain_usages(
+    session: Session,
+    points: list,
+    counter,
+    output_fn: Callable[[object], int],
+    rewrite: Callable[[Session, list[Message]], list[Message]] | None = None,
+):
+    """Cache-aware baseline/rewrite usages by differencing successive prompts.
+
+    A generator so callers (the noop executor feeding the live dashboard) can
+    stream each point as it is counted — API counting is slow, and buffering
+    the whole chain would freeze the dashboard until the session completes.
+    """
+    prev = 0
+    for p in points:
+        msgs = rewrite(session, p.prefix) if rewrite else p.prefix
+        total = counter.count(session, msgs)
+        new = max(0, total - prev)
+        yield Usage(input_tokens=0, output_tokens=output_fn(p), cache_read=prev, cache_write=new)
+        prev = total
 
 
 def chain_usages(
@@ -98,18 +170,7 @@ def chain_usages(
     output_fn: Callable[[object], int],
     rewrite: Callable[[Session, list[Message]], list[Message]] | None = None,
 ) -> list[Usage]:
-    """Cache-aware baseline/rewrite usages by differencing successive prompts."""
-    usages: list[Usage] = []
-    prev = 0
-    for p in points:
-        msgs = rewrite(session, p.prefix) if rewrite else p.prefix
-        total = counter.count(session, msgs)
-        new = max(0, total - prev)
-        usages.append(
-            Usage(input_tokens=0, output_tokens=output_fn(p), cache_read=prev, cache_write=new)
-        )
-        prev = total
-    return usages
+    return list(iter_chain_usages(session, points, counter, output_fn, rewrite))
 
 
 def make_counter(mode: str, encoding: str, anthropic_base_url: str, anthropic_beta: str | None):

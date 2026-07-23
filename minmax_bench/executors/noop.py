@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from ..chain import chain_usages
+from ..chain import iter_chain_usages
 from ..models import RequestPoint, Session
 from ..pricing import cost_usd
 from ..strategies.base import ResolvedStrategy as Strategy
@@ -30,11 +30,14 @@ class NoopExecutor:
         strategy: Strategy,
         on_point: Callable[[Measurement], None] | None = None,
     ) -> list[Measurement]:
-        usages = chain_usages(
+        usages = iter_chain_usages(
             session, points, self.counter,
             lambda p: output_tokens_for(p, self.out_counter), rewrite=None,
         )
         out: list[Measurement] = []
+        # zip over the generator: each point emits as soon as it is counted, so
+        # the live dashboard advances during (slow) API counting instead of
+        # bursting the whole session at the end.
         for p, u in zip(points, usages, strict=False):
             m = Measurement(p.index, session.id, u, cost_usd(session.model, u))
             out.append(m)
