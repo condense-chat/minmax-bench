@@ -502,10 +502,10 @@ def run_quality_wizard(console: Console) -> QualityWizardResult:
                       ("does compaction preserve the agent's trajectory?", "dim")),
         border_style="magenta"))
     mode = _select_one(console, "trajectory type", [
-        ("full", "full trajectories — run the agent end-to-end on tasks "
-                 "(behavior, rework, solve, milestones)", True),
         ("incremental", "incremental — teacher-forced per-step run of a recorded "
                         "session (paired A/B, cheap, no turn noise)", True),
+        ("full", "full trajectories — run the agent end-to-end on tasks "
+                 "(behavior, rework, solve, milestones)", True),
         ("view", "view an existing run — pick from stored results and re-render "
                  "(free, never spends)", True),
     ])
@@ -634,7 +634,7 @@ def _full_wizard(console: Console) -> QualityWizardResult:
         f"{f'  ·  auto-retry ×{retries}' if retries else ''}   [bold]auth[/] {auth}\n"
         f"[bold]{trials} trials[/], cost ceiling ~[bold]${trials * budget:.0f}[/] "
         f"(${budget:g}/trial cap)", title="ready", border_style="green"))
-    if not Confirm.ask("[cyan]run it?[/]", default=False, console=console):
+    if not Confirm.ask("[cyan]run it?[/]", default=True, console=console):
         raise KeyboardInterrupt
     return QualityWizardResult(mode="full", arms=",".join(arms), tasks=tasks, model=model,
                                k=k, budget_usd=budget, milestones=milestones, out=out,
@@ -759,7 +759,7 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         f"[bold]window[/] {'independent budgets' if independent_budgets else 'cap to control'}   "
         f"[bold]resume[/] {'yes' if resume else 'no'}   [bold]auth[/] {auth}   [bold]out[/] {out}",
         title="ready", border_style="green"))
-    if not Confirm.ask("[cyan]run the incremental?[/]", default=False, console=console):
+    if not Confirm.ask("[cyan]run the incremental?[/]", default=True, console=console):
         raise KeyboardInterrupt
     return QualityWizardResult(mode="incremental", source=src, session=session, swechat=swechat,
                                conv=conv, task=task, arms=",".join(arms), model=model,
