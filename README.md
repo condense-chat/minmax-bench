@@ -11,29 +11,28 @@ Were tokens saved? Were dollars saved? Was quality kept?
 
 **minmax-bench** consists of two benchmark types:
 
-- **cost** — the **minimize target**: analyzes how many tokens a given **strategy**
-  saves, and how much of that survives as actual dollars. The analysis is cache-aware —
+- **cost** (the **minimize target**): analyzes how many tokens a given **strategy**
+  saves, and how much of that survives as actual dollars. The analysis is cache-aware:
   with a suboptimal strategy you can save tokens yet end up with a *larger* bill, because
   breaking the prompt cache trades cheap cache-reads for expensive cache-writes.
-  
+
   → [docs/cost.md](docs/cost.md)
 
-  ![cost report — per-bucket tokens & cost saved](docs/img/cost-report.png)
+  ![cost report: per-bucket tokens & cost saved](docs/img/cost-report.png)
 
-- **quality** — the **maximize target**: analyzes how well the agent's trajectory is
+- **quality** (the **maximize target**): analyzes how well the agent's trajectory is
   preserved under a given **strategy** compared to a control. This comes in two flavors:
-  - **full** — run complete trajectories and compare them. Closest to reality, but
+  - **full**: run complete trajectories and compare them. Closest to reality, but
     requires a number of reruns to eliminate variance.
-  - **incremental** — a more deterministic analysis: does the model produce the same
+  - **incremental**: a more deterministic analysis. Does the model produce the same
     step given identical pre-/post-**strategy** input?
 
   → [docs/quality.md](docs/quality.md)
 
-  ![quality report — trajectory preservation vs the vanilla noise floor](docs/img/quality-report.png)
-  
+  ![quality report: trajectory preservation vs the vanilla noise floor](docs/img/quality-report.png)
 
-Cost tells you what a strategy saves; quality tells you whether those savings are real —
-a method that makes the agent take more turns pays back its "savings" with interest.
+Cost tells you what a strategy saves; quality tells you whether those savings are real.
+A method that makes the agent take more turns pays back its "savings" with interest.
 Read them together.
 
 ## Strategies
@@ -43,7 +42,7 @@ The contenders, and how they line up
 
 | strategy | what it does | source | mode | transport |
 |---|---|---|---|---|
-| `baseline` | uncompressed control — everything is scored against it | built-in | — | — |
+| `baseline` | uncompressed control; everything is scored against it | built-in | n/a | n/a |
 | `upstream` | direct call to the provider; live cache-aware baseline | built-in | proxy | anthropic, bedrock |
 | `headroom` | compression proxy, cache-optimized: freezes prior turns for prefix-cache hits | [headroom-ai](https://pypi.org/project/headroom-ai/) | proxy, rewrite | anthropic, bedrock |
 | `headroom-kompress` | the same proxy in token mode: Kompress rewrites history for max compression | [headroom-ai](https://pypi.org/project/headroom-ai/) | proxy, rewrite | anthropic, bedrock |
@@ -52,12 +51,12 @@ The contenders, and how they line up
 
 Legend:
 
-- **\*** — organization account only.
-- **mode** — how a strategy is measured (cost bench only). **proxy** sends the real
-  request through the strategy's proxy to the provider — real usage, real costs.
-  **rewrite** uses the strategy's rewrite API and simulates caching locally — run a much
-  larger dataset without incurring major costs.
-- **transport** — the provider API used for the bench's own model calls: the
+- **\***: organization account only.
+- **mode**: how a strategy is measured (cost bench only). **proxy** sends the real
+  request through the strategy's proxy to the provider: real usage, real costs.
+  **rewrite** uses the strategy's rewrite API and simulates caching locally, letting you
+  run a much larger dataset without incurring major costs.
+- **transport**: the provider API used for the bench's own model calls: the
   **Anthropic API** (with an API key *or* your **Claude subscription** login) or
   **AWS Bedrock**.
 
@@ -110,12 +109,12 @@ uv run minmax-bench cost run -d swe-chat:64 -s condense-sync -s headroom --mode 
 uv run minmax-bench quality incremental
 ```
 
-> **Proxy runs cost real money** — you pay for the input tokens of every replayed turn.
+> **Proxy runs cost real money**: you pay for the input tokens of every replayed turn.
 > Iterate with `--limit`, `--token-budget`, or `--mode rewrite`.
 
 ## See cached results
 
-`runs/` ships three committed **reference runs** — every number recomputes from stored
+`runs/` ships three committed **reference runs**. Every number recomputes from stored
 usage, no keys, no network, zero spend:
 
 ```bash
@@ -125,17 +124,17 @@ uv run minmax-bench report 5c61ab52-8eea-4fee-97a4-5c64ee5344af
 uv run minmax-bench replay <any of the above>                      # animated
 ```
 
-- **`run-202f98bd`** — headroom vs headroom-kompress vs condense-async, Haiku 4.5,
+- **`run-202f98bd`**: headroom vs headroom-kompress vs condense-async, Haiku 4.5,
   truncated to 190k. The clean head-to-head: condense-async saves **~28%** cost,
   headroom (cache mode) ~14%, headroom-kompress ~2% (token savings die in cache-writes).
-- **`run-cba32b86`** — untruncated long sessions (~$73.6 baseline): condense's savings
-  *grow* with chain length — 53% in the 400k+ band.
-- **`run-5c61ab52`** — Opus 4.8 over 64 sessions / \~11.7k turns in `--mode rewrite`
+- **`run-cba32b86`**: untruncated long sessions (~$73.6 baseline): condense's savings
+  *grow* with chain length, reaching 53% in the 400k+ band.
+- **`run-5c61ab52`**: Opus 4.8 over 64 sessions / \~11.7k turns in `--mode rewrite`
   (zero spend): condense-sync **\~73% tokens / \~64% cost** (\~$549 off \~$861); headroom
   slightly negative at this scale.
 
 ## Docs
 
-- [docs/cost.md](docs/cost.md) — cost-bench methodology: harness simulation, bucketing, cache modeling, run store.
-- [docs/quality.md](docs/quality.md) — quality-bench methodology: noise floor, axes, compaction gate, full + incremental.
-- [docs/architecture.md](docs/architecture.md) — how strategies, mode, and transport come together; module map.
+- [docs/cost.md](docs/cost.md) covers the cost-bench methodology: harness simulation, bucketing, cache modeling, run store.
+- [docs/quality.md](docs/quality.md) covers the quality-bench methodology: noise floor, axes, compaction gate, full + incremental.
+- [docs/architecture.md](docs/architecture.md) explains how strategies, mode, and transport come together; module map.
