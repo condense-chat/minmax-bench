@@ -271,16 +271,6 @@ Note the same names carry different meanings across the two benches: in the **co
 `headroom` (token + CCR) has no cost-bench counterpart, because CCR needs a running agent.
 Full tooling + reproduction: [`scripts/README.md`](scripts/README.md).
 
-**Offline demo — no keys, no Docker (~30 s)** — a tiny sample of real recorded runs ships in
-`runs/quality-sample/`:
-
-```bash
-python3 scripts/report.py --from runs/quality-sample --tasks kv-store-grpc --arms condense
-```
-
-→ `kv-store-grpc  condense  2/2 · 2/2  6[5-6]  12[11-14]  ✗ DIVERGES  ✓ OK` — on this task condense
-~doubles the trajectory (both still solve). That's the whole point, visible from a fresh clone.
-
 **Generate your own** (Docker + `uv tool install harbor` + `.env` keys):
 
 ```bash
@@ -378,7 +368,6 @@ minmax_bench/quality/   quality / trajectory-preservation bench (pure stdlib; se
   report.py        DISPLAY (pure, never spends): reads artifacts -> html/md
 scripts/           thin `python3 scripts/{generate,report}.py` wrappers around the above
 harbor_agents/     custom Harbor agent (self-contained headroom-CCR wiring)
-runs/quality-sample/  tiny bundled recorded runs for the offline quality demo
 ```
 
 ## Status / caveats

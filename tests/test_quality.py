@@ -753,6 +753,8 @@ def test_discover_runs_finds_full_and_incremental(tmp_path):
 
 # ---------------------------------------------------------------- rich-free analysis
 def test_render_console_falls_back_to_plain_text_without_rich(tmp_path, capsys, monkeypatch):
+    if not os.path.isdir("runs/quality-sample"):
+        return  # sample not present in this checkout
     monkeypatch.setattr(report, "HAVE_RICH", False)
     args = SimpleNamespace(tasks="kv-store-grpc", arms="condense", agent="claude-code",
                            ctx_gate=50_000, **{"from": "runs/quality-sample"})

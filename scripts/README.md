@@ -83,9 +83,6 @@ uv run minmax-bench quality incremental   # rich replay of your own sessions (wr
 ## End to end
 
 ```bash
-# offline demo (bundled sample) — no keys, no Docker
-python3 scripts/report.py --from runs/quality-sample --tasks kv-store-grpc --arms condense
-
 # generate then display (needs Docker + harbor + .env keys)
 cp .env.dist .env      # ANTHROPIC_API_KEY, CONDENSE_API_KEY
 python3 scripts/generate.py --mode full --out results/jobs/run1 --milestones   # 5 default tasks
