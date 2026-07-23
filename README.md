@@ -135,7 +135,7 @@ uv run minmax-bench cost run -d swe-chat:32 -s gemini -m gemini-3.1-flash-lite
 
 ## Checking the cached replays
 
-`runs/` ships two committed **reference runs** you can inspect with **zero spend** —
+`runs/` ships three committed **reference runs** you can inspect with **zero spend** —
 every number is recomputed from stored token usage, and the animated evolution is
 replayed from the same cache. No API keys or network needed.
 
@@ -143,10 +143,12 @@ replayed from the same cache. No API keys or network needed.
 # re-score from the stored usage (prints the per-bucket tables):
 uv run minmax-bench report 202f98bd-a2f1-4390-8307-658b451b7727
 uv run minmax-bench report cba32b86-99ba-4ed7-bf7c-e385edf2ec99
+uv run minmax-bench report 5c61ab52-8eea-4fee-97a4-5c64ee5344af
 
 # replay the animated context + cost evolution:
 uv run minmax-bench replay 202f98bd-a2f1-4390-8307-658b451b7727
 uv run minmax-bench replay cba32b86-99ba-4ed7-bf7c-e385edf2ec99
+uv run minmax-bench replay 5c61ab52-8eea-4fee-97a4-5c64ee5344af
 ```
 
 - **`run-202f98bd`** — `headroom` vs `headroom-kompress` vs `condense-async` on
@@ -155,6 +157,13 @@ uv run minmax-bench replay cba32b86-99ba-4ed7-bf7c-e385edf2ec99
 - **`run-cba32b86`** — baseline + `condense-async`, **untruncated**, over the full
   long sessions (baseline totals **~$73.6** on replay). Shows how savings grow with
   chain length into the 200k–400k+ bands.
+- **`run-5c61ab52`** — `headroom` vs `condense-sync` on **Opus 4.8** over the full
+  **`swe-chat:64`** (64 sessions, **~11.7k scored turns**), measured in
+  **`--mode rewrite`**: each strategy's rewritten request body is fetched from its
+  rewrite API and costed from **simulated (locally counted) token usage** — nothing is
+  sent to a model, zero spend. At this scale `condense-sync` saves **~73% tokens /
+  ~64% cost** (**~$549** off an **~$861** baseline), while `headroom` nets slightly
+  negative overall — the large-dataset counterpart to the truncated head-to-head above.
 
 What to look at: each strategy gets a **tokens-saved** and a **cost-saved (USD)**
 table, bucketed by input-chain length, with an `ALL` aggregate row. Cost-saved

@@ -9,13 +9,16 @@ runs the vanilla agent through this do-nothing forwarder, so:
   - a proxy arm vs vanilla-proxy = the arm's own effect with the confound subtracted.
 
 Bytes are forwarded verbatim in both directions (headers minus hop-by-hop, body
-streamed chunk-by-chunk so SSE latency is preserved). Pure standard library.
+streamed chunk-by-chunk so SSE latency is preserved). Standard library plus a
+certifi fallback for interpreters with no OpenSSL CA paths (see minmax_bench.tls).
 """
 import http.server
 import socketserver
 import threading
 import urllib.error
 import urllib.request
+
+from minmax_bench.tls import ssl_context
 
 UPSTREAM = "https://api.anthropic.com"
 
@@ -44,7 +47,7 @@ class _Forwarder(http.server.BaseHTTPRequestHandler):
         req = urllib.request.Request(self.upstream + self.path, data=body,
                                      headers=headers, method=self.command)
         try:
-            resp = urllib.request.urlopen(req, timeout=600)
+            resp = urllib.request.urlopen(req, timeout=600, context=ssl_context())
         except urllib.error.HTTPError as e:
             resp = e  # an upstream 4xx/5xx is still a response — forward it verbatim
         except OSError as e:

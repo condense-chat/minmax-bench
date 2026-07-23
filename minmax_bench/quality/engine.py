@@ -34,6 +34,9 @@ import time
 import urllib.error
 import urllib.request
 
+from minmax_bench.auth import cc_oauth_token
+from minmax_bench.tls import ssl_context as _ssl_context
+
 # where a Harbor claude-code trial stores its session transcript (cwd=/app slug);
 # shared by report.py and generate.py so the path convention lives in one place
 SESSION_GLOB = "agent/sessions/projects/-app/*.jsonl"
@@ -167,6 +170,16 @@ ARMS = {
     "headroom": {"base": os.environ.get("HEADROOM_PROXY", "http://localhost:8787")},
 }
 
+# UPSTREAM_VIA=bedrock reroutes the bench's own direct-to-Anthropic calls
+# (control arm + judge) through Bedrock's Anthropic-compatible endpoint:
+# bearer auth from the AWS credential chain, inference-profile model ids.
+BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "eu-south-2")
+if os.environ.get("UPSTREAM_VIA") == "bedrock":
+    ARMS["control"] = {
+        "base": f"https://bedrock-runtime.{BEDROCK_REGION}.amazonaws.com/anthropic",
+        "bedrock": True,
+    }
+
 
 def load_env(path=".env"):
     env = {}
@@ -206,66 +219,6 @@ def condense_creds(env):
     return None
 
 
-_CC_TOKEN_CACHE = ["unset"]  # one keychain read per process, not per request
-
-
-def cc_oauth_token():
-    """The user's own Claude Code subscription credential, read locally.
-
-    Most Claude Code users have no API key — their auth is the OAuth token the
-    Claude Code login stores. The bench replays THEIR sessions in Claude Code's
-    own request shape, so when no API key is configured we authenticate the same
-    way Claude Code does. The token stays in-process and is only ever sent where
-    the arm points (api.anthropic.com or the user's chosen gateway).
-
-    Sources, in order: CLAUDE_CODE_OAUTH_TOKEN env var, ~/.claude/.credentials.json,
-    the macOS keychain item Claude Code maintains. Returns None when absent/expired.
-    """
-    if _CC_TOKEN_CACHE[0] != "unset":
-        return _CC_TOKEN_CACHE[0]
-
-    def parse(raw):
-        try:
-            oauth = json.loads(raw).get("claudeAiOauth") or {}
-        except (json.JSONDecodeError, AttributeError):
-            return None
-        exp = oauth.get("expiresAt") or 0
-        if exp and exp / 1000 < time.time():
-            # the stored ACCESS token is short-lived and has expired. Claude Code refreshes it
-            # on use via the refresh token, so your subscription is fine — but this reader does
-            # NOT do the OAuth refresh, so it can't use the stale token and falls back to an API
-            # key. `claude setup-token` mints a LONG-LIVED token for exactly this programmatic use.
-            hint = ("run `claude setup-token` and `export CLAUDE_CODE_OAUTH_TOKEN=<it>` (a "
-                    "long-lived token)" if oauth.get("refreshToken")
-                    else "open `claude` once to refresh it")
-            print("warn: the stored Claude Code access token has expired (Claude Code refreshes "
-                  f"it on use; this bench does not) — {hint}, or set ANTHROPIC_API_KEY.",
-                  file=sys.stderr)
-            return None
-        return oauth.get("accessToken")
-
-    # os.environ first (an explicit export wins), then .env — the setup wizard writes the token
-    # to .env, and nothing load_dotenv's it into os.environ on the quality-bench paths, so read
-    # it directly or a wizard-wired token stays invisible and we wrongly fall back to an API key.
-    tok = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-           or load_env().get("CLAUDE_CODE_OAUTH_TOKEN") or None)
-    if not tok:
-        cred = os.path.expanduser("~/.claude/.credentials.json")
-        if os.path.exists(cred):
-            tok = parse(open(cred).read())
-    if not tok and sys.platform == "darwin":
-        try:
-            r = subprocess.run(["security", "find-generic-password",
-                                "-s", "Claude Code-credentials", "-w"],
-                               capture_output=True, text=True, timeout=15)
-            if r.returncode == 0:
-                tok = parse(r.stdout.strip())
-        except (OSError, subprocess.TimeoutExpired):
-            tok = None
-    _CC_TOKEN_CACHE[0] = tok
-    return tok
-
-
 def auth_mode(env):
     """'api-key' | 'subscription' | None — how upstream calls will authenticate."""
     if env.get("ANTHROPIC_API_KEY"):
@@ -287,13 +240,22 @@ def check_arms(arms, env):
         if arm not in ARMS:
             problems.append(f"arm {arm!r} has no replay endpoint "
                             f"(known: {', '.join(sorted(ARMS))})")
-    if not auth_mode(env):
+    needs_anthropic_auth = any(not ARMS.get(a, {}).get("bedrock") for a in arms)
+    if needs_anthropic_auth and not auth_mode(env):
         problems.append(
             "no auth found. Either:\n"
             "    - set ANTHROPIC_API_KEY (API billing), or\n"
             "    - use your Claude Code subscription: run `claude setup-token` and\n"
             "      `export CLAUDE_CODE_OAUTH_TOKEN=<the printed token>` "
             "(it is not persisted where the bench can read it otherwise)")
+    if any(ARMS.get(a, {}).get("bedrock") for a in arms):
+        try:
+            from minmax_bench.bedrock import bearer_token
+            bearer_token(BEDROCK_REGION)
+        except Exception as e:  # noqa: BLE001
+            problems.append(
+                f"bedrock upstream: cannot mint a bearer token ({e}) — "
+                "is the AWS credential chain configured for this shell?")
     if any(ARMS.get(a, {}).get("condense_auth") for a in arms) and not condense_creds(env):
         problems.append(
             "condense arm has no creds. It authenticates via the local `dense` CLI, not a "
@@ -917,7 +879,8 @@ def call_api(arm, req, tmpl_headers, env):
     creds = condense_creds(env) if ARMS[arm].get("condense_auth") else None
     if creds:  # honour the dense profile's api_url (a non-prod profile can point elsewhere)
         base = creds["url"]
-    url = base + "/v1/messages?beta=true"
+    bedrock = ARMS[arm].get("bedrock")
+    url = base + "/v1/messages" + ("" if bedrock else "?beta=true")
     headers = {
         "content-type": "application/json",
         "anthropic-version": tmpl_headers.get("anthropic-version", "2023-06-01"),
@@ -925,7 +888,13 @@ def call_api(arm, req, tmpl_headers, env):
     }
     if tmpl_headers.get("anthropic-beta"):
         headers["anthropic-beta"] = tmpl_headers["anthropic-beta"]
-    if env.get("ANTHROPIC_API_KEY"):
+    if bedrock:
+        from minmax_bench.bedrock import bearer_token, bedrock_model_id
+
+        headers["Authorization"] = f"Bearer {bearer_token(BEDROCK_REGION)}"
+        if req.get("model"):
+            req = {**req, "model": bedrock_model_id(req["model"])}
+    elif env.get("ANTHROPIC_API_KEY"):
         headers["x-api-key"] = env["ANTHROPIC_API_KEY"]
     else:  # Claude Code subscription auth (validated up front by check_arms)
         headers["Authorization"] = f"Bearer {cc_oauth_token()}"
@@ -940,7 +909,7 @@ def call_api(arm, req, tmpl_headers, env):
     for attempt in range(3):
         try:
             r = urllib.request.Request(url, data=data, headers=headers, method="POST")
-            with urllib.request.urlopen(r, timeout=600) as resp:
+            with urllib.request.urlopen(r, timeout=600, context=_ssl_context()) as resp:
                 if req.get("stream"):
                     return read_sse(resp)
                 return json.loads(resp.read()), None

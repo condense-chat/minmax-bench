@@ -17,26 +17,52 @@ from __future__ import annotations
 
 import uuid
 
-from ..models import Message, RequestPoint, Role, Session
+from ..models import Block, BlockKind, Message, RequestPoint, Role, Session
 
 
 def with_test_run(session: Session, test_uuid: str | None = None) -> Session:
     """Return a copy of ``session`` stamped with a fresh test-run id (rotates on
     every call unless one is passed in).
 
-    The id is (a) prepended to the system prompt — so the request content is
-    unique per run and the proxy's content-keyed chain matching can't reuse a
-    prior run's compacted chain — and (b) exposed as ``test_uuid``, which the
-    proxy executor sends as whichever session header a given strategy declares
-    (``ProxyConfig.session_id_header``, e.g. condense's ``x-condense-session-id``)
-    to bust that proxy's own session-keyed chain state. This guarantees each fresh
-    rerun of a session is independent of previous runs. The marker is fixed
-    length, so baseline token counts are unaffected in value.
+    The id is stamped in three places so a fresh rerun is independent of any
+    prior run's cached/compacted chain state:
+
+    (a) prepended to the **first message's** text — a proxy that keys chain
+        identity off the *message* prefix (condense folds sha256 over message
+        content + role, and does **not** hash the system prompt) only sees a new
+        chain when the messages themselves differ, so the buster must live in a
+        message to actually fork the chain;
+    (b) prepended to the system prompt — for proxies that content-key on the
+        whole request (system included);
+    (c) exposed as ``test_uuid``, which the proxy/rewrite executor sends as
+        whichever session header a strategy declares
+        (``ProxyConfig.session_id_header``, e.g. condense's
+        ``x-condense-session-id``) to bust a proxy's session-keyed chain state.
+
+    The marker is fixed length, so baseline token counts are unaffected in value.
     """
     tid = test_uuid or str(uuid.uuid4())
     marker = f"[minmax-bench test-run: {tid}]"
     system = f"{marker}\n{session.system}" if session.system else marker
-    return session.model_copy(update={"system": system, "test_uuid": tid})
+    messages = _stamp_first_message(session.messages, marker)
+    return session.model_copy(update={"system": system, "messages": messages, "test_uuid": tid})
+
+
+def _stamp_first_message(messages: list[Message], marker: str) -> list[Message]:
+    """Prepend ``marker`` to the first message's leading text block (inserting one
+    if the first message has no text block), so the buster lands in the hashed
+    message content. No-op on an empty transcript."""
+    if not messages:
+        return messages
+    first = messages[0]
+    blocks = list(first.blocks)
+    for i, b in enumerate(blocks):
+        if b.kind == BlockKind.text and b.text is not None:
+            blocks[i] = b.model_copy(update={"text": f"{marker}\n{b.text}"})
+            break
+    else:
+        blocks.insert(0, Block.text_block(marker))
+    return [first.model_copy(update={"blocks": blocks}), *messages[1:]]
 
 
 class HarnessSimulator:

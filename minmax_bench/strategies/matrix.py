@@ -10,7 +10,7 @@ rows the user can filter out, and what gets set up).
 from __future__ import annotations
 
 from .base import ResolvedStrategy, Strategy, StrategyConfig
-from .runners import CONDENSE, GEMINI, HEADROOM, NOOP, RUNNERS_BY_KEY, UPSTREAM
+from .runners import CONDENSE, HEADROOM, NOOP, RUNNERS_BY_KEY, UPSTREAM
 
 # The mandatory baseline's name == runstore.BASELINE, so it stores as the
 # "original cost" cache and every strategy is scored against it.
@@ -22,11 +22,12 @@ def _cfg(**params) -> StrategyConfig:
 
 
 # The competitive set: headroom (cache-optimized) vs headroom-kompress (max
-# compression) vs condense sync/async.
+# compression) vs condense sync/async. How they are measured (proxy vs rewrite,
+# anthropic vs bedrock) is a run-wide choice, not a matrix row — see
+# `strategies.base` Mode/Transport.
 STRATEGY_MATRIX: list[Strategy] = [
     Strategy(BASELINE, NOOP, mandatory=True, enabled=True),
     Strategy("upstream", UPSTREAM, enabled=False),
-    Strategy("gemini", GEMINI, enabled=False),
     Strategy("headroom", HEADROOM, _cfg(mode="cache"), enabled=True),
     Strategy("headroom-kompress", HEADROOM, _cfg(mode="token"), enabled=True),
     Strategy("condense-sync", CONDENSE, _cfg(mode="sync"), enabled=True),
@@ -65,12 +66,15 @@ def tool_for(name: str) -> str | None:
         return None
 
 
-def resolve_strategy(name: str) -> ResolvedStrategy:
-    """Resolve a matrix entry name; fall back to a runner key with default config
-    (so ``resolve_strategy('noop')`` works without a matrix row)."""
+def resolve_strategy(
+    name: str, mode: str = "proxy", transport: str = "anthropic"
+) -> ResolvedStrategy:
+    """Resolve a matrix entry name under the run-wide mode/transport; fall back to
+    a runner key with default config (so ``resolve_strategy('noop')`` works
+    without a matrix row)."""
     if has_entry(name):
-        return get_entry(name).resolve()
+        return get_entry(name).resolve(mode=mode, transport=transport)
     runner = RUNNERS_BY_KEY.get(name)
     if runner is not None:
-        return runner.build(name, StrategyConfig())
+        return runner.build(name, StrategyConfig(), mode=mode, transport=transport)
     raise KeyError(f"unknown strategy {name!r}; available: {', '.join(matrix_names())}")

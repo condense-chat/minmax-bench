@@ -265,7 +265,8 @@ def test_scoring_infers_llm_judge():
 def test_check_arms_catches_unknown_arm_and_missing_keys(monkeypatch):
     # force "no subscription token" so the check is hermetic — cc_oauth_token reads the ambient
     # environment (os.environ / .env / keychain), which the dev machine may actually have
-    eng._CC_TOKEN_CACHE[0] = None
+    from minmax_bench import auth as _auth
+    _auth._CC_TOKEN_CACHE[0] = None
     # and force "no condense creds": condense_creds reads the real ~/.config/dense, which the
     # dev machine may have logged in — pin it to None so the missing-creds branch is exercised
     monkeypatch.setattr(eng, "condense_creds", lambda env: None)
@@ -278,7 +279,7 @@ def test_check_arms_catches_unknown_arm_and_missing_keys(monkeypatch):
         assert "dense login" in text and "CONDENSE_API_KEY" in text  # condense creds missing
         assert not eng.check_arms(["control"], {"ANTHROPIC_API_KEY": "k"})
     finally:
-        eng._CC_TOKEN_CACHE[0] = "unset"
+        _auth._CC_TOKEN_CACHE[0] = "unset"
 
 
 def _pin_dense_home(monkeypatch, home):
@@ -414,7 +415,6 @@ def test_solve_distinguishes_never_ran_from_crashed(tmp_path):
 
 def test_auth_mode_resolution(monkeypatch):
     import minmax_bench.quality.engine as e
-    monkeypatch.setattr(e, "_CC_TOKEN_CACHE", ["unset"])
     monkeypatch.setattr(e, "cc_oauth_token", lambda: None)
     assert e.auth_mode({"ANTHROPIC_API_KEY": "k"}) == "api-key"
     assert e.auth_mode({}) is None

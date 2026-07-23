@@ -28,10 +28,20 @@ class Settings(BaseSettings):
     anthropic_base_url: str = "https://api.anthropic.com"
     openai_base_url: str = "https://api.openai.com/v1"
 
+    # count_tokens must always hit the real Anthropic API, even when
+    # ANTHROPIC_BASE_URL points a shell at a proxy (e.g. condense).
+    count_tokens_base_url: str = "https://api.anthropic.com"
+
     # Google Gemini via its OpenAI-compatible chat/completions endpoint. A cheap
     # direct executor for evaluating the anatomy without Anthropic spend.
     gemini_api_key: str | None = None
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+    # Transport for the bench's own direct-to-Anthropic calls (the "upstream"
+    # strategy): "anthropic" or "bedrock" (Anthropic-compatible endpoint on
+    # bedrock-runtime, bearer auth from the AWS credential chain).
+    upstream_via: str = "anthropic"
+    bedrock_region: str = "eu-south-2"
 
     # headroom proxy endpoint.
     headroom_base_url: str = "http://127.0.0.1:8787"

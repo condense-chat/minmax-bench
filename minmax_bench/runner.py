@@ -16,13 +16,20 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from .catalog import is_openai
 from .chain import LocalCounter, make_counter
 from .config import get_settings
 from .dashboard import Dashboard
 from .data import load_dataset
-from .executors import NoopExecutor, ProxyExecutor
+from .executors import (
+    CaptureRewriteExecutor,
+    NoopExecutor,
+    ProxyExecutor,
+    RewriteExecutor,
+    RewriteInvokeExecutor,
+)
 from .executors.base import Measurement
 from .gate import EndpointGate
 from .harness import simulate, with_test_run
@@ -32,6 +39,7 @@ from .runstore import BASELINE, RunStore
 from .strategies import get_strategy
 from .strategies.base import ResolvedStrategy as Strategy
 from .tokens import TokenCounter
+from .transport import resolve_upstream
 
 
 @dataclass
@@ -62,7 +70,7 @@ def _applicable(strategies: list[Strategy], model: str) -> list[Strategy]:
     mprov = Provider.openai if is_openai(model) else Provider.anthropic
     out: list[Strategy] = []
     for s in strategies:
-        if s.kind != "proxy":
+        if s.kind == "noop":
             out.append(s)
         elif s.proxy and s.proxy.provider == mprov:
             out.append(s)
@@ -101,34 +109,64 @@ def run(
     settings = get_settings()
     out_counter = TokenCounter(encoding=m.encoding)
     chain_counter = make_counter(
-        m.count_mode, m.encoding, settings.anthropic_base_url, settings.anthropic_beta
+        m.count_mode, m.encoding, settings.count_tokens_base_url, settings.anthropic_beta
     )
+    mode = getattr(m, "mode", "proxy")
+    transport = getattr(m, "transport", "anthropic")
     noop = get_strategy("noop")
     strategies = []
     for n in m.strategies:
         try:
-            strategies.append(get_strategy(n))
+            strategies.append(get_strategy(n, mode=mode, transport=transport))
         except Exception as e:  # a variant whose creds/tools are missing: skip, don't abort
             _err(f"{n}: unavailable ({e})")
 
     # One shared gate per destination endpoint, built up front (single-threaded) so
     # workers only read it. condense sync + async share a gate on api.condense.chat.
+    def _gate_cap(base_url: str) -> int:
+        # A loopback proxy (headroom) is only bounded by our own CPU: let it take
+        # the whole worker pool. Remote hosts keep the conservative cap.
+        host = urlsplit(base_url).hostname or ""
+        local = host in ("127.0.0.1", "::1", "localhost") or host.endswith(".localhost")
+        return max(1, settings.run_max_workers) if local else settings.endpoint_max_concurrency
+
     gates: dict[str, EndpointGate] = {}
     for strat in strategies:
-        if strat.kind == "proxy" and strat.proxy:
+        if strat.kind != "noop" and strat.proxy:
             g = gates.get(strat.proxy.base_url)
             if g is None:
                 gates[strat.proxy.base_url] = EndpointGate(
-                    settings.endpoint_max_concurrency, strat.proxy.min_request_interval
+                    _gate_cap(strat.proxy.base_url), strat.proxy.min_request_interval
                 )
             else:
                 g.raise_interval(strat.proxy.min_request_interval)
 
     def _executor_for(strategy: Strategy):
-        if strategy.kind == "proxy":
-            gate = gates.get(strategy.proxy.base_url) if strategy.proxy else None
-            return ProxyExecutor(counter=out_counter, max_tokens=m.max_tokens, gate=gate)
-        return NoopExecutor(chain_counter, out_counter)
+        if strategy.kind == "noop":
+            return NoopExecutor(chain_counter, out_counter)
+        gate = gates.get(strategy.proxy.base_url) if strategy.proxy else None
+        if strategy.kind == "rewrite":
+            return RewriteExecutor(
+                counter=out_counter,
+                chain_counter=chain_counter,
+                max_tokens=m.max_tokens,
+                gate=gate,
+            )
+        if strategy.kind == "rewrite_capture":
+            return CaptureRewriteExecutor(
+                counter=out_counter,
+                chain_counter=chain_counter,
+                max_tokens=m.max_tokens,
+                gate=gate,
+            )
+        if strategy.kind == "rewrite_invoke":
+            return RewriteInvokeExecutor(
+                upstream=resolve_upstream(strategy.transport),
+                counter=out_counter,
+                max_tokens=m.max_tokens,
+                gate=gate,
+            )
+        return ProxyExecutor(counter=out_counter, max_tokens=m.max_tokens, gate=gate)
 
     # Cheap offline counter used only to truncate each conversation at the token
     # budget (independent of count_mode so we never pay the API just to size a chain).

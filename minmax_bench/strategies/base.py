@@ -7,20 +7,37 @@ e.g. condense's dense profile + sync/async mode). Resolving an entry yields a
 :class:`ResolvedStrategy` — the concrete, executor-facing object (endpoint +
 headers) that :mod:`minmax_bench.executors` consumes.
 
-Two execution kinds exist:
-* ``proxy`` — an HTTP endpoint that rewrites the request server-side.
-* ``noop``  — the mandatory uncompressed baseline (the "vanilla" run).
+A strategy is only the compression technique. *How* it is measured is a separate,
+run-wide choice resolved at :meth:`Strategy.resolve` time:
+
+* ``mode`` — ``proxy`` sends the real request through the strategy's proxy, which
+  forwards to the upstream (real usage, real money); ``rewrite`` asks the proxy's
+  rewrite function for the transformed request body and costs it offline (zero
+  model spend).
+* ``transport`` — where direct model traffic lands: ``anthropic`` or ``bedrock``.
+  ``mode=proxy`` + ``transport=bedrock`` on a compression strategy *emulates* the
+  proxy: fetch the rewritten body, send it to Bedrock ourselves, report Bedrock's
+  real usage (the proxy itself cannot reach Bedrock).
+
+The resolved ``kind`` is the executor selector derived from that combination:
+``proxy`` | ``rewrite`` | ``rewrite_invoke`` | ``noop``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ..models import Provider
 
-ExecutorKind = Literal["proxy", "noop"]
+ExecutorKind = Literal["proxy", "rewrite", "rewrite_capture", "rewrite_invoke", "noop"]
 CacheModel = Literal["retroactive", "none"]
+Mode = Literal["proxy", "rewrite"]
+Transport = Literal["anthropic", "bedrock"]
+
+MODES = ("proxy", "rewrite")
+TRANSPORTS = ("anthropic", "bedrock")
 
 
 @dataclass
@@ -30,7 +47,8 @@ class ProxyConfig:
     base_url: str
     provider: Provider = Provider.anthropic
     # Env var holding the UPSTREAM provider key the proxy forwards with.
-    api_key_env: str = "ANTHROPIC_API_KEY"
+    # None = no key header; auth must come via extra_headers (e.g. Bedrock bearer).
+    api_key_env: str | None = "ANTHROPIC_API_KEY"
     extra_headers: dict[str, str] = field(default_factory=dict)
     anthropic_version: str = "2023-06-01"
     # Optional anthropic-beta header value (e.g. 1M-context) for Anthropic proxies.
@@ -55,9 +73,16 @@ class ProxyConfig:
     # onto another strategy's requests).
     session_id_header: str | None = None
     # Flatten history tool_use/tool_result into text and send no structured tool
-    # calls. Needed for Gemini's OpenAI endpoint, which rejects functionCall parts
-    # that lack a thought_signature.
+    # calls. Needed for OpenAI-dialect endpoints that reject functionCall parts
+    # lacking a thought_signature.
     flatten_tools: bool = False
+    # Rewrite the request's model id for this upstream (e.g. Bedrock requires
+    # inference-profile ids). Pricing keeps using the session's model.
+    model_id_map: Callable[[str], str] | None = None
+    # Header this proxy honors as a per-request upstream base-url override (e.g.
+    # headroom's "x-headroom-base-url"). Enables rewrite-by-capture and direct
+    # alternate-transport forwarding for proxies without a rewrite function.
+    upstream_override_header: str | None = None
 
 
 @dataclass
@@ -72,10 +97,13 @@ class ResolvedStrategy:
     #   retroactive -> rewrites historical turns; may invalidate cache (condense)
     #   none        -> baseline
     cache_model: CacheModel = "retroactive"
+    # The run-wide measurement choice this strategy was resolved under.
+    mode: Mode = "proxy"
+    transport: Transport = "anthropic"
 
     def __post_init__(self):
-        if self.kind == "proxy" and self.proxy is None:
-            raise ValueError(f"proxy strategy {self.name!r} needs a ProxyConfig")
+        if self.kind != "noop" and self.proxy is None:
+            raise ValueError(f"{self.kind} strategy {self.name!r} needs a ProxyConfig")
 
 
 @dataclass
@@ -89,19 +117,33 @@ class StrategyConfig:
         return default if v is None else v
 
 
+class UnsupportedCombo(RuntimeError):
+    """The strategy cannot run under the requested mode/transport."""
+
+
 class StrategyRunner:
     """Generic, reusable implementation of a technique. Subclasses build a
-    :class:`ResolvedStrategy` from a :class:`StrategyConfig`.
+    :class:`ResolvedStrategy` from a :class:`StrategyConfig` plus the run-wide
+    mode/transport.
 
     ``tool`` names the local tool the runner needs (for auto-setup / preflight),
-    or ``None`` for pure-local runners (noop, upstream, rewrite).
+    or ``None`` for pure-local runners (noop, upstream).
+    ``supports_rewrite`` gates ``mode=rewrite`` and the bedrock proxy emulation —
+    both need the proxy to expose a rewrite function.
     """
 
     key: str = ""
     kind: ExecutorKind = "noop"
     tool: str | None = None
+    supports_rewrite: bool = False
 
-    def build(self, name: str, config: StrategyConfig) -> ResolvedStrategy:
+    def build(
+        self,
+        name: str,
+        config: StrategyConfig,
+        mode: Mode = "proxy",
+        transport: Transport = "anthropic",
+    ) -> ResolvedStrategy:
         raise NotImplementedError
 
     def describe(self, config: StrategyConfig) -> str:  # noqa: ARG002
@@ -130,5 +172,7 @@ class Strategy:
     def description(self) -> str:
         return self.runner.describe(self.config)
 
-    def resolve(self) -> ResolvedStrategy:
-        return self.runner.build(self.name, self.config)
+    def resolve(
+        self, mode: Mode = "proxy", transport: Transport = "anthropic"
+    ) -> ResolvedStrategy:
+        return self.runner.build(self.name, self.config, mode=mode, transport=transport)

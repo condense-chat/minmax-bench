@@ -26,6 +26,7 @@ from .runner import key as track_key
 from .runner import run as run_bench
 from .runstore import BASELINE, RunStore
 from .strategies import STRATEGY_MATRIX, default_selected, has_entry, matrix_names
+from .strategies.base import MODES, TRANSPORTS
 from .tokens import parse_token_count as _parse_token_budget
 
 app = typer.Typer(add_completion=False, help="Estimated token/cost savings benchmark for agent-session proxies.")
@@ -364,12 +365,26 @@ def run_cmd(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the guided wizard; use flags/defaults."),
     setup: str = typer.Option("auto", "--setup", help="Local tools to install/start: 'auto' (implied by strategies), 'none', or a comma list of headroom,dense."),
     runs_dir: str | None = typer.Option(None, "--runs-dir", help="Root for run-<uuid> dirs (default from settings)."),
+    mode: str = typer.Option("proxy", "--mode", help="Run-wide measurement method: 'proxy' (real request through each strategy's proxy; real usage, real money) or 'rewrite' (fetch the rewritten body from the strategy's rewrite function; costed offline, zero model spend)."),
+    transport: str | None = typer.Option(None, "--transport", help="Where direct model traffic lands: 'anthropic' or 'bedrock' (default from UPSTREAM_VIA in .env). With --mode proxy, bedrock EMULATES each proxy: rewritten body fetched here, invoked on Bedrock, real usage reported."),
 ):
     """Guided (or flag-driven) benchmark: measure baseline + strategies per model."""
     settings = get_settings()
     root = runs_dir or settings.runs_dir
     mt = max_tokens if max_tokens is not None else settings.proxy_max_tokens
     refresh_set = {x.strip() for x in refresh.split(",")} if refresh else set()
+
+    transport_given = transport is not None
+    transport = transport or settings.upstream_via
+    if mode not in MODES:
+        raise typer.BadParameter(f"--mode {mode}: expected one of {', '.join(MODES)}")
+    if transport not in TRANSPORTS:
+        raise typer.BadParameter(f"--transport {transport}: expected one of {', '.join(TRANSPORTS)}")
+    if mode == "rewrite" and transport == "bedrock":
+        raise typer.BadParameter(
+            "--mode rewrite is offline (nothing is sent to a model) — "
+            "--transport bedrock has no effect there; use --mode proxy --transport bedrock"
+        )
 
     chosen_s = list(strategy) if strategy else None
     chosen_m = list(model) if model else None
@@ -382,6 +397,15 @@ def run_cmd(
     wizard_setup: list[str] | None = None
     if run:
         store = RunStore.open(root, run)
+        # Cached measurements are keyed by strategy name; a resumed run MUST keep
+        # the mode/transport it was created with or numbers silently mix.
+        stored = (getattr(store.manifest, "mode", "proxy"),
+                  getattr(store.manifest, "transport", "anthropic"))
+        if (mode != "proxy" or transport_given) and (mode, transport) != stored:
+            raise typer.BadParameter(
+                f"run {run} was measured with mode={stored[0]} transport={stored[1]} — "
+                "resume keeps those; start a new run to change them"
+            )
         if chosen_s:
             store.manifest.strategies = list(dict.fromkeys(store.manifest.strategies + chosen_s))
         if chosen_m:
@@ -400,6 +424,7 @@ def run_cmd(
                 "dataset": w.dataset, "strategies": w.strategies, "models": w.models,
                 "edges": w.edges, "session_ids": w.session_ids, "token_limit": w.token_limit,
                 "count_mode": w.count_mode, "encoding": encoding, "max_tokens": mt,
+                "mode": mode, "transport": transport,
             }
             wizard_setup = w.setup
         else:
@@ -410,11 +435,17 @@ def run_cmd(
                 "session_limit": limit, "point_limit": max_points, "longest": longest,
                 "token_limit": _parse_token_budget(token_budget),
                 "count_mode": count, "encoding": encoding, "max_tokens": mt,
+                "mode": mode, "transport": transport,
             }
         store = RunStore.create(root, {"created_utc": datetime.now(UTC).isoformat(timespec="seconds"), **fields})
 
     m = store.manifest
-    console.print(f"[dim]run=[/]{m.uuid}  [dim]models=[/]{','.join(m.models)}  [dim]strategies=[/]{','.join(m.strategies)}")
+    console.print(
+        f"[dim]run=[/]{m.uuid}  [dim]models=[/]{','.join(m.models)}  "
+        f"[dim]strategies=[/]{','.join(m.strategies)}  "
+        f"[dim]mode=[/]{getattr(m, 'mode', 'proxy')}  "
+        f"[dim]transport=[/]{getattr(m, 'transport', 'anthropic')}"
+    )
 
     setup_tools = wizard_setup if wizard_setup is not None else _resolve_setup(setup, m.strategies)
 
