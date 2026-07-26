@@ -29,7 +29,6 @@ Were tokens saved? Were dollars saved? Was quality kept?
 
   → [docs/quality.md](docs/quality.md)
 
-  ![quality report: trajectory preservation vs the vanilla noise floor](docs/img/quality-report.png)
 
 Cost tells you what a strategy saves; quality tells you whether those savings are real.
 A method that makes the agent take more turns pays back its "savings" with interest.
