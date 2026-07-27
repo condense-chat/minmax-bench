@@ -196,7 +196,15 @@ from 2286 Bash commands across six real recorded sessions, at the pinned rtk:
   evidence that rtk doesn't work; full mode is where its real reach shows. The run prints
   how many observations it filtered and how many passed through, and says so outright when
   it filtered nothing.
-- **Where the filter is a pure post-processor, replay is EXACT — not an approximation.**
+- **Replay runs the REAL rtk command wherever its input can be reconstructed.** For a file
+  read the recorded output *is* the file's content, so it is materialized and the actual
+  `rtk read …` runs on it — exact, and reaching commands no pipe filter covers. Pipe-filtering
+  is the fallback, used only where post-processing stdout is genuinely rtk's mechanism. Where
+  neither applies (`rtk ls`, `rtk wc` need a real filesystem) the observation is left verbatim,
+  never faked. Note `cat x` rewrites to a *bare* `rtk read x`, whose default level is full
+  content — so it returns unchanged, and that is the faithful answer; passing
+  `--level aggressive` would cut ~94% but would measure a method rtk's hook does not implement.
+- **Where the pipe fallback is used, it is EXACT for pure post-processors.**
   Verified byte-identical for `pytest` and `grep`. It diverges only where rtk re-invokes the
   underlying tool with its own format: `git status` (hook 35B vs pipe 55B — it emits
   `* branch / clean`, not a trimmed `git status`), `git log -5` (hook **1856B** vs pipe
