@@ -60,7 +60,7 @@ def _flag(argv: list[str], name: str, value, default=None) -> None:
 @quality_app.command("run")
 def quality_run(
     tasks: str | None = typer.Option(None, "--tasks", help="N recommended | random:N (with --seed) | group (all|long|short|hard|medium) | a,b,c | omitted = 5. `long`=author timeout ≥30m, biasing toward sessions long enough to compact. See --list-tasks."),
-    arms: str = typer.Option("condense,headroom", "--arms", help="Methods to run; vanilla baseline always included. Also: headroom-kompress (ablation), vanilla-proxy (passthrough control — isolates the proxy-wiring confound)."),
+    arms: str = typer.Option("condense,headroom", "--arms", help="Methods to run; vanilla baseline always included. Also: headroom-kompress (ablation), vanilla-proxy (passthrough control — isolates the proxy-wiring confound), caveman (terse-output skill; not a proxy, reads against plain vanilla)."),
     model: str | None = typer.Option(None, "--model", "-m", help="Model id (default claude-sonnet-4-6)."),
     effort: str | None = typer.Option(None, "--effort", help="Thinking effort for the container's Claude Code: low | medium | high | xhigh | max (default: unset — Claude Code's own default, high)."),
     dataset: str = typer.Option(_Q_DATASET, "--dataset", "-d", help="Harbor dataset (only the default is validated)."),
@@ -78,6 +78,7 @@ def quality_run(
     list_tasks: bool = typer.Option(False, "--list-tasks", help="Print the known tasks and exit."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the Harbor commands without running."),
     auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force Claude Code login; no API key needed)."),
+    caveman_mode: str | None = typer.Option(None, "--caveman-mode", help="For the caveman arm: lite | full | ultra intensity (default full). Same knob as `quality incremental --caveman-mode`; sets TMB_CAVEMAN_MODE for the container."),
     force: bool = typer.Option(False, "--force", help="Full retry: re-run ALL cells including completed ones (re-spends the whole run). Default resumes — only cells missing trials re-run."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the guided wizard; use flags/defaults."),
 ):
@@ -109,15 +110,23 @@ def quality_run(
                              limit=w.limit, budget_usd=w.budget_usd, max_tokens=6000,
                              out=w.out, task=w.task, auth=w.auth, assume_yes=True, judge=w.judge,
                              capture=w.capture, ctx_gate=w.ctx_gate,
-                             independent_budgets=w.independent_budgets, resume=w.resume)
+                             independent_budgets=w.independent_budgets, resume=w.resume,
+                             caveman_mode=w.caveman_mode)
             return
         arms, tasks, model, k, budget_usd, milestones, out, force, retries, auth = (
             w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out, w.force, w.retries,
             w.auth)
         effort = w.effort
         concurrency = w.concurrency   # wizard answer wins over the flag default
+        caveman_mode = w.caveman_mode
         if w.agent_timeout_mult is not None:
             agent_timeout_mult = w.agent_timeout_mult
+    # caveman intensity is the same knob for full and incremental: the flag (or wizard) sets
+    # TMB_CAVEMAN_MODE, which the container agent reads. Precedence: explicit flag/wizard >
+    # an already-exported TMB_CAVEMAN_MODE > the built-in 'full'.
+    if caveman_mode and "caveman" in arms.split(","):
+        import os
+        os.environ["TMB_CAVEMAN_MODE"] = caveman_mode
     if not out:  # auto-mint a fresh dir under the configured root, like the cost bench
         from minmax_bench.quality.paths import new_run_dir
         out = new_run_dir("full", (tasks or dataset).replace(",", "-"))
@@ -226,22 +235,35 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None,
                      auth: str, assume_yes: bool, judge: str = "off", steps: bool = True,
                      capture: bool = False, headroom_mode: str = "token", ccr: bool = True,
                      ctx_gate: int = 50_000, independent_budgets: bool = False,
-                     resume: bool = True, effort: str | None = None) -> None:
+                     resume: bool = True, effort: str | None = None,
+                     caveman_mode: str = "full") -> None:
     """Rich incremental (teacher-forced, per-step) run of one session — picker when no
     --session, model auto-fallback, cost preview, per-arm progress, a summary table with the
     recorded backtest anchor, and a per-step good/semi/bad/redundant readout. Writes
     <out>/incremental/<task>-<arm>.jsonl for report."""
     from .counterfactual import pick_session, render_steps, render_summary, replay
+    from .quality import engine as _eng
+    arm_list = [a.strip() for a in arms.split(",") if a.strip() and a.strip() != "control"]
+    # Validate arms BEFORE the interactive picker: replay() re-checks, but by then the user
+    # has already scrolled a session list and chosen one, only to be told the arm was never
+    # runnable. Only arm-shape problems abort here — credential problems stay in replay(),
+    # which reports them all together with the rest of its preflight.
+    unsupported = [p for p in _eng.check_arms(["control"] + arm_list, {"ANTHROPIC_API_KEY": "x"})
+                   if "has no replay endpoint" in p or "is not supported" in p]
+    if unsupported:
+        for p in unsupported:
+            console.print(f"[red]{p}[/]")
+        raise typer.Exit(1)
     sp = Path(session).expanduser() if session else pick_session(console)
     if not sp.is_file():
         raise typer.BadParameter(f"not a session file: {sp}")
-    arm_list = [a.strip() for a in arms.split(",") if a.strip() and a.strip() != "control"]
     try:
         summary = replay(sp, arm_list, budget_usd=budget_usd, limit=limit,
                          max_tokens=max_tokens, out_dir=Path(out), console=console,
                          assume_yes=assume_yes, model=model, auth=auth, task=task, judge=judge,
                          capture=capture, headroom_mode=headroom_mode, ccr=ccr, ctx_gate=ctx_gate,
-                         independent_budgets=independent_budgets, resume=resume, effort=effort)
+                         independent_budgets=independent_budgets, resume=resume,
+                         effort=effort, caveman_mode=caveman_mode)
     except SystemExit as e:
         raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
     render_summary(summary, console)
@@ -254,7 +276,7 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None,
 @quality_app.command("incremental")
 def quality_incremental(
     session: str | None = typer.Argument(None, help="A session .jsonl (default: pick from ~/.claude/projects)."),
-    arms: str = typer.Option("condense", "--arms", help="Arms to compare besides control (condense, headroom)."),
+    arms: str = typer.Option("condense", "--arms", help="Arms to compare besides control (condense, headroom, caveman)."),
     model: str | None = typer.Option(None, "--model", "-m", help="Model to run the incremental on (default: the session's own, with auto-fallback if an arm can't serve it)."),
     effort: str | None = typer.Option(None, "--effort", help="Thinking effort override stamped onto every replayed request (low | medium | high | xhigh | max). Default: inherit the session's recorded thinking config."),
     limit: int = typer.Option(0, "--limit", "-n", help="Max decision points, contiguous from the start (0 = all). Strided sampling was removed — it distorted the cost/compaction numbers."),
@@ -267,6 +289,7 @@ def quality_incremental(
     steps: bool = typer.Option(True, "--steps/--no-steps", help="Show the per-step good/semi/bad/redundant readout."),
     capture: bool = typer.Option(False, "--capture", help="Run your version-matched Claude Code binary once (locally) to capture its system prompt + tools, instead of a stored template."),
     headroom_mode: str = typer.Option("token", "--headroom-mode", help="For a headroom arm: token (compression — the meaningful test) or cache (~passthrough). Auto-starts the proxy."),
+    caveman_mode: str = typer.Option("full", "--caveman-mode", help="For the caveman arm: lite | full | ultra intensity. caveman freezes the recorded tool rails and drifts only its terse prose (it changes prose, not actions)."),
     ccr: bool = typer.Option(True, "--ccr/--no-ccr", help="For the headroom arm, inject the CCR retrieve loop (via headroom mcp serve); --no-ccr runs it as kompress (compression only)."),
     ctx_gate: int = typer.Option(50_000, "--ctx-gate", help="Skip sessions whose peak context stays below this (compaction can't fire — nothing to compare). 0 = run it anyway."),
     independent_budgets: bool = typer.Option(False, "--independent-budgets/--cap-to-control", help="Default caps every arm at the steps control reached within budget (the paired comparison window — no wasted spend past it). --independent-budgets lets each arm run to its own budget instead (e.g. a 'how far can each arm get' reach test), at the cost of ragged, partly-uncomparable step counts."),
@@ -288,7 +311,8 @@ def quality_incremental(
                      budget_usd=budget_usd, max_tokens=max_tokens, out=out_dir, task=task,
                      auth=auth, assume_yes=yes, judge=judge, steps=steps, capture=capture,
                      headroom_mode=headroom_mode, ccr=ccr, ctx_gate=ctx_gate,
-                     independent_budgets=independent_budgets, resume=resume)
+                     independent_budgets=independent_budgets, resume=resume,
+                     caveman_mode=caveman_mode)
 
 
 # judge takes niche flags; pass through to the driver (which owns its --help)

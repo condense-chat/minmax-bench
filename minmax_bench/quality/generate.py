@@ -19,6 +19,11 @@ Shared:
                              vanilla-proxy     = vanilla through a do-nothing local forwarder
                                               (full mode only) — the passthrough CONTROL that
                                               isolates the non-default-base-URL confound
+                             caveman           = the caveman skill (full mode only): a
+                                              generation-policy method, NOT a proxy — it makes
+                                              the agent write terse, so its savings come from
+                                              its own smaller messages accumulating. Reads
+                                              against plain vanilla (no proxy confound).
 Optional (full): --milestones runs an LLM judge over the runs → results/<out>/milestones.json.
 
 Nothing here is read by report.py except the files it writes. Keep generation and display separate.
@@ -143,6 +148,20 @@ PTPORT = int(os.environ.get("PTPORT", "8788"))  # the vanilla-proxy passthrough 
 # (token-mode compression with NO retrieval). Both need a token-mode proxy.
 HEADROOM_MODES = {"headroom": "token", "headroom-kompress": "token"}
 
+# caveman intensity levels the bench accepts (TMB_CAVEMAN_MODE). Upstream also ships
+# wenyan-{lite,full,ultra}; those are excluded on purpose — they switch the output language
+# to classical Chinese, which confounds every trajectory metric. Duplicated in
+# harbor_agents/caveman_claude_code.py, which cannot be imported from here (it pulls in
+# harbor, a separate uv tool env).
+CAVEMAN_MODES = ("lite", "full", "ultra")
+
+# Kept in sync with harbor_agents/caveman_claude_code.py (same import barrier as above).
+# Bumping the pin changes the METHOD under test, not a dependency — re-run every arm.
+CAVEMAN_PIN = "v1.9.1"
+CAVEMAN_TARBALL_PROBE = (
+    "https://codeload.github.com/JuliusBrussee/caveman/tar.gz/"
+    "033f918602bd5319931256a537c4bd9ea7a48c25")
+
 # the harbor child currently running (for cleanup on interrupt) — a 1-slot box so
 # the signal handler / atexit reaper can terminate it before removing its network
 _HARBOR = [None]
@@ -206,6 +225,24 @@ def _arm_wiring(arm, env):
     if arm == "headroom-kompress":
         # ablation: token-mode compression WITHOUT the retrieve loop (plain agent)
         return (f"http://host.docker.internal:{HRPORT}", "host.docker.internal", "claude-code", [])
+    if arm == "caveman":
+        # NOT a proxy: same endpoint as vanilla, all the way to api.anthropic.com. The
+        # intervention is entirely inside the container — a SessionStart hook that puts the
+        # caveman ruleset in context so the agent writes terse. Its context savings are
+        # indirect (its own smaller messages accumulate into a smaller prefix), against a
+        # fixed ~750-token cost for the ruleset itself — so on SHORT tasks the tax can
+        # exceed the savings. Level is a knob: lite | full | ultra.
+        #
+        # allow-host stays api.anthropic.com ONLY, exactly like vanilla, even though the
+        # agent curls the pinned caveman tarball from GitHub. That fetch happens in
+        # install(), which runs under the environment baseline rather than the agent-phase
+        # allowlist (the same reason headroom's `pip install headroom-ai` works today).
+        # Adding codeload.github.com here would open it during agent RUN too, handing
+        # caveman network reach that vanilla does not have on allowlisted tasks — an unfair
+        # capability difference that would show up as a trajectory difference.
+        return ("https://api.anthropic.com", "api.anthropic.com",
+                "harbor_agents.caveman_claude_code:CavemanClaudeCode",
+                ["--ae", f"TMB_CAVEMAN_MODE={env.get('TMB_CAVEMAN_MODE', 'full')}"])
     sys.exit(f"unknown arm: {arm}")
 
 
@@ -327,6 +364,17 @@ def _validate_full(args, env):
                  "silently produce garbage. condense authenticates via the local `dense` CLI: "
                  "install it (curl -fsSL https://cli.condense.chat/unix | sh) and run "
                  "`dense login`. (Headless fallback: set CONDENSE_API_KEY.) Or drop the arm.")
+    if "caveman" in arms:
+        # Validate the level HERE rather than in the container: the agent also rejects a bad
+        # value, but only after a full image build + agent setup has been paid for on every
+        # cell. (The list is duplicated in harbor_agents/caveman_claude_code.py on purpose —
+        # that module imports harbor, which lives in a separate uv tool env and is NOT
+        # importable from here.)
+        mode = env.get("TMB_CAVEMAN_MODE", "full")
+        if mode not in CAVEMAN_MODES:
+            sys.exit(f"TMB_CAVEMAN_MODE={mode!r} is not one of {', '.join(CAVEMAN_MODES)} "
+                     "(set it in .env or the environment; --arms caveman uses 'full' by "
+                     "default).")
     return arms
 
 
@@ -339,6 +387,19 @@ def _docker_alive():
     try:
         return subprocess.run(["docker", "info"], capture_output=True, timeout=15).returncode == 0
     except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def _url_ok(url, timeout=10):
+    """True iff the URL responds without an HTTP error. HEAD only — no body is downloaded;
+    the container does the real fetch."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 200 <= r.status < 400
+    except (urllib.error.URLError, OSError, ValueError):
         return False
 
 
@@ -375,6 +436,12 @@ def _preflight_full(arms, env):
                      "free" if not busy else
                      f"busy — the passthrough control needs it (`kill $(lsof -ti :{PTPORT})` "
                      f"or set PTPORT)", True))
+    if "caveman" in arms:
+        # Each container fetches the pinned tarball itself; check reachability from the host
+        # as a cheap stand-in, so a network/tag problem surfaces now instead of failing agent
+        # setup on every cell. Non-fatal: the host may be firewalled where containers aren't.
+        rows.append(("caveman tarball", _url_ok(CAVEMAN_TARBALL_PROBE),
+                     f"github {CAVEMAN_PIN} reachable", False))
     return rows
 
 
