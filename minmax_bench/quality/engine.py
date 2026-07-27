@@ -1098,6 +1098,61 @@ def rtk_pipe(text, filt, timeout=30):
     return p.stdout if p.returncode == 0 and p.stdout.strip() else str(text)
 
 
+_enc = []
+
+
+def _tokens(text):
+    """Token count for a string. cl100k is not Claude's tokenizer, so absolute counts are
+    approximate — but every number below is a RATIO of two counts under the same encoder,
+    and that is robust to the encoder choice."""
+    if not _enc:
+        import tiktoken
+        _enc.append(tiktoken.get_encoding("cl100k_base"))
+    return len(_enc[0].encode(str(text), disallowed_special=()))
+
+
+def transcript_tokens(msgs):
+    """Tokens in a whole message list — 'how big is this conversation', each token once."""
+    return sum(_tokens(json.dumps(m)) for m in msgs)
+
+
+def billed_tokens(msgs, points):
+    """Tokens you would actually SEND across a session: the sum of every decision point's
+    prefix. Each step resends everything before it, so an early saving is re-banked on every
+    later turn — which is exactly why this, not the flat transcript size, is the number that
+    matches a bill. Returns (total, per_step_prefix_sizes).
+    """
+    sizes, running, j = [], 0, 0
+    for i in points:
+        while j < i:
+            running += _tokens(json.dumps(msgs[j]))
+            j += 1
+        sizes.append(running)
+    return sum(sizes), sizes
+
+
+def rtk_savings(orig_msgs, new_msgs, points):
+    """End-to-end token saving of a transform, computed OFFLINE — no API calls, no spend.
+
+    rtk's transform is deterministic and independent of anything the model says, so the token
+    saving is fully knowable before replaying a single step. That decouples the two questions
+    the arm actually asks:
+
+      - "how much smaller is the context?"  -> exactly this, free, over the WHOLE session;
+      - "does the smaller context change the next decision?" -> the replay, which spends.
+
+    The replay's own `comp` measures the first from real API usage, but only over the steps
+    that fit in the budget; this covers everything. Reported together they cross-check.
+
+    Returns {'transcript': (before, after), 'billed': (before, after)} — `transcript` counts
+    each token once, `billed` weights by how many turns re-send it.
+    """
+    tb, ta = transcript_tokens(orig_msgs), transcript_tokens(new_msgs)
+    bb, _ = billed_tokens(orig_msgs, points)
+    ba, _ = billed_tokens(new_msgs, points)
+    return {"transcript": (tb, ta), "billed": (bb, ba)}
+
+
 def _result_text(block):
     """A tool_result's text, whichever shape it is stored in (str, or a content-block list)."""
     c = block.get("content")

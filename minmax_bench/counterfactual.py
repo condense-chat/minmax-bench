@@ -717,7 +717,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
     # transformed history exactly like control teacher-forces the original. That is what makes
     # this arm paired with control step-for-step by construction — same actions, same step set,
     # only the observations are smaller.
-    rtk_msgs, rtk_stats = None, None
+    rtk_msgs, rtk_stats, rtk_savings_report = None, None, None
     if "rtk" in arms:
         with console.status("[cyan]rtk[/] filtering recorded tool output…"):
             rtk_msgs, rtk_stats = eng.rtk_transform_session(msgs, points)
@@ -726,6 +726,21 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
         console.print(
             f"[dim]rtk:[/] filtered [bold]{rtk_stats['filtered']}[/] Bash observations "
             f"({cut}), [dim]{rtk_stats['skipped']} had no rtk filter and passed through[/]")
+        # The end-to-end token saving is KNOWABLE WITHOUT SPENDING: rtk's transform is
+        # deterministic and model-independent, so it is measured here over the WHOLE session
+        # rather than inferred from the replay's per-step usage (which only covers the steps
+        # that fit in the budget). The replay still runs — but to answer the other question,
+        # whether the smaller context changes the next decision.
+        sv = eng.rtk_savings(msgs, rtk_msgs, points)
+        tb, ta = sv["transcript"]
+        bb, ba = sv["billed"]
+        rtk_savings_report = sv
+        console.print(
+            f"[dim]rtk:[/] transcript [bold]{tb / 1000:.1f}k → {ta / 1000:.1f}k[/] tokens "
+            f"([{'green' if ta < tb else 'dim'}]{(1 - ta / tb) if tb else 0:.1%}[/]) · "
+            f"billed across all {len(points)} steps [bold]{bb / 1000:.0f}k → {ba / 1000:.0f}k[/] "
+            f"([{'green' if ba < bb else 'dim'}]{(1 - ba / bb) if bb else 0:.1%}[/]) "
+            f"[dim]— measured offline, no API calls[/]")
         if not rtk_stats["filtered"]:
             console.print("[yellow]rtk changed nothing in this session[/] — no recorded command "
                           "has an rtk pipe filter, so the arm is a guaranteed passthrough here. "
@@ -983,6 +998,9 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
             "rtk_skipped": (rtk_stats["skipped"] if arm == "rtk" and rtk_stats else None),
             "rtk_bytes": ([rtk_stats["bytes_before"], rtk_stats["bytes_after"]]
                           if arm == "rtk" and rtk_stats else None),
+            # end-to-end token saving over the WHOLE session, measured offline (no API calls)
+            # — the replay's ctx numbers only cover the steps that fit in the budget
+            "rtk_tokens": (rtk_savings_report if arm == "rtk" else None),
             "judge_usd": round(judge_spent, 4),
             # cost_usd is the arm's REPLAY spend only (judge cost is a measurement overhead,
             # reported separately) so the arm-vs-control $ comparison stays clean; the budget
