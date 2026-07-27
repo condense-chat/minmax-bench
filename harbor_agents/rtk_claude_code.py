@@ -34,6 +34,7 @@ Run via:  -a harbor_agents.rtk_claude_code:RtkClaudeCode
 """
 from __future__ import annotations
 
+import json
 import os
 import shlex
 
@@ -125,7 +126,7 @@ class RtkClaudeCode(ClaudeCode):
         incomparable.
         """
         base = super()._build_register_skills_command()
-        settings = f"node -e {shlex.quote(self._settings_script())}"
+        settings = self._settings_command()
 
         # `rtk init -g` installs the hook AND embeds hooks/claude/rtk-awareness.md into
         # CLAUDE.md, so a faithful install includes it. It is NOT a skill in caveman's sense —
@@ -146,52 +147,75 @@ class RtkClaudeCode(ClaudeCode):
         # subcommand's own JSON, so either half breaking is caught here rather than becoming
         # a quiet null result. `rtk rewrite` exits 0 (auto-allow) or 3 (ask) on a hit and 1
         # when it has no equivalent — 1 for `git status` would mean the registry is gone.
+        # Smoke test: a hook that never fires makes this arm identical to vanilla while
+        # scoring a clean "trajectory preserved". Assert on the real rewrite engine (`rtk
+        # rewrite`, the source of truth the hook delegates to) AND on the hook subcommand's
+        # own JSON, so either half breaking is caught here rather than becoming a null result.
+        #
+        # NO top-level `||` anywhere in here. `&&` and `||` are equal precedence and
+        # left-associative in sh, so `a && b && c || d` parses as `((a && b) && c) || d` —
+        # an earlier failure in the chain this string is joined into would fall through to
+        # THIS block's error branch and be misreported as an rtk problem. That is not
+        # hypothetical: it is how a missing `node` got blamed on rtk's rewrite engine.
+        # Exit codes are absorbed with `|| true` inside the $( ), and every assertion is a
+        # `case` on the captured STRING — which is the thing worth asserting anyway.
+        # Braces make the whole block ONE unit in the `&&` chain. Without them only the first
+        # command is guarded — everything after the first `;` runs even when an earlier step
+        # failed, which is how a failed settings write still reached these assertions and got
+        # reported as "rtk's rewrite engine is broken".
         verify = (
-            f'out=$({RTK_BIN} rewrite "git status") || test $? -eq 3 || '
-            '{ echo "rtk: rewrite engine produced nothing for a known command — the arm '
-            'would run WITHOUT the intervention" >&2; exit 1; }; '
+            "{ "
+            f'out=$({RTK_BIN} rewrite "git status" 2>/dev/null || true); '
             'case "$out" in "rtk git status") ;; *) '
-            'echo "rtk: unexpected rewrite \'$out\' for \'git status\'" >&2; exit 1 ;; esac; '
+            'echo "rtk: rewrite engine did not rewrite a known command (got: [$out]) — the '
+            'arm would run WITHOUT the intervention" >&2; exit 1 ;; esac; '
             'hook=$(echo \'{"tool_name":"Bash","tool_input":{"command":"git status"}}\' '
-            f'| {RTK_BIN} hook claude); '
+            f'| {RTK_BIN} hook claude 2>/dev/null || true); '
             'case "$hook" in *\'"command":"rtk git status"\'*) ;; *) '
-            'echo "rtk: hook claude did not rewrite the command; got: \'$hook\'" >&2; '
+            'echo "rtk: hook claude did not rewrite the command (got: [$hook])" >&2; '
             'exit 1 ;; esac; '
-            f'echo "rtk {RTK_REF} active (PreToolUse hook wired)"'
+            # prove the hook is actually WIRED, not merely functional — the settings write is
+            # the step that silently did nothing when node was missing
+            'grep -q "hook claude" $CLAUDE_CONFIG_DIR/settings.json || '
+            '{ echo "rtk: settings.json has no PreToolUse hook — it was never wired" >&2; '
+            'exit 1; }; '
+            f'echo "rtk {RTK_REF} active (PreToolUse hook wired)"; '
+            "}"
         )
 
         parts = [p for p in (base, settings, awareness, verify) if p]
         return " && ".join(parts)
 
-    def _settings_script(self) -> str:
-        """Node one-liner that merges the PreToolUse hook into settings.json.
+    def _settings_command(self) -> str:
+        """Shell command that writes the PreToolUse hook into settings.json.
 
-        Merges rather than clobbers (and creates the file if absent) so anything the base
-        agent or the image already wrote survives.
+        Built on the HOST and echoed in — the same approach headroom_ccr_claude_code.py uses
+        for .claude.json — rather than shelling out to `node -e`. node is not on PATH during
+        the agent SETUP phase (the base agent only exports ~/.local/bin for the agent RUN),
+        so the node version silently wrote nothing and the hook was never wired.
 
-        The matcher is "Bash" — rtk only rewrites shell commands, and an unmatched hook would
-        fire on every tool call for nothing. The binary path is baked ABSOLUTE at write time
-        rather than left as `$HOME/...`: that would assume Claude Code expands environment
-        variables inside hook commands, and a wrong guess there fails silently as "no
-        intervention" — the one failure this arm must never have.
+        Writing fresh rather than merging is safe here: the base ClaudeCode never writes
+        settings.json (its memory command targets projects/-app/memory/ and its MCP command
+        .claude.json), so there is nothing of its to preserve.
+
+        $HOME is expanded in the CONTAINER via a placeholder + sed, because the hook command
+        must be an absolute path — assuming Claude Code expands environment variables inside
+        hook commands would fail silently as "no intervention", the one failure this arm must
+        never have.
+
+        The matcher is "Bash": rtk only rewrites shell commands, and an unmatched hook would
+        fire on every tool call for nothing.
         """
-        # Plain string, NOT an f-string: nothing is interpolated (rtk has no mode knob), so
-        # the JS braces stay single. Adding an interpolation later means doubling every brace.
-        return r"""
-const fs = require('fs');
-const os = require('os');
-const dir = process.env.CLAUDE_CONFIG_DIR;
-const p = dir + '/settings.json';
-const bin = os.homedir() + '/.local/bin/rtk';
-let s = {};
-try { s = JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) {}
-if (!s.hooks) s.hooks = {};
-if (!s.hooks.PreToolUse) s.hooks.PreToolUse = [];
-const has = s.hooks.PreToolUse.some(e =>
-  e.hooks && e.hooks.some(h => h.command && h.command.includes('rtk')));
-if (!has) s.hooks.PreToolUse.push({
-  matcher: 'Bash',
-  hooks: [{ type: 'command', command: bin + ' hook claude', timeout: 10 }],
-});
-fs.writeFileSync(p, JSON.stringify(s, null, 2) + '\n');
-"""
+        cfg = {
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command",
+                               "command": "__RTK_HOME__/.local/bin/rtk hook claude",
+                               "timeout": 10}],
+                }]
+            }
+        }
+        blob = shlex.quote(json.dumps(cfg, indent=2))
+        return (f'printf %s {blob} | sed "s|__RTK_HOME__|$HOME|g" '
+                "> $CLAUDE_CONFIG_DIR/settings.json")
