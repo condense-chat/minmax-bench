@@ -7,6 +7,8 @@ import json
 import os
 from types import SimpleNamespace
 
+import pytest
+
 from minmax_bench.quality import engine as eng
 from minmax_bench.quality import report
 
@@ -812,3 +814,29 @@ def test_k_for_vanilla_defaults_to_k_plus_one():
     args = SimpleNamespace(k=4, k_vanilla=None)
     assert _k_for(args, "vanilla") == 5 and _k_for(args, "condense") == 4
     assert _k_for(SimpleNamespace(k=4, k_vanilla=2), "vanilla") == 2
+
+
+def test_named_tasks_are_validated_with_a_did_you_mean(monkeypatch, capsys):
+    """Regression: comma-separated task names were the ONE --tasks form returned verbatim, so
+    a typo survived the wizard, the cost preview and Docker startup and only died inside
+    harbor once per cell — after the run had already announced a spend ceiling."""
+    monkeypatch.setattr(eng, "dataset_tasks",
+                        lambda org="terminal-bench": ["dna-assembly", "protein-assembly",
+                                                      "build-pmars"])
+    assert eng.resolve_tasks("dna-assembly") == ["dna-assembly"]
+    assert eng.resolve_tasks("dna-assembly,build-pmars") == ["dna-assembly", "build-pmars"]
+
+    # a misspelling has a close neighbour -> refuse, and name it
+    with pytest.raises(SystemExit) as e:
+        eng.resolve_tasks("dna-assmebly")
+    msg = str(e.value)
+    assert "no such terminal-bench task" in msg and "dna-assembly" in msg
+
+    # the local pool is a SUBSET of the dataset (harbor materializes on demand), so a name
+    # with no close neighbour may be real-but-uncached — warn, never block
+    assert eng.resolve_tasks("some-brand-new-task-xyz") == ["some-brand-new-task-xyz"]
+    assert "not among the 3 terminal-bench tasks" in capsys.readouterr().err
+
+    # nothing cached at all -> nothing to validate against, so don't invent an opinion
+    monkeypatch.setattr(eng, "dataset_tasks", lambda org="terminal-bench": [])
+    assert eng.resolve_tasks("anything") == ["anything"]

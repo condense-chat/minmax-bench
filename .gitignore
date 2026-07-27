@@ -23,6 +23,12 @@ results/
 # so both stay; commit a NEW reference run deliberately with `git add -f`.
 runs/run-*/
 
+# Generated quality-bench runs (QUALITY_RUNS_DIR, `runs/quality/{full,incremental}/…`).
+# Incremental replays embed the content of whichever local session was replayed, so this
+# must not be committable by accident. runs/quality-sample/ (the offline demo) is a
+# different path and stays tracked.
+runs/quality/
+
 .headroom/
 .playwright-mcp/
 scratchpad/

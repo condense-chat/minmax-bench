@@ -157,7 +157,31 @@ def resolve_tasks(raw, org="terminal-bench", seed=None):
         if rand_n:
             return sorted(_random.Random(seed).sample(pool, n))
         return pool[:n]
-    return [t for t in raw.split(",") if t.strip()]
+    names = [t.strip() for t in raw.split(",") if t.strip()]
+    # Named tasks used to be returned VERBATIM — the one --tasks form with no validation. A
+    # typo then survived the wizard, the cost preview and Docker startup, and only died inside
+    # harbor once per cell ("No tasks matched the filter(s) …"), after the run had announced a
+    # spend ceiling. Catch it here, before anything is started.
+    #
+    # The local pool is a SUBSET of the dataset (harbor materializes packages on demand), so an
+    # unknown name is not proof of a typo:
+    #   - unknown WITH a close neighbour -> almost certainly a misspelling; exit and say so.
+    #   - unknown with no neighbour      -> may be a real task not cached yet; warn and proceed
+    #                                       rather than blocking a legitimate run.
+    pool = dataset_tasks(org)
+    if pool:
+        for n in names:
+            if n in pool:
+                continue
+            near = difflib.get_close_matches(n, pool, n=3, cutoff=0.6)
+            if near:
+                sys.exit(f"--tasks {n!r}: no such {org} task. Did you mean "
+                         f"{' or '.join(repr(m) for m in near)}?"
+                         f"\n(`--list-tasks` shows everything known locally.)")
+            print(f"warn: {n!r} is not among the {len(pool)} {org} tasks cached locally — "
+                  f"continuing in case harbor can fetch it, but check the spelling "
+                  f"(`--list-tasks`) if the run fails immediately.", file=sys.stderr)
+    return names
 
 
 # The 'headroom' arm hits the proxy (cache or token mode, per --headroom-mode). In the
