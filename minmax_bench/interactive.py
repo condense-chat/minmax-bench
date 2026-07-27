@@ -508,7 +508,16 @@ def _quality_preflight(console: Console, arms: list[str], *, need_docker: bool) 
         if any(a.startswith("headroom") for a in arms):
             rows.append(("headroom / uvx", bool(shutil.which("headroom") or shutil.which("uvx")),
                          "the headroom proxy"))
-        fatal_names = {"Anthropic auth"}
+        if "rtk" in arms:
+            # incremental filters the recorded output locally, so a missing binary is fatal
+            # here (replay() would otherwise abort after the session picker and cost preview)
+            from .quality.engine import rtk_version
+            from .quality.generate import RTK_PIN
+            rv = rtk_version()
+            rows.append(("rtk CLI", bool(rv),
+                         f"{rv} (pin {RTK_PIN})" if rv else "brew install rtk — filters the "
+                         "recorded output locally"))
+        fatal_names = {"Anthropic auth", "rtk CLI"}
     t = Table(title="[bold]dependency preflight")
     t.add_column("dependency")
     t.add_column("status")
@@ -592,6 +601,9 @@ def _full_wizard(console: Console) -> QualityWizardResult:
                           "confound every proxy arm shares)", True, False),
         ("caveman", "caveman — terse-output skill; not a proxy, so it reads against plain "
                     "vanilla", True, False),
+        ("rtk", "rtk — filters tool OUTPUT in the container (pinned build, installed per "
+                "trial); not a proxy either, so it also reads against plain vanilla",
+         True, False),
     ])
     # caveman intensity — the SAME knob as the incremental wizard (both set TMB_CAVEMAN_MODE),
     # only asked when the arm is selected so full and incremental legs of one experiment don't
@@ -757,7 +769,19 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         ("headroom", "headroom — token proxy + injected retrieve loop (CCR)", True, False),
         ("caveman", "caveman — terse-output skill; freezes the recorded tool rails, drifts "
                     "only its terse prose", True, False),
+        ("rtk", "rtk — filters recorded tool OUTPUT through `rtk pipe` (needs rtk locally)",
+         True, False),
     ])
+    # rtk's incremental transform runs HERE, not in a container — offer the install now rather
+    # than aborting in replay() after the user has already picked a session and a budget.
+    if "rtk" in arms:
+        from .quality.engine import rtk_version as _rv
+        if not _rv():
+            console.print("[yellow]rtk is not installed[/] — the incremental rtk arm filters the "
+                          "recorded output locally, so it needs the binary.")
+            if Confirm.ask("  install rtk now?", default=True, console=console):
+                from .provision import ensure_rtk
+                ensure_rtk(console)
     # caveman intensity — only asked when the arm is selected. caveman has no internal
     # compaction threshold, but the session-length gate (--ctx-gate, applied before any arm
     # runs) still filters a short caveman-only session out; and its per-turn ruleset tax means
@@ -928,6 +952,12 @@ def run_setup_wizard(console: Console) -> None:
     t.add_row("  ANTHROPIC_API_KEY", mask(env.get("ANTHROPIC_API_KEY")))
     t.add_row("  Claude Code login", "[green]available[/]" if sub else "[dim]not found[/]")
     t.add_row("condense (dense CLI)", cc_status)
+    from .quality.engine import rtk_version as _rv_probe
+    from .quality.generate import RTK_PIN as _rtk_pin
+    _rv0 = _rv_probe()
+    t.add_row("rtk (incremental arm)",
+              f"[green]{_rv0}[/]" if _rv0 == _rtk_pin.lstrip("v") else
+              f"[yellow]{_rv0} (pin {_rtk_pin})[/]" if _rv0 else "[dim]not installed[/]")
     t.add_row("HF_TOKEN", mask(env.get("HF_TOKEN")))
     console.print(t)
 
@@ -981,7 +1011,29 @@ def run_setup_wizard(console: Console) -> None:
         if k:
             updates["CONDENSE_API_KEY"] = k
 
-    console.print("\n[bold]3) SWE-chat dataset[/] [dim](optional)[/] — HuggingFace token for the "
+    console.print("\n[bold]3) rtk arm[/] [dim](optional)[/] — the [bold]rtk[/] CLI, needed only by "
+                  "[bold]quality incremental --arms rtk[/]: it filters the RECORDED tool output "
+                  "locally. Full mode never needs it (the container installs its own pinned "
+                  "build), so skip this if you only run full.")
+    from .quality.engine import rtk_version as _rtk_version
+    _rv = _rtk_version()
+    if _rv:
+        from .quality.generate import RTK_PIN as _pin
+        if _rv == _pin.lstrip("v"):
+            console.print(f"  [green]rtk {_rv} detected[/] — matches the benchmark pin, nothing "
+                          "to set.")
+        else:
+            console.print(f"  [yellow]rtk {_rv} detected, benchmark pins {_pin}[/] — incremental "
+                          f"would filter with {_rv} while full mode runs {_pin}, making those "
+                          f"two legs non-comparable.")
+            if Confirm.ask("  upgrade rtk to match the pin?", default=True, console=console):
+                from .provision import ensure_rtk
+                ensure_rtk(console)
+    elif Confirm.ask("  install rtk now?", default=False, console=console):
+        from .provision import ensure_rtk
+        ensure_rtk(console)
+
+    console.print("\n[bold]4) SWE-chat dataset[/] [dim](optional)[/] — HuggingFace token for the "
                   "gated SALT-NLP/SWE-chat dataset.")
     if Confirm.ask("  set HF_TOKEN?", default=False, console=console):
         k = Prompt.ask("  [cyan]HF_TOKEN[/] (hf_…)", password=True, default="",
@@ -989,7 +1041,7 @@ def run_setup_wizard(console: Console) -> None:
         if k:
             updates["HF_TOKEN"] = k
 
-    console.print("\n[bold]4) advanced[/] [dim](optional)[/] — where quality runs are saved. Each "
+    console.print("\n[bold]5) advanced[/] [dim](optional)[/] — where quality runs are saved. Each "
                   "run auto-mints a fresh timestamped dir under this root (like the cost bench), "
                   "so re-runs never clobber.")
     from .config import get_settings

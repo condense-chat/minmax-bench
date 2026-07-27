@@ -66,6 +66,39 @@ def _run(cmd: str, console: Console, timeout: int = 900) -> bool:
         return False
 
 
+def ensure_rtk(console: Console) -> None:
+    """Install the rtk CLI if missing, and report how it lines up with the benchmark's pin.
+
+    Only the quality bench's INCREMENTAL rtk arm needs this: it filters the recorded tool
+    output through `rtk pipe` locally. Full mode installs its own pinned build in the
+    container, so a version mismatch here does not break that leg — it makes the two legs
+    non-comparable, which is worth saying out loud rather than discovering in a chart.
+    """
+    s = get_settings()
+    if not shutil.which("rtk"):
+        console.print(f"[yellow]•[/] rtk not found; installing — [dim]{s.rtk_install_cmd}[/]")
+        if not _run(s.rtk_install_cmd, console, timeout=600) or not shutil.which("rtk"):
+            console.print("[red]✗[/] rtk unavailable; the incremental rtk arm will be skipped "
+                          "(full mode is unaffected — the container installs its own)")
+            return
+        console.print(f"[green]✓[/] installed rtk ({shutil.which('rtk')})")
+    else:
+        console.print(f"[green]✓[/] rtk CLI present ({shutil.which('rtk')})")
+
+    from .quality.engine import rtk_version
+    from .quality.generate import RTK_PIN
+    have, pinned = rtk_version(), RTK_PIN.lstrip("v")
+    if not have:
+        console.print("[red]✗[/] rtk is on PATH but `rtk --version` failed")
+    elif have == pinned:
+        console.print(f"[green]✓[/] rtk {have} matches the benchmark pin ({RTK_PIN})")
+    else:
+        console.print(
+            f"[yellow]•[/] rtk {have} differs from the benchmark pin [bold]{RTK_PIN}[/] — "
+            f"incremental filters with {have} while full mode runs {RTK_PIN}, so those two "
+            f"legs are not directly comparable. [dim]`brew upgrade rtk` to match.[/]")
+
+
 def ensure_dense(console: Console) -> None:
     """Install the dense CLI if missing; ensure (or hint) login for condense creds."""
     s = get_settings()

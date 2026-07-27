@@ -274,7 +274,7 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None,
 @quality_app.command("incremental")
 def quality_incremental(
     session: str | None = typer.Argument(None, help="A session .jsonl (default: pick from ~/.claude/projects)."),
-    arms: str = typer.Option("condense", "--arms", help="Arms to compare besides control (condense, headroom, caveman)."),
+    arms: str = typer.Option("condense", "--arms", help="Arms to compare besides control (condense, headroom, caveman, rtk)."),
     model: str | None = typer.Option(None, "--model", "-m", help="Model to run the incremental on (default: the session's own, with auto-fallback if an arm can't serve it)."),
     effort: str | None = typer.Option(None, "--effort", help="Thinking effort override stamped onto every replayed request (low | medium | high | xhigh | max). Default: inherit the session's recorded thinking config."),
     limit: int = typer.Option(0, "--limit", "-n", help="Max decision points, contiguous from the start (0 = all). Strided sampling was removed — it distorted the cost/compaction numbers."),

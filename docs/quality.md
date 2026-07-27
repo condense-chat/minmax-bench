@@ -97,6 +97,88 @@ un-gated, so a new method shows a real verdict rather than quietly vanishing fro
 - `caveman` — the [caveman](https://github.com/JuliusBrussee/caveman) skill (full mode
   only), pinned at `v1.9.1`. A different *class* of method, and the distinction matters
   for how you read it — see below.
+- `rtk` — [RTK](https://github.com/rtk-ai/rtk) ("Rust Token Killer"), pinned at `v0.44.0`.
+  A **third** class: it transforms neither the history nor the agent's output but its
+  **observations** — see below.
+
+### three classes of method, and why the class changes how you read the arm
+
+| class | transforms | arms |
+|---|---|---|
+| history transform | the conversation you resend | `condense`, `headroom` |
+| generation policy | what the agent **writes** | `caveman` |
+| observation transform | what the agent **reads back** | `rtk` |
+
+The first hands back a smaller conversation. The second makes the agent's own messages
+smaller as they accrue. The third leaves both alone and shrinks the *tool output* — which
+is what actually dominates a coding session's prefix, and the exact gap the caveman section
+below names ("tool I/O dominates the prefix and caveman never touches it").
+
+Neither `caveman` nor `rtk` is a proxy, so both read against plain **`vanilla`**, not
+`vanilla-proxy` — they don't carry the ~8-9k non-default-base-URL wiring confound, and
+comparing them to `vanilla-proxy` would credit them with that whole difference.
+
+### rtk is an observation transform
+
+RTK is a single Rust binary and is **deterministic** — rule-based filters, no LLM, nothing
+sampled. A `PreToolUse` hook rewrites a Bash command to its rtk equivalent (`git status` →
+`rtk git status`), rtk runs it, and only the filtered output reaches the model. Consequences:
+
+- **It rewrites the recorded actions.** `rtk hook claude` returns `updatedInput.command`, so
+  the transcript stores `rtk git status`, not `git status`. This is unique among the arms and
+  it is load-bearing: every command-shaped metric un-wraps first (`engine.unrtk`). Without
+  that, `rework_count` scores the arm a flawless **zero** on identical behaviour — its
+  read-only pattern is `^`-anchored so `rtk grep …` never matches, and it looks for
+  `cat`/`head`/`tail` by name while rtk renames all three to `rtk read`. That would be a
+  strawman *in RTK's favour*, the mirror image of the `headroom-kompress` warning above.
+- **`comp` should be substantial**, unlike caveman's ~0. It is attacking the part of the
+  prefix that is actually large.
+- **The risk to watch is information loss, not amnesia.** RTK's claim is "smaller context,
+  same signal" — it keeps failures and drops passing boilerplate. So `milestone` and solve
+  rate are the axes: a filter that ate the one line the agent needed shows up as a failed
+  task, not as a longer trajectory.
+
+```bash
+uv run minmax-bench quality run --arms rtk --tasks long           # full: pinned build per trial
+uv run minmax-bench quality incremental --arms rtk                # incremental: filters locally
+```
+
+**Silent-inactivity guard.** Structurally stronger than caveman's marker scan: an *active*
+trial stores the `rtk` prefix in the recorded `tool_use` itself, so the report flags any trial
+that issued Bash commands with none carrying it (`⚠ n inactive`). A trial that ran no Bash at
+all is not counted — having nothing to rewrite is a property of the task. Container-side, the
+agent smoke-tests both `rtk rewrite` and `rtk hook claude` and refuses to run if either stops
+rewriting. It deliberately wires the **native** `rtk hook claude` rather than upstream's
+`hooks/claude/rtk-rewrite.sh`, which shells out to `jq` and degrades to a silent no-op when jq
+is absent — precisely the failure that makes an arm measure nothing while scoring a clean pass.
+
+**In `quality incremental`, rtk filters the recorded output.** This is far simpler than
+caveman's replay, because the transform is deterministic and independent of anything the model
+says: the whole session is filtered **once** up front through `rtk pipe --filter <name>`, and
+the arm then teacher-forces its transformed history exactly like control teacher-forces the
+original. Same actions, same prose, same step set — only the observations are smaller — so the
+arm is paired with control step-for-step by construction. There is no free-running, no state
+machine, and none of caveman's prose/action stapling.
+
+Which commands rtk touches is decided by `rtk rewrite`, the same registry the hook delegates
+to, so incremental and full agree. The filter set is queried from the binary rather than
+hardcoded, so a pin bump can't silently rot it. A command with no rtk *pipe* filter (`rtk ls`
+has none) passes through verbatim rather than being faked, and a failed filter returns the text
+**unchanged** — dropping an observation would read as a spectacular saving while destroying the
+trajectory.
+
+Two caveats to read it honestly:
+
+- **`rtk pipe` post-filters, the hook replaces the command.** In real use rtk *runs* the
+  command and may pass different flags upstream (`--porcelain`); here it filters output the
+  unwrapped command produced. Same filter, slightly different input. `rtk pipe` is a
+  first-class rtk mode (`pytest | rtk pipe --filter pytest`), not an improvisation, which is
+  what makes the approximation defensible — but it is an approximation.
+- **Incremental uses your LOCAL rtk; full mode uses the pin.** The transform runs on this
+  machine (like condense's `dense` CLI), so if `rtk --version` differs from `v0.44.0` the two
+  legs ran different versions of the method under test. The run warns, `minmax-bench setup`
+  reports the alignment and offers to install/upgrade, and comparing rtk-vs-control *within*
+  one run is unaffected either way.
 
 ### caveman is a generation policy, not a history transform
 
@@ -210,7 +292,7 @@ before spending anything.
 | flag | meaning |
 |---|---|
 | `--tasks` | `N` = first N recommended \| `random:N` (with `--seed`) \| a group: `all`/`long`/`short`/`hard`/`medium` (`long` = author timeout ≥ 30m, biasing toward sessions long enough to compact) \| `a,b,c` by name \| omitted = 5. `--list-tasks` shows everything known. |
-| `--arms` | default `condense,headroom`; vanilla always included; also `headroom-kompress`, `vanilla-proxy`, `caveman` |
+| `--arms` | default `condense,headroom`; vanilla always included; also `headroom-kompress`, `vanilla-proxy`, `caveman`, `rtk` |
 | `-m/--model` | default `claude-sonnet-4-6` |
 | `-d/--dataset` | Harbor dataset; only `terminal-bench/terminal-bench-2-1` is validated so far |
 | `--k` | trials per arm/task (default 4); `--k-vanilla` defaults to k+1 — the extra noise-floor run sharpens every verdict |
@@ -261,7 +343,7 @@ condense arm sends your session content to `api.condense.chat`.
 
 | flag | meaning |
 |---|---|
-| `--arms` | default `condense`; also `headroom` (`--headroom-mode token|cache`, auto-starts/stops the proxy; `--ccr/--no-ccr` injects the retrieve loop via `headroom mcp serve` — `--no-ccr` = kompress); `caveman` (frozen rails, terse-prose drift, `--caveman-mode lite|full|ultra`) |
+| `--arms` | default `condense`; also `headroom` (`--headroom-mode token|cache`, auto-starts/stops the proxy; `--ccr/--no-ccr` injects the retrieve loop via `headroom mcp serve` — `--no-ccr` = kompress); `caveman` (frozen rails, terse-prose drift, `--caveman-mode lite|full|ultra`); `rtk` (filters the recorded tool output through `rtk pipe` — needs rtk installed locally) |
 | `-n/--limit` | max decision points, contiguous from the start (strided sampling was removed — it distorted cost/compaction numbers) |
 | `--budget-usd` | per-arm spend cap, control included (default 2.0) |
 | `--judge` | `off` \| `goal` (rate each action toward the task — robust, recommended) \| `equivalence` (upgrade grep-vs-rg near-misses to "agrees") |
@@ -372,6 +454,7 @@ on the analysis path).
 | `minmax_bench/counterfactual.py` | generate | the rich `quality incremental` front-end (picker, cost preview, summary table) |
 | `harbor_agents/headroom_ccr_claude_code.py` | generate | self-contained CCR wiring for the `headroom` arm (preserves base MCP servers) |
 | `harbor_agents/caveman_claude_code.py` | generate | pinned caveman install + activation smoke test for the full-mode `caveman` arm |
+| `harbor_agents/rtk_claude_code.py` | generate | pinned rtk binary install + PreToolUse hook wiring + rewrite smoke test for the `rtk` arm |
 | `data/caveman/ruleset-<mode>.txt` | generate | frozen SessionStart-hook rulesets injected by incremental caveman (pinned; see `data/caveman/PIN`) |
 | `tests/test_quality.py` | — | unit tests for the metric code (`uv run pytest`) |
 
