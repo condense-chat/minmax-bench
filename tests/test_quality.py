@@ -2441,3 +2441,24 @@ def test_rtk_apply_never_loses_an_observation():
     _rtk_or_skip()
     assert eng.rtk_apply("definitely-not-a-command --x", "payload") == ("payload", None)
     assert eng.rtk_read_file("payload", "a.py", ["--not-a-real-flag"]) == "payload"
+
+
+def test_rtk_awareness_file_is_frozen_at_the_same_pin():
+    """`rtk init -g` embeds hooks/claude/rtk-awareness.md into CLAUDE.md, so a faithful
+    install includes it — omitting it would measure a lighter rtk than a user actually runs.
+    The agent installs a release BINARY (not the repo), so the file is frozen on the host and
+    must not drift from the pin."""
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    txt = open(os.path.join(root, "data", "rtk", "awareness.md"), encoding="utf-8").read()
+    assert txt.strip() and "rtk" in txt.lower()
+    # it advertises analytics commands and delegates everything else to the hook — it does NOT
+    # redirect the model off the native Read tool, which is why it cannot lift rtk's ceiling
+    assert "rtk gain" in txt and "automatically rewritten" in txt.lower()
+    assert "Read tool" not in txt
+
+    pin = open(os.path.join(root, "data", "rtk", "PIN"), encoding="utf-8").read().strip()
+    ref, sha = re.match(r"(\S+)\s*\(([0-9a-f]{40})\)", pin).groups()
+    agent = open(os.path.join(root, "harbor_agents", "rtk_claude_code.py")).read()
+    assert re.search(r'RTK_REF\s*=\s*"([^"]+)"', agent).group(1) == ref
+    assert re.search(r'RTK_SHA\s*=\s*"([0-9a-f]{40})"', agent).group(1) == sha

@@ -162,6 +162,23 @@ uv run minmax-bench quality run --arms rtk --tasks long           # full: pinned
 uv run minmax-bench quality incremental --arms rtk                # incremental: filters locally
 ```
 
+**What rtk does and does not activate.** The hook fires on *every* Bash call, but
+`rtk rewrite` has no equivalent for most commands and passes them through — measured, **348 of
+2286 Bash commands (15%)** are actually rewritten on real sessions. rtk also ships a
+model-facing file (`hooks/claude/rtk-awareness.md`, embedded into CLAUDE.md by `rtk init -g`
+and frozen here at `data/rtk/awareness.md`). It is **not** a skill in caveman's sense: ~10
+lines advertising four analytics commands (`gain`/`discover`/`proxy`) plus "everything else is
+rewritten automatically". It never redirects the model off the native Read tool, so it does not
+lift the Bash-only ceiling — but it is installed, because a real `rtk init -g` installs it and
+those lines are a genuine (small) context cost the arm should carry.
+
+**Aggressiveness is not configurable through the hook.** Unlike caveman's `--caveman-mode`,
+rtk has no level knob the bench can set: `--level`/`--ultra-compact` are per-invocation flags,
+`src/core/config.rs` has no corresponding config key, and the hook emits bare commands. Setting
+one would require shimming `rtk` on PATH — i.e. benchmarking a wrapper the user would have to
+build — and it could not move the result anyway: the bytes that reach rtk at all total ~17kB
+against multi-million-token transcripts, so even deleting them outright is ~0.05%.
+
 **Silent-inactivity guard.** Structurally stronger than caveman's marker scan: an *active*
 trial stores the `rtk` prefix in the recorded `tool_use` itself, so the report flags any trial
 that issued Bash commands with none carrying it (`⚠ n inactive`). A trial that ran no Bash at
