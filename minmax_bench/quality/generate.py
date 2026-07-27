@@ -163,6 +163,15 @@ CAVEMAN_TARBALL_PROBE = (
     "https://codeload.github.com/JuliusBrussee/caveman/tar.gz/"
     "033f918602bd5319931256a537c4bd9ea7a48c25")
 
+# Kept in sync with harbor_agents/rtk_claude_code.py (same import barrier: that module imports
+# harbor, which lives in a separate uv tool env). Bumping the pin changes the METHOD under
+# test — and can add a command rename, which would skew rework/fidelity until engine's
+# RTK_ALIASES is updated (tests re-derive that table from the binary and fail on a drift).
+RTK_PIN = "v0.44.0"
+RTK_RELEASE_PROBE = (
+    "https://github.com/rtk-ai/rtk/releases/download/v0.44.0/"
+    "rtk-x86_64-unknown-linux-musl.tar.gz")
+
 # the harbor child currently running (for cleanup on interrupt) — a 1-slot box so
 # the signal handler / atexit reaper can terminate it before removing its network
 _HARBOR = [None]
@@ -250,6 +259,21 @@ def _arm_wiring(arm, env):
         return ("https://api.anthropic.com", "api.anthropic.com",
                 "harbor_agents.caveman_claude_code:CavemanClaudeCode",
                 ["--ae", f"TMB_CAVEMAN_MODE={env.get('TMB_CAVEMAN_MODE', 'full')}"])
+    if arm == "rtk":
+        # NOT a proxy: same endpoint as vanilla, all the way to api.anthropic.com. The
+        # intervention is entirely inside the container — a PreToolUse hook rewrites Bash
+        # commands to their rtk equivalents, and rtk filters the command's OUTPUT before the
+        # result reaches the model. So unlike caveman (which shrinks what the agent writes),
+        # rtk shrinks what it READS BACK — the tool I/O that actually dominates the prefix.
+        #
+        # allow-host stays api.anthropic.com ONLY, exactly like vanilla, even though the
+        # agent curls the pinned release asset from GitHub. That fetch happens in install(),
+        # which runs under the environment baseline rather than the agent-phase allowlist
+        # (the same reason headroom's `pip install headroom-ai` and caveman's tarball work).
+        # Adding github here would open it during agent RUN too, handing rtk network reach
+        # vanilla does not have on allowlisted tasks — an unfair capability difference.
+        return ("https://api.anthropic.com", "api.anthropic.com",
+                "harbor_agents.rtk_claude_code:RtkClaudeCode", [])
     sys.exit(f"unknown arm: {arm}")
 
 
@@ -527,6 +551,13 @@ def _preflight_full(arms, env):
         # setup on every cell. Non-fatal: the host may be firewalled where containers aren't.
         rows.append(("caveman tarball", _url_ok(CAVEMAN_TARBALL_PROBE),
                      f"github {CAVEMAN_PIN} reachable", False))
+    if "rtk" in arms:
+        # Each container downloads the pinned release asset itself; check reachability from
+        # the host as a cheap stand-in, so a deleted/retagged release surfaces now instead of
+        # failing agent setup on every cell. Non-fatal: the host may be firewalled where
+        # containers aren't.
+        rows.append(("rtk release", _url_ok(RTK_RELEASE_PROBE),
+                     f"github {RTK_PIN} reachable", False))
     return rows
 
 

@@ -437,6 +437,32 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
     if "caveman" in arms and cav_mode not in eng.CAVEMAN_MODES:
         console.print(f"[red]caveman mode {cav_mode!r} not in {eng.CAVEMAN_MODES}[/]")
         raise SystemExit(1)
+    # rtk's transform runs on the HOST (the recorded output is filtered through `rtk pipe`),
+    # unlike full mode where the container installs its own pinned binary. Fail here rather
+    # than silently replaying an untransformed session that would score as a perfect
+    # passthrough — the arm would look flawless while measuring nothing.
+    if "rtk" in arms:
+        rtk_ver = eng.rtk_version()
+        if not rtk_ver:
+            console.print("[red]the rtk arm needs the `rtk` binary locally[/] — incremental "
+                          "filters the RECORDED output through `rtk pipe`, which runs here, not "
+                          "in a container.\n  install it: [bold]brew install rtk[/] (or `uv run "
+                          "minmax-bench setup`), or set RTK_BIN to a binary path.")
+            raise SystemExit(1)
+        # Incremental filters with the HOST binary; full mode installs the pin in the
+        # container. If they differ, the two legs of one experiment ran different versions of
+        # the method under test — the confound the pin exists to prevent. Not fatal (the
+        # incremental run is still internally valid, control and rtk share the session), but
+        # it must never be silent, because cross-leg comparison is the usual reason to run both.
+        from minmax_bench.quality import generate as _gen  # local: gen is imported lazily below
+        pinned = _gen.RTK_PIN.lstrip("v")
+        if rtk_ver != pinned:
+            console.print(
+                f"[yellow]⚠ local rtk is {rtk_ver}, full mode pins {_gen.RTK_PIN}[/] — these "
+                f"incremental numbers are NOT directly comparable to a full-mode rtk run.\n"
+                f"  [dim]match them with `brew upgrade rtk` (or pin the agent to {rtk_ver}); "
+                f"comparing rtk-vs-control WITHIN this run is unaffected.[/]")
+        console.print(f"[dim]rtk {rtk_ver} — filtering recorded observations locally[/]")
     if auth == "subscription":
         # force the Claude Code login path even when an API key is configured
         # (.env or environment) — this is how you TEST the no-API-key experience
@@ -521,7 +547,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
             probe["system"] = tmpl_body["system"]
         # caveman rides control's transport, so probing it separately is redundant — dedupe
         # to the real endpoints so a caveman-only run still probes (via control) exactly once.
-        for arm in dict.fromkeys(eng.caveman_api_arm(a) for a in all_arms):
+        for arm in dict.fromkeys(eng.api_arm_for(a) for a in all_arms):
             _, err = eng.call_api(arm, probe, tmpl_headers, env)
             if err:
                 return arm, err
@@ -686,9 +712,31 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
     # the uncompressed/priciest-per-step arm, usually hits budget FIRST, so it defines the
     # shortest comparable window. Each later arm still stops at its OWN budget if that comes
     # first: min(control's steps, own budget), whichever is sooner.
+    # rtk's transform is DETERMINISTIC and independent of anything the model says, so the whole
+    # session is filtered ONCE here rather than step-by-step: the arm then teacher-forces its
+    # transformed history exactly like control teacher-forces the original. That is what makes
+    # this arm paired with control step-for-step by construction — same actions, same step set,
+    # only the observations are smaller.
+    rtk_msgs, rtk_stats = None, None
+    if "rtk" in arms:
+        with console.status("[cyan]rtk[/] filtering recorded tool output…"):
+            rtk_msgs, rtk_stats = eng.rtk_transform_session(msgs, points)
+        b0, b1 = rtk_stats["bytes_before"], rtk_stats["bytes_after"]
+        cut = f"{(1 - b1 / b0):.0%} smaller" if b0 else "nothing to filter"
+        console.print(
+            f"[dim]rtk:[/] filtered [bold]{rtk_stats['filtered']}[/] Bash observations "
+            f"({cut}), [dim]{rtk_stats['skipped']} had no rtk filter and passed through[/]")
+        if not rtk_stats["filtered"]:
+            console.print("[yellow]rtk changed nothing in this session[/] — no recorded command "
+                          "has an rtk pipe filter, so the arm is a guaranteed passthrough here. "
+                          "[dim]Pick a session with test/git/grep output.[/]")
+
     cap_steps = None
     for arm in all_arms:
         arm_sel = sel if cap_steps is None else sel[:cap_steps]
+        # the message list this arm replays against: rtk's is pre-filtered, everyone else
+        # teacher-forces the recording verbatim
+        arm_msgs = rtk_msgs if (arm == "rtk" and rtk_msgs is not None) else msgs
         path = inc_dir / f"{task}-{arm}.jsonl"
         done_path = inc_dir / f"{task}-{arm}.done"
         # resume: a clean completion writes a .done sentinel (below). On a re-run to the SAME
@@ -703,6 +751,11 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
         # control/condense/headroom to re-run and re-spend on resume.
         if arm == "caveman":
             cur_sig["caveman_mode"] = cav_mode
+        # rtk: a different binary filters differently, so a resumed rtk arm must re-run when
+        # the transform changed. Keyed on what the filtering actually produced (same reason
+        # caveman keys on its mode): same session + same bytes out = the same experiment.
+        if arm == "rtk" and rtk_stats:
+            cur_sig["rtk_bytes_after"] = rtk_stats["bytes_after"]
         if resume and done_path.exists() and path.exists():
             try:
                 saved = json.loads(done_path.read_text())
@@ -742,7 +795,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
         # context INSIDE that history (CavemanState.__init__ → caveman_inject), the way the
         # SessionStart hook does, so the system prompt is untouched.
         cav = eng.CavemanState(msgs, points, cav_mode) if arm == "caveman" else None
-        api_arm = eng.caveman_api_arm(arm)
+        api_arm = eng.api_arm_for(arm)
         with path.open("w") as f, Progress(
             TextColumn(f"[cyan]{arm:9}[/]"), BarColumn(),
             TextColumn("{task.completed}/{task.total} [dim]{task.fields[stat]}[/]"),
@@ -782,9 +835,10 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
                                                                    sid, tmpl_headers, env, mcp)
                         n_retrieves += nr
                     else:
-                        # caveman replays its OWN accumulated (terse) history; every other arm
-                        # teacher-forces the recorded prefix msgs[:i].
-                        prefix = cav.prefix() if cav is not None else msgs[:i]
+                        # caveman replays its OWN accumulated (terse) history; rtk teacher-
+                        # forces its pre-filtered history (arm_msgs); everyone else the
+                        # recorded prefix verbatim.
+                        prefix = cav.prefix() if cav is not None else arm_msgs[:i]
                         req = eng.build_request(tmpl_body, prefix, args, sid)
                         resp, err = eng.call_api(api_arm, req, tmpl_headers, env)
                     latency = time.monotonic() - t0
@@ -874,6 +928,11 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
                     before = cav.native
                     cav.advance(i, cav_rep, cav_matched)
                     rec["caveman_native"] = cav.native > before
+                # rtk's engagement is a SESSION-level fact (one deterministic transform up
+                # front), stamped on every step so the report can read it without depending on
+                # the .done sentinel, which only a clean completion writes.
+                if arm == "rtk" and rtk_stats:
+                    rec["rtk_filtered"] = rtk_stats["filtered"]
                 # accumulate what the ORIGINAL trajectory has now seen, so a later step that
                 # re-fetches it counts as redundant (compaction amnesia the arm should avoid)
                 _mark_seen(rec.get("orig"), seen_files, seen_cmds)
@@ -916,6 +975,14 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
             # ones where terse prose ends up beside an action it was not written for. Divergence
             # on a prose-only turn replaces the whole message, so it is clean signal.
             "caveman_stapled": (cav.stapled if cav is not None else None),
+            # rtk only: how many recorded Bash observations its filters actually shrank, how
+            # many had no rtk filter (passed through verbatim rather than faked), and the byte
+            # delta over the filtered ones. `filtered == 0` is the arm's inactivity signal —
+            # the incremental twin of full mode's "the hook never fired".
+            "rtk_filtered": (rtk_stats["filtered"] if arm == "rtk" and rtk_stats else None),
+            "rtk_skipped": (rtk_stats["skipped"] if arm == "rtk" and rtk_stats else None),
+            "rtk_bytes": ([rtk_stats["bytes_before"], rtk_stats["bytes_after"]]
+                          if arm == "rtk" and rtk_stats else None),
             "judge_usd": round(judge_spent, 4),
             # cost_usd is the arm's REPLAY spend only (judge cost is a measurement overhead,
             # reported separately) so the arm-vs-control $ comparison stays clean; the budget
