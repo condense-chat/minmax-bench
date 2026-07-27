@@ -172,12 +172,28 @@ rewritten automatically". It never redirects the model off the native Read tool,
 lift the Bash-only ceiling — but it is installed, because a real `rtk init -g` installs it and
 those lines are a genuine (small) context cost the arm should carry.
 
-**Aggressiveness is not configurable through the hook.** Unlike caveman's `--caveman-mode`,
-rtk has no level knob the bench can set: `--level`/`--ultra-compact` are per-invocation flags,
-`src/core/config.rs` has no corresponding config key, and the hook emits bare commands. Setting
-one would require shimming `rtk` on PATH — i.e. benchmarking a wrapper the user would have to
-build — and it could not move the result anyway: the bytes that reach rtk at all total ~17kB
-against multi-million-token transcripts, so even deleting them outright is ~0.05%.
+**Flagless rewriting is the whole product — confirmed against rtk's own docs.** Unlike
+caveman's `--caveman-mode`, rtk has no level knob the bench could set, and this is by design
+rather than an oversight: `docs/guide/getting-started/configuration.md` documents the config
+file, env vars (`RTK_DISABLED`, `RTK_TEE_DIR`, `RTK_TELEMETRY_DISABLED`, `RTK_HOOK_AUDIT`,
+`SKIP_ENV_VALIDATION`) and custom filters, and mentions no level/ultra/aggressive setting
+anywhere; `src/core/config.rs` has no such key; `--level`/`--ultra-compact` are per-invocation
+flags the hook never emits. rtk's own description of the intended use is *"You run them
+normally — the hook rewrites them transparently before execution."* So installing the hook and
+replacing commands **without flags is the organic configuration**, and that is exactly what
+both modes do. Adding a level would mean shimming `rtk` on PATH — benchmarking a wrapper the
+user would have to build — and could not move the result anyway: the bytes reaching rtk total
+~17kB against multi-million-token transcripts, so deleting them outright is ~0.05%.
+
+**Read rtk's headline numbers against the right denominator.** rtk claims 60-99% reduction
+(`git status` 75-93%, `git log` 80-92%), and its docs are careful about what that measures:
+*"Every percentage below measures bash output bytes removed — the only thing RTK controls.
+Those bytes are one contributor to input tokens."* That is consistent with everything here,
+not in tension with it: those percentages are of **bash output**, and on the Claude Code
+sessions measured bash is 13.4% of observation bytes (Read is 84.1%), with 15% of bash
+commands rewritten. So rtk's numbers can be entirely correct while the whole-session effect
+stays small — translating the former into the latter is precisely this bench's job, and full
+mode is what settles it.
 
 **Silent-inactivity guard.** Structurally stronger than caveman's marker scan: an *active*
 trial stores the `rtk` prefix in the recorded `tool_use` itself, so the report flags any trial
