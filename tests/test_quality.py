@@ -2392,3 +2392,17 @@ def test_rtk_inactive_warning_reaches_every_renderer():
     con = _C(file=__import__("io").StringIO(), width=200, force_terminal=False)
     report._full_table(con, d, "m")
     assert "without the skill" in con.file.getvalue(), "missing from console"
+
+
+def test_rtk_filter_handles_compound_commands():
+    """Agents write `cd <dir> && pytest -q` constantly, and rtk rewrites the INNER segment.
+    Requiring the rewrite to START with rtk missed all of them — on real sessions that was the
+    difference between 1% and 7% of Bash commands being transformable."""
+    _rtk_or_skip()
+    assert eng.rtk_filter_for("cd /tmp && pytest -q") == "pytest"
+    assert eng.rtk_filter_for("cd /a && cd /b && git status") == "git-status"
+    # several rtk calls in one pipeline: the recorded output is two commands' output
+    # concatenated and no single filter expresses that — skip rather than mangle it
+    assert eng.rtk_filter_for("ls && grep -rn x .") is None
+    assert eng.rtk_filter_for("pytest -q | head -20") is None
+    assert eng.rtk_filter_for("echo hi") is None

@@ -149,8 +149,9 @@ sampled. A `PreToolUse` hook rewrites a Bash command to its rtk equivalent (`git
   read-only pattern is `^`-anchored so `rtk grep …` never matches, and it looks for
   `cat`/`head`/`tail` by name while rtk renames all three to `rtk read`. That would be a
   strawman *in RTK's favour*, the mirror image of the `headroom-kompress` warning above.
-- **`comp` should be substantial**, unlike caveman's ~0. It is attacking the part of the
-  prefix that is actually large.
+- **In full mode `comp` should be substantial**, unlike caveman's ~0 — it is attacking the
+  part of the prefix that is actually large. Incremental is a different story; see the
+  coverage numbers below.
 - **The risk to watch is information loss, not amnesia.** RTK's claim is "smaller context,
   same signal" — it keeps failures and drops passing boilerplate. So `milestone` and solve
   rate are the axes: a filter that ate the one line the agent needed shows up as a failed
@@ -185,13 +186,31 @@ has none) passes through verbatim rather than being faked, and a failed filter r
 **unchanged** — dropping an observation would read as a spectacular saving while destroying the
 trajectory.
 
-Two caveats to read it honestly:
+Two caveats to read it honestly. Both are measured, not asserted — the numbers below come
+from 2286 Bash commands across six real recorded sessions, at the pinned rtk:
 
-- **`rtk pipe` post-filters, the hook replaces the command.** In real use rtk *runs* the
-  command and may pass different flags upstream (`--porcelain`); here it filters output the
-  unwrapped command produced. Same filter, slightly different input. `rtk pipe` is a
-  first-class rtk mode (`pytest | rtk pipe --filter pytest`), not an improvisation, which is
-  what makes the approximation defensible — but it is an approximation.
+- **Incremental reaches about half of what full mode does.** rtk *rewrites* 15% of those
+  Bash commands, but only 7% have a **pipe** filter — the pipe set (25 filters) is much
+  narrower than the rewrite set (100+ commands): `rtk ls`, `rtk read`, `rtk wc` and friends
+  have no pipe equivalent. So a low incremental `comp` is the arm's *coverage ceiling*, not
+  evidence that rtk doesn't work; full mode is where its real reach shows. The run prints
+  how many observations it filtered and how many passed through, and says so outright when
+  it filtered nothing.
+- **Where the filter is a pure post-processor, replay is EXACT — not an approximation.**
+  Verified byte-identical for `pytest` and `grep`. It diverges only where rtk re-invokes the
+  underlying tool with its own format: `git status` (hook 35B vs pipe 55B — it emits
+  `* branch / clean`, not a trimmed `git status`), `git log -5` (hook **1856B** vs pipe
+  227B), `git diff <ref>` (34517B vs 13544B). Note `git log` goes the *wrong way*: the real
+  hook produces more output than the pipe filter, so a git-heavy session could show a saving
+  that the real thing does not deliver. On the sessions measured this affects **19 of 170**
+  transformed observations (11%) — the other 89% are exact.
+
+  This gap is intrinsic, not an implementation shortcut: replay only holds the output of the
+  *original* command, and `rtk git log` runs git with its own `--format`, so those bytes were
+  never recorded. Re-executing locally would be worse — the repo has moved on since the
+  recording, so the rtk arm would see different underlying *facts* than control rather than
+  different formatting, breaking the pairing far more badly. **Full mode is the mode that
+  runs rtk for real**; that is the division of labour the two modes exist for.
 - **Incremental uses your LOCAL rtk; full mode uses the pin.** The transform runs on this
   machine (like condense's `dense` CLI), so if `rtk --version` differs from `v0.44.0` the two
   legs ran different versions of the method under test. The run warns, `minmax-bench setup`

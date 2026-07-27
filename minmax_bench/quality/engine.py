@@ -1002,6 +1002,8 @@ def unrtk(cmd):
 # unwrapped command. Same filter, slightly different input. Documented in docs/quality.md.
 RTK_BIN = os.environ.get("RTK_BIN", "rtk")
 _rtk_filters_cache: list = []
+# a single `|` (a real pipe), not the `||` operator
+_PIPE_INTO = re.compile(r"(?<!\|)\|(?!\|)")
 
 
 def rtk_version():
@@ -1047,7 +1049,15 @@ def rtk_filter_for(command):
     `rtk <subcommand path> <rest>`, and a filter is that path joined with '-' (git status ->
     git-status, cargo test -> cargo-test, pytest -> pytest); try longest first so `git log`
     picks git-log rather than a bare git. Not every rewritable command has a PIPE filter (rtk
-    ls has none), and those simply go untransformed rather than being faked.
+    ls has none), and those go untransformed rather than being faked.
+
+    Compound commands matter here, because agents write `cd <dir> && pytest -q` constantly:
+    rtk rewrites the INNER segment (`cd /tmp && rtk pytest -q`), so the rtk call is looked for
+    per segment rather than only at the start. When SEVERAL segments are rewritten
+    (`ls && grep x` -> `rtk ls && rtk grep x`) the recorded output is two commands' output
+    concatenated, and no single pipe filter can express that — so that returns None and the
+    observation is left alone. Skipping is the honest failure: a wrong filter would mangle a
+    real observation while reporting it as a saving.
     """
     try:
         p = subprocess.run([RTK_BIN, "rewrite", str(command)],
@@ -1057,15 +1067,23 @@ def rtk_filter_for(command):
     # 0 = rewrite (auto-allow), 3 = rewrite (ask); 1 = no rtk equivalent, 2 = denied
     if p.returncode not in (0, 3) or not p.stdout.strip():
         return None
-    toks = [t for t in p.stdout.split() if not t.startswith("-")]
-    if not toks or toks[0] != "rtk":
+    # A real pipe means the recorded output was post-processed by ANOTHER program
+    # (`pytest -q | head -20`), so it is not what the filter expects. rtk v0.44 declines to
+    # rewrite these itself; v0.43 rewrites them — refuse here so the arm behaves the same
+    # whichever binary is on the host.
+    if _PIPE_INTO.search(p.stdout):
         return None
-    path, avail = toks[1:], set(rtk_filters())
-    for n in range(len(path), 0, -1):
-        cand = "-".join(path[:n])
-        if cand in avail:
-            return cand
-    return None
+    avail, hits = set(rtk_filters()), []
+    for seg in _SEG_SPLIT.split(p.stdout):
+        toks = [t for t in seg.split() if not t.startswith("-")]
+        if not toks or toks[0] != "rtk":
+            continue
+        path = toks[1:]
+        hits.append(next((c for c in ("-".join(path[:n]) for n in range(len(path), 0, -1))
+                          if c in avail), None))
+    real = [h for h in hits if h]
+    # exactly one filterable rtk call in the pipeline, or nothing we can express
+    return real[0] if len(real) == 1 and len(hits) == 1 else None
 
 
 def rtk_pipe(text, filt, timeout=30):
