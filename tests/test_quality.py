@@ -668,10 +668,14 @@ def test_goal_mode_suppresses_the_same_action_verdict():
     # goal is the chosen metric: the same-action "below the floor → trajectory loss" verdict
     # (low same-action reads as failure) must NOT appear; the goal verdict must
     assert "trajectory loss" not in goal and "same action vs original" not in goal
-    assert "degrade" in goal  # the goal-based verdict line is present
+    assert "degrade" in goal                       # the goal-based verdict line is present
+    assert "goal-quality" in goal                  # the bottom line names the chosen metric
 
-    off = render("off")  # structural is the metric here, so the same-action verdict SHOULD show
-    assert "same action vs original" in off
+    # structural is the metric here: the bottom line reports it as same-action FIDELITY (the
+    # concise replacement for the old verbose "same action vs original → trajectory loss" prose)
+    off = render("off")
+    assert "same-action fidelity" in off and "faithful" in off
+    assert "trajectory loss" not in off            # still no scary verbose verdict
 
 
 def test_ccr_step_executes_retrieve_then_scores_the_real_action(monkeypatch):

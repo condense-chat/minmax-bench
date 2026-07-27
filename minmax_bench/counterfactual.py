@@ -1035,6 +1035,46 @@ def _render_bottom_line(summary, console, common, ctrl, ctrl_c, floor, is_goal, 
             console.print(ln)
 
 
+def _render_incr_clean(summary, console, model):
+    """The clean per-step table — the SAME one `quality report` / the view wizard (option 3)
+    shows. Rendered from the just-written jsonl via the report helpers so the end-of-run view
+    and the stored-run view never drift. Columns are deltas vs control (+ = better); the raw
+    absolutes (avg ctx tokens, cost $, reached, errors) are intentionally omitted — the delta
+    table plus the bottom line carry the signal."""
+    import os
+
+    from minmax_bench.quality import report as rpt
+    files = [a["file"] for a in summary["arms"].values() if a.get("file")]
+    if not files:
+        return
+    root = os.path.dirname(os.path.dirname(files[0]))          # <out>/incremental/<f> -> <out>
+    arms = [a for a in summary["arms"] if a != "control"]
+    incr = rpt._load_incremental(root, arms)
+    if not incr:
+        return
+    task = next(t for (t, _a) in incr)                        # one session -> one task label
+    ref = next(iter(incr.values()))
+    floor, lat0 = ref.get("fid_ctrl"), ref.get("latency_ctrl")
+    scoring = ref.get("scoring") or "—"
+    t = Table(title="[bold]incremental (teacher-forced per-step)"
+                    + (f" · {model}" if model else "") + "[/]")
+    t.add_column("arm", no_wrap=True)
+    t.add_column("scoring", no_wrap=True)
+    for c in ("compaction %", "faithful", "$ savings", "speed up"):
+        t.add_column(c, justify="center" if c == "faithful" else "right")
+    t.add_row("control", scoring, "—",
+              f"[dim]100% ({floor:.0%})[/]" if floor is not None else "—",
+              "—", f"[dim]{lat0:.1f}s[/]" if lat0 else "—")
+    for arm in arms:
+        inc = incr.get((task, arm))
+        if not inc or inc.get("fid") is None:
+            t.add_row(arm, "", "—", "—", "—", "—")
+            continue
+        faith, cost = rpt._faithful_cost({"incr": inc}, floor)
+        t.add_row(arm, "", rpt._comp_cell(inc), faith, cost, rpt._latency_cell(inc))
+    console.print(t)
+
+
 def render_summary(summary: dict, console: Console) -> None:
     ctrl = summary["arms"].get("control", {})
     common = _common_steps(summary["arms"])
@@ -1045,197 +1085,32 @@ def render_summary(summary: dict, console: Console) -> None:
     if is_goal:
         console.print("[bold]HEADLINE — goal-based quality (judge=goal)[/]")
         _render_goal_quality(summary, console, common)
-        console.print("[dim]— secondary: structural agreement vs the original trajectory —[/]")
     ctrl_c = _over(ctrl, common)
     floor = (ctrl_c["agree"] if ctrl_c else
              ctrl.get("agree_action", 0) / ctrl["steps_ok"] if ctrl.get("steps_ok") else None)
-    # the comparison window is capped at the fewest steps any arm reached — an arm that
-    # hits its budget stops there, and comparing past that point is apples-to-oranges
-    reaches = {arm: a.get("steps_ok", 0) for arm, a in summary["arms"].items() if a.get("by_step")}
     cap_n = len(common)
-    capper = min(reaches, key=reaches.get) if reaches else None
-    capped = capper and len(set(reaches.values())) > 1
-    # name the cap by its ACTUAL cause — a rate-limit / out-of-credits API error is not a
-    # budget cap, and calling it one is exactly the misattribution to avoid
-    cap_reason = (summary["arms"].get(capper, {}).get("stop_reason", "budget")
-                  if capper else "budget")
-    cap_txt = (f", where {capper} stopped ({_STOP_LABEL.get(cap_reason, cap_reason)})"
-               if capped else "")
-    t = Table(title=f"[bold]incremental — {Path(summary['session']).name} "
-                    f"({summary['model']}, {summary['steps']} decision points; "
-                    f"all deltas over the first {cap_n} steps{cap_txt})")
-    for col in ("arm", "reached", "errors", "vs original", "exact", "avg ctx tokens",
-                "ctx vs control", "cost", "$ vs control", "s/step"):
-        t.add_column(col, justify="right" if col != "arm" else "left")
-    rec = summary.get("recorded")
-    if rec:
-        t.add_row("[dim]recorded*[/]", f"[dim]{rec['steps']}[/]", "[dim]—[/]", "[dim]—[/]",
-                  "[dim]—[/]", f"[dim]{rec['avg_ctx_tokens']:,}[/]", "[dim]—[/]",
-                  f"[dim]${rec['cost_usd']:.2f}[/]", "[dim]—[/]", "[dim]—[/]")
-    for arm, a in summary["arms"].items():
-        n = a["steps_ok"]
-        # vs-original agreement and the vs-control deltas are all computed over the COMMON
-        # steps (fair); the 'steps' column still shows each arm's OWN reach so you can see
-        # who stopped early. avg ctx / cost columns are each arm's own totals (context).
-        ac = _over(a, common)
-        if ac and ctrl_c:  # fair: common steps
-            agree = ac["agree"]
-            comp = 1 - ac["ctx"] / ctrl_c["ctx"] if arm != "control" and ctrl_c["ctx"] else None
-            costd = 1 - ac["cost"] / ctrl_c["cost"] if arm != "control" and ctrl_c["cost"] else None
-        else:  # fallback: no by_step (old artifact) -> each arm's own aggregates
-            agree = a["agree_action"] / n if n else None
-            comp = (1 - a["avg_ctx_tokens"] / ctrl["avg_ctx_tokens"]
-                    if arm != "control" and ctrl.get("avg_ctx_tokens") else None)
-            costd = (1 - a["cost_usd"] / ctrl["cost_usd"]
-                     if arm != "control" and ctrl.get("cost_usd") else None)
-        errs = a.get("errors", 0)
-        # colour each arm's vs-original agreement AGAINST the control floor: at/above the
-        # floor is green (no measurable loss), below is red. control itself is the floor.
-        # BUT when judge=goal, same-action is NOT the chosen metric (goal-quality is the
-        # headline table above), so show it as neutral data — never red-flag it, or a low
-        # same-action reads as a failure when the goal verdict was actually a pass.
-        if agree is None:
-            agree_cell = "—"
-        elif arm == "control":
-            agree_cell = f"[dim]{agree:.0%} (floor)[/]"
-        elif is_goal:
-            agree_cell = f"[dim]{agree:.0%}[/]"
-        elif floor is not None:
-            agree_cell = (f"[green]{agree:.0%}[/]" if agree >= floor - 0.02
-                          else f"[red]{agree:.0%}[/]")
-        else:
-            agree_cell = f"{agree:.0%}"
-        # ctx/cost cells use the common-step aggregates when available, so they reconcile
-        # with the deltas beside them (else an arm that ran longer shows a bigger total that
-        # contradicts a per-step saving). The 'steps' column shows the arm's own reach.
-        ctx_cell = f"{round(ac['ctx']):,}" if ac else f"{a['avg_ctx_tokens']:,}"
-        cost_cell = f"${ac['cost']:.2f}" if ac else f"${a['cost_usd']:.2f}"
-        # 'reached' = how far this arm got; mark the arm that capped the window, labelled by
-        # its real stop cause (budget vs a rate-limit / out-of-credits API error)
-        reason = a.get("stop_reason", "complete")
-        reached_cell = (f"[yellow]{n} ◀ {_STOP_LABEL.get(reason, reason)}[/]"
-                        if capper == arm and len(set(reaches.values())) > 1 else str(n))
-        # per-step wall-clock: common-step aggregate, else the arm's own average (old artifacts
-        # have no by_step latency); compaction (esp. condense-sync) and CCR round-trips add to it
-        lat = (ac.get("latency") if ac else None) or a.get("avg_latency_s") or None
-        lat_cell = f"{lat:.1f}s" if lat else "—"
-        # 'vs original' and 'exact' are STRUCTURAL same-action metrics; under --judge goal they
-        # are not the chosen metric (goal-quality is the headline table above), so dim both so
-        # a bright 'exact' isn't mistaken for the verdict.
-        exact_val = f"{a['agree_exact'] / n:.0%}" if n else "—"
-        exact_cell = f"[dim]{exact_val}[/]" if is_goal else exact_val
-        t.add_row(
-            arm, reached_cell, f"[red]{errs}[/]" if errs else "0",
-            agree_cell,
-            exact_cell,
-            ctx_cell,
-            f"{comp:+.0%}" if comp is not None else "—",
-            cost_cell,
-            f"{costd:+.0%}" if costd is not None else "—",
-            lat_cell,
-        )
-    console.print(t)
+    # clean per-step table — the SAME view `quality report` / option 3 (view) shows: deltas
+    # vs control only, no raw absolutes.
+    _render_incr_clean(summary, console, summary.get("model"))
     _render_bottom_line(summary, console, common, ctrl, ctrl_c, floor, is_goal, cap_n)
-    # if arms stopped at different depths (an arm hit its budget / error-bailed), say so —
-    # the deltas above use the common steps, but the reader should see who stopped short
+    # concise notes only (the verbose explanations were dropped to keep the end-of-run clean):
+    # who stopped early (not in the delta table), any total failures, and the judge spend.
     reach = {arm: a.get("steps_ok", 0) for arm, a in summary["arms"].items() if a.get("by_step")}
     if reach and len(set(reach.values())) > 1:
         short = min(reach, key=reach.get)
         sr = summary["arms"].get(short, {}).get("stop_reason", "budget")
-        cause = _STOP_LABEL.get(sr, sr)
-        # if the short arm bailed on an API error (rate-limit / credits) it was NOT out of
-        # budget — surface the real reason and, where relevant, the underlying error line
-        api_err = sr in ("rate-limited", "out of credits", "unreachable")
-        errline = summary["arms"][short].get("first_error", "")[:140]
-        detail = f" [dim]{errline}[/]" if api_err else ""
-        console.print(f"[yellow]note:[/] arms stopped at different depths "
-                      f"({', '.join(f'{k} {v}' for k, v in reach.items())}) — "
-                      f"[bold]{short}[/] stopped ([bold]{cause}[/]).{detail} All vs-control deltas "
-                      f"use the {len(common)} steps every arm reached, so they stay "
-                      f"apples-to-apples.")
+        console.print(f"[dim]note: arms reached different depths "
+                      f"({', '.join(f'{k} {v}' for k, v in reach.items())}); {short} stopped "
+                      f"({_STOP_LABEL.get(sr, sr)}). Deltas use the {cap_n} common steps.[/]")
     for arm, a in summary["arms"].items():
-        if arm != "headroom" or not a.get("by_step"):
-            continue
-        if a.get("ccr"):
-            nr = a.get("ccr_retrieves", 0)
-            console.print(f"[cyan]headroom: CCR retrieve loop engaged[/] — "
-                          f"{nr} headroom_retrieve call(s) executed via mcp serve, "
-                          f"counted as steps and billed into cost (CCR's overhead).")
-        else:
-            console.print("[yellow]headroom ran as kompress[/] (retrieve loop unavailable) — "
-                          "compression without retrieval. For headroom with CCR, use full mode "
-                          "(`quality run`), or check the mcp serve log.")
+        if arm != "control" and not a.get("steps_ok"):
+            console.print(f"[red]{arm} FAILED every step ({a.get('errors', 0)} errors)[/] — "
+                          f"first error: {a.get('first_error', '?')}")
     judge_total = sum(a.get("judge_usd", 0.0) for a in summary["arms"].values())
     if judge_total:
-        console.print(f"[dim]LLM judge ({summary.get('judge')}): [bold]${judge_total:.2f}[/] "
-                      f"total across arms (haiku, per step) — billed against the budget cap, "
-                      f"excluded from the arm cost columns above.[/]")
-    if floor is not None:
-        label = "(secondary — structural) " if is_goal else ""
-        console.print(f"[dim]{label}the control arm runs the SAME session with NO compaction; its "
-                      f"{floor:.0%} agreement with the original is the NOISE FLOOR (sampling + "
-                      f"free-running divergence), not 100%. An arm only loses the trajectory to "
-                      f"the extent it falls below it; a few points on <30 steps is noise.[/]")
-    ctrl_series = ctrl.get("ctx_series") or []
-    for arm, a in summary["arms"].items():
-        if arm == "control":
-            continue
-        if not a.get("steps_ok"):
-            console.print(f"[red]{arm} FAILED every step ({a.get('errors', 0)} errors)[/] — "
-                          f"no verdict is possible. First error: {a.get('first_error', '?')}")
-            continue
-        # headline verdict: the arm's vs-original agreement against the control floor.
-        # SKIP it entirely when judge=goal — same-action is not the chosen metric there and
-        # is expected to be low even for control, so "-23% below the floor → trajectory loss"
-        # is actively misleading. The goal-based verdict (_render_goal_quality) is the headline.
-        _ac = _over(a, common)
-        agree = _ac["agree"] if _ac else a["agree_action"] / a["steps_ok"]
-        if floor is not None and not is_goal:
-            delta = agree - floor
-            if delta >= -0.02:
-                verdict = ("[green]at/above the noise floor → no measurable trajectory loss[/]")
-            else:
-                verdict = (f"[red]{delta:+.0%} below the floor → possible trajectory loss[/]")
-            console.print(f"[bold]{arm}[/]  same action vs original [bold]{agree:.0%}[/]  "
-                          f"vs control floor {floor:.0%}   →   {verdict}")
-        if not ctrl_series:
-            continue
-        series = a.get("ctx_series") or []
-        pairs = list(zip(series, ctrl_series, strict=False))
-        onset = next((i for i, (x, c) in enumerate(pairs) if c and x < c * 0.9), None)
-        if onset is None:
-            console.print(
-                f"[dim]  └ {arm} never compacted this session (context matched control at "
-                f"every step) — a passthrough below its trigger, so the delta is sampling "
-                f"noise, not a compaction effect.[/]")
-        else:
-            deepest = max((1 - x / c) for x, c in pairs[onset:] if c)
-            console.print(
-                f"[dim]  └ {arm} compacted from step {onset} (context −{deepest:.0%} vs "
-                f"control at the deepest point) — the delta from step {onset} on is real "
-                f"compaction.[/]")
-    if rec:
-        console.print(
-            "[dim]* recorded = what these turns actually consumed when the session ran (its own "
-            "model + live caching); the incremental rows re-ran the same turns fresh, so compare "
-            "arms to control for the incremental comparison and to recorded for the backtest "
-            "anchor.[/]")
-        # replays reconstruct only the tools the session references; the original CC
-        # requests also carried the full system prompt + available tool/MCP catalog
-        # (mostly unused). When that overhead is large the recorded row dwarfs the
-        # replay rows in absolute terms — flag it so the anchor isn't misread.
-        rc = rec.get("avg_ctx_tokens", 0)
-        cc = ctrl.get("avg_ctx_tokens", 0)
-        if rc and cc and cc < 0.75 * rc:
-            console.print(
-                f"[yellow]note:[/] replay context ({cc:,} avg) is well below recorded "
-                f"({rc:,}) — this session's original requests carried a large fixed "
-                f"overhead (system prompt + full tool/MCP catalog) the replay can't "
-                f"reconstruct. The arm-vs-control comparison is unaffected, but don't "
-                f"read absolute cost against the recorded anchor here.")
+        console.print(f"[dim]LLM judge ({summary.get('judge')}): ${judge_total:.2f} total "
+                      f"(billed to the budget, excluded from the cost column).[/]")
 
-
-# --------------------------------------------------------------------------- per-step view
 _CAT_STYLE = {"good": ("green", "✓ good"), "semi": ("yellow", "◐ semi"),
               "bad": ("red", "✗ bad"), "err": ("dim", "· err")}
 _REDUND_RE = re.compile(r"\b(cat|head|tail|less|more|bat|sed -n|nl|grep|rg)\b")
