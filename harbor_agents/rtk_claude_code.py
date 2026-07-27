@@ -34,6 +34,7 @@ Run via:  -a harbor_agents.rtk_claude_code:RtkClaudeCode
 """
 from __future__ import annotations
 
+import os
 import shlex
 
 from harbor.agents.installed.claude_code import ClaudeCode
@@ -60,6 +61,20 @@ RTK_ASSETS = {
 # absolute during setup.
 RTK_BIN_DIR = "$HOME/.local/bin"
 RTK_BIN = f"{RTK_BIN_DIR}/rtk"
+
+
+def _awareness_text() -> str:
+    """rtk's model-facing instructions, frozen at the pin (data/rtk/awareness.md).
+
+    This is what `rtk init -g` embeds into CLAUDE.md. Read from disk rather than inlined so a
+    pin bump is a file swap, and so the exact bytes are reviewable next to data/rtk/PIN.
+    """
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(here, "data", "rtk", "awareness.md"), encoding="utf-8") as fh:
+        text = fh.read()
+    if "rtk" not in text.lower():
+        raise RuntimeError("data/rtk/awareness.md looks empty/stale — regenerate it")
+    return text
 
 
 class RtkClaudeCode(ClaudeCode):
@@ -112,6 +127,19 @@ class RtkClaudeCode(ClaudeCode):
         base = super()._build_register_skills_command()
         settings = f"node -e {shlex.quote(self._settings_script())}"
 
+        # `rtk init -g` installs the hook AND embeds hooks/claude/rtk-awareness.md into
+        # CLAUDE.md, so a faithful install includes it. It is NOT a skill in caveman's sense —
+        # ~10 lines advertising four ANALYTICS commands (gain/discover/proxy) plus "everything
+        # else is rewritten automatically". It never redirects the model away from the native
+        # Read tool, so it does not lift rtk's Bash-only ceiling. Installed anyway for
+        # faithfulness, and because it is a real (small) context cost the arm should carry:
+        # omitting it would quietly measure a lighter rtk than a user actually runs.
+        # Frozen at data/rtk/awareness.md rather than re-fetched: this agent installs a release
+        # BINARY, not the repo, so the file is captured on the host at the same pin.
+        awareness = (
+            f"printf '%s' {shlex.quote(_awareness_text())} > $CLAUDE_CONFIG_DIR/CLAUDE.md"
+        )
+
         # Smoke test: a hook that never fires makes this arm identical to vanilla while
         # scoring a clean "trajectory preserved". Assert on the real rewrite engine (`rtk
         # rewrite`, the single source of truth the hook delegates to) AND on the hook
@@ -132,7 +160,7 @@ class RtkClaudeCode(ClaudeCode):
             f'echo "rtk {RTK_REF} active (PreToolUse hook wired)"'
         )
 
-        parts = [p for p in (base, settings, verify) if p]
+        parts = [p for p in (base, settings, awareness, verify) if p]
         return " && ".join(parts)
 
     def _settings_script(self) -> str:
