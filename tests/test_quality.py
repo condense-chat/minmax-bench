@@ -1869,7 +1869,7 @@ def test_rtk_transform_shrinks_observations_and_touches_nothing_else():
     assert msgs == before, "the source session must not be mutated"
     assert len(new) == len(msgs), "step count changed"
     assert stats["filtered"] == 1 and stats["bytes_after"] < stats["bytes_before"]
-    assert stats["filters"] == {"pytest": 1}
+    assert stats["modes"] == {"pipe": 1}
     # the pytest observation shrank...
     assert len(new[2]["content"][0]["content"]) < len(_PYTEST_OUT)
     assert "failed" in new[2]["content"][0]["content"].lower(), "the failure must survive"
@@ -2121,3 +2121,38 @@ def test_rtk_filter_handles_compound_commands():
     assert eng.rtk_filter_for("ls && grep -rn x .") is None
     assert eng.rtk_filter_for("pytest -q | head -20") is None
     assert eng.rtk_filter_for("echo hi") is None
+
+
+def test_rtk_apply_runs_the_real_command_for_file_reads():
+    """The proper swap-out: for a file read the recorded output IS the file's content, so it
+    is materialized and the ACTUAL rtk command runs on it — exact, and reaching commands no
+    pipe filter covers. Falls back to pipe only where post-processing stdout is genuinely
+    rtk's mechanism, and leaves the observation verbatim when neither applies."""
+    _rtk_or_skip()
+    src = "\n".join(f"line {i}" for i in range(200))
+
+    out, mode = eng.rtk_apply("head -40 a.py", src)
+    assert mode == "read" and len(out) < len(src), "real `rtk read --max-lines` did not apply"
+    out2, mode2 = eng.rtk_apply("cd /proj && head -40 a.py", src)
+    assert mode2 == "read" and out2 == out, "compound command took a different path"
+
+    # `cat x` rewrites to a BARE `rtk read x`, whose default level is full content. Returning
+    # it unchanged is the faithful answer — passing --level aggressive would cut ~94% but
+    # would be measuring a method rtk's hook does not implement.
+    out3, mode3 = eng.rtk_apply("cat a.py", src)
+    assert mode3 == "read" and out3 == src
+
+    # inputs that cannot be reconstructed from a transcript are left alone, not faked
+    for cmd in ("ls -la", "cat a.py b.py", "ls && cat a.py", "echo hi"):
+        outn, moden = eng.rtk_apply(cmd, src)
+        assert moden is None and outn == src, cmd
+    # stdout post-processing still routes to pipe
+    assert eng.rtk_apply("pytest -q", "1 failed, 2 passed in 0.05s")[1] == "pipe"
+
+
+def test_rtk_apply_never_loses_an_observation():
+    """Every failure path returns the recorded text unchanged. Dropping an observation would
+    read as a spectacular saving while destroying the trajectory."""
+    _rtk_or_skip()
+    assert eng.rtk_apply("definitely-not-a-command --x", "payload") == ("payload", None)
+    assert eng.rtk_read_file("payload", "a.py", ["--not-a-real-flag"]) == "payload"

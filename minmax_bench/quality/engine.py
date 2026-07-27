@@ -23,6 +23,7 @@ Template = a real CC request captured via a local recording server (has the
 version-matched system prompt, tools, beta headers, thinking/context_management
 config). mcp__* tools are dropped by default (container runs had plain CC tools).
 """
+import contextlib
 import copy
 import difflib
 import json
@@ -1046,22 +1047,20 @@ def rtk_filter_for(command):
     observation is left alone. Skipping is the honest failure: a wrong filter would mangle a
     real observation while reporting it as a saving.
     """
-    try:
-        p = subprocess.run([RTK_BIN, "rewrite", str(command)],
-                           capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    # 0 = rewrite (auto-allow), 3 = rewrite (ask); 1 = no rtk equivalent, 2 = denied
-    if p.returncode not in (0, 3) or not p.stdout.strip():
-        return None
+    rew = rtk_rewrite(command)
+    return _rtk_pipe_filter(rew) if rew else None
+
+
+def _rtk_pipe_filter(rewritten):
+    """The pipe filter for an already-rewritten command (see rtk_filter_for for the rules)."""
     # A real pipe means the recorded output was post-processed by ANOTHER program
     # (`pytest -q | head -20`), so it is not what the filter expects. rtk v0.44 declines to
     # rewrite these itself; v0.43 rewrites them — refuse here so the arm behaves the same
     # whichever binary is on the host.
-    if _PIPE_INTO.search(p.stdout):
+    if _PIPE_INTO.search(rewritten):
         return None
     avail, hits = set(rtk_filters()), []
-    for seg in _SEG_SPLIT.split(p.stdout):
+    for seg in _SEG_SPLIT.split(rewritten):
         toks = [t for t in seg.split() if not t.startswith("-")]
         if not toks or toks[0] != "rtk":
             continue
@@ -1071,6 +1070,123 @@ def rtk_filter_for(command):
     real = [h for h in hits if h]
     # exactly one filterable rtk call in the pipeline, or nothing we can express
     return real[0] if len(real) == 1 and len(hits) == 1 else None
+
+
+def rtk_rewrite(command):
+    """What rtk's PreToolUse hook would rewrite ``command`` to, or None if it has no
+    equivalent. This is the registry the hook itself delegates to, so it is the ground truth
+    for WHICH commands rtk touches — full and incremental agree by construction."""
+    try:
+        p = subprocess.run([RTK_BIN, "rewrite", str(command)],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # 0 = rewrite (auto-allow), 3 = rewrite (ask); 1 = no rtk equivalent, 2 = denied
+    if p.returncode not in (0, 3) or not p.stdout.strip():
+        return None
+    return p.stdout.strip()
+
+
+def _rtk_read_call(rewritten):
+    """Parse `rtk read <path> [flags]` out of a rewritten command -> (path, flags), else None.
+
+    This is the branch that lets replay run the REAL rtk command instead of approximating it:
+    for a file read the recorded output IS the file's content, so it can be materialized and
+    handed to rtk verbatim. Only a single-path read qualifies — `rtk read a.py b.py` produces
+    output for two files that the recording concatenated, and splitting that back apart would
+    be guesswork.
+    """
+    import shlex
+    if _PIPE_INTO.search(rewritten):
+        return None                    # output was post-processed by another program
+    # scan SEGMENTS, not just the head: agents write `cd <dir> && cat x` constantly and rtk
+    # rewrites the inner segment. More than one rtk call means several commands' output was
+    # concatenated into this observation — not reconstructable, so decline.
+    segs = [s for s in _SEG_SPLIT.split(rewritten) if s.split()[:1] == ["rtk"]]
+    if len(segs) != 1:
+        return None
+    try:
+        toks = shlex.split(segs[0])
+    except ValueError:
+        return None
+    if len(toks) < 3 or toks[1] != "read":
+        return None
+    rest = toks[2:]
+    paths = [t for t in rest if not t.startswith("-")]
+    # `rtk read a.py --max-lines 20`: the path leads, flag VALUES follow their flag
+    if not paths or rest[0].startswith("-"):
+        return None
+    path, flags = rest[0], rest[1:]
+    if any(not t.startswith("-") and t != path and rest[rest.index(t) - 1][:1] != "-"
+           for t in paths if t != path):
+        return None          # a second bare path — two files, can't reconstruct
+    return path, flags
+
+
+def rtk_read_file(content, path, flags, timeout=30):
+    """Run the REAL `rtk read` against recorded file content.
+
+    The content is materialized under the ORIGINAL file's extension, because rtk's read
+    filters are type-aware — handing it a suffix-less temp file would measure a different
+    code path than the one a real run takes.
+
+    Note what is deliberately NOT done: no `--level` is added. The hook rewrites `cat a.py`
+    to a bare `rtk read a.py`, whose default level is "none" (full content) — so this usually
+    returns the content unchanged, and that IS the faithful answer. Passing `--level
+    aggressive` would cut ~94%, but it would be measuring a method rtk's hook does not
+    implement.
+    """
+    import tempfile
+    suffix = os.path.splitext(path)[1] or ".txt"
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False,
+                                         encoding="utf-8") as fh:
+            fh.write(str(content))
+            tmp = fh.name
+        p = subprocess.run([RTK_BIN, "read", tmp, *flags],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return str(content)
+    finally:
+        if tmp:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+    if p.returncode != 0 or not p.stdout.strip():
+        return str(content)
+    # rtk prints the temp path in its header; put the real one back so the observation reads
+    # exactly as it would have in the container
+    return p.stdout.replace(os.path.basename(tmp), os.path.basename(path)).replace(tmp, path)
+
+
+def rtk_apply(command, recorded_output):
+    """Apply rtk to one recorded observation -> (output, mode).
+
+    Prefers running the REAL rtk command over approximating it:
+
+      'read' — a file read (`cat`/`head`/`tail` -> `rtk read`). The recorded output is the
+               file's content, so it is materialized and the actual rtk command runs on it.
+               Exact, and covers commands no pipe filter reaches.
+      'pipe' — rtk post-processes the command's stdout (`pytest`, `grep`, …). Exact where
+               that is genuinely rtk's mechanism; approximate for the few commands where rtk
+               re-invokes the tool with its own format (`git log`, `git status`).
+      None   — rtk has no equivalent, or its input cannot be reconstructed from a transcript
+               (`rtk ls`, `rtk wc` need a real filesystem). The observation is left verbatim.
+
+    Returning the recorded text unchanged on every failure path is deliberate: dropping an
+    observation would read as a spectacular saving while destroying the trajectory.
+    """
+    rew = rtk_rewrite(unrtk(command))
+    if not rew:
+        return str(recorded_output), None
+    spec = _rtk_read_call(rew)
+    if spec:
+        path, flags = spec
+        return rtk_read_file(recorded_output, path, flags), "read"
+    filt = _rtk_pipe_filter(rew)
+    if filt:
+        return rtk_pipe(recorded_output, filt), "pipe"
+    return str(recorded_output), None
 
 
 def rtk_pipe(text, filt, timeout=30):
@@ -1170,9 +1286,11 @@ def rtk_transform_session(msgs, points=None):
     """Apply RTK to a recorded session: shrink Bash tool_result content, touch nothing else.
 
     Returns ``(new_msgs, stats)`` — a NEW message list (the input is not mutated) plus
-    {'filtered', 'skipped', 'bytes_before', 'bytes_after', 'filters'}. ``filtered`` counts
-    observations rtk actually shrank; ``skipped`` counts Bash results rtk had no filter for
-    (rtk ls has no pipe filter) — those pass through verbatim rather than being faked.
+    {'filtered', 'skipped', 'bytes_before', 'bytes_after', 'modes'}. ``filtered`` counts
+    observations rtk actually shrank; ``skipped`` counts Bash results whose rtk input could
+    not be reconstructed from a transcript (`rtk ls` needs a real filesystem) — those pass
+    through verbatim rather than being faked. ``modes`` splits the applied ones by HOW rtk was
+    run: 'read' ran the real command against materialized content, 'pipe' post-filtered.
 
     Only Bash tool_use results are candidates: rtk wraps shell commands, so a Read/Edit result
     is none of its business. The action, its arguments, the prose and the step set are all
@@ -1180,7 +1298,7 @@ def rtk_transform_session(msgs, points=None):
     """
     out = copy.deepcopy(list(msgs))
     cmd_by_id, stats = {}, {"filtered": 0, "skipped": 0, "bytes_before": 0, "bytes_after": 0,
-                            "filters": {}}
+                            "modes": {}}
     for m in out:
         content = m.get("content")
         if not isinstance(content, list):
@@ -1201,16 +1319,16 @@ def rtk_transform_session(msgs, points=None):
             before = _result_text(b)
             if not before.strip():
                 continue
-            # unrtk first: a session recorded by someone already running rtk stores the
-            # WRAPPED command, and `rtk rewrite` on an already-rewritten command is a no-op.
-            filt = rtk_filter_for(unrtk(cmd))
-            if not filt:
+            # rtk_apply runs the REAL rtk command wherever its input can be reconstructed
+            # (file reads, via the recorded content) and falls back to pipe-filtering only
+            # where post-processing stdout is genuinely rtk's mechanism.
+            after, mode = rtk_apply(cmd, before)
+            if mode is None:
                 stats["skipped"] += 1
                 continue
-            after = rtk_pipe(before, filt)
             stats["bytes_before"] += len(before)
             stats["bytes_after"] += len(after)
-            stats["filters"][filt] = stats["filters"].get(filt, 0) + 1
+            stats["modes"][mode] = stats["modes"].get(mode, 0) + 1
             if after != before:
                 stats["filtered"] += 1
                 _set_result_text(b, after)
