@@ -50,7 +50,8 @@ AGENT_SESSION_GLOB = {  # only claude-code is wired; others are TODO
 
 # longest names first — cell dir names are '<arm>-<task>' and arm names contain hyphens,
 # so splitting is a longest-prefix match against the arms the bench knows about
-KNOWN_ARMS = ("headroom-kompress", "vanilla-proxy", "headroom", "condense", "vanilla", "control")
+KNOWN_ARMS = ("headroom-kompress", "vanilla-proxy", "headroom", "condense", "caveman",
+              "vanilla", "control")
 
 # Arms whose intervention only EXISTS once the harness compacts — the history transforms. ⊘
 # (vanilla's peak context never reached --ctx-gate) means nothing compacted, so for these the
@@ -300,6 +301,41 @@ def index_runs(root, agent):
 
 
 # ---------------------------------------------------------------- assemble (from artifacts only)
+# caveman-activate.js prefixes the ruleset it injects at SessionStart with this. Its absence
+# from a transcript means the trial ran WITHOUT the intervention (the hook never fired, or
+# Claude Code skipped hooks in --print mode). That is the one failure this arm cannot be
+# allowed to have silently: an inactive caveman run is indistinguishable from vanilla, so it
+# would score as a clean ✓ "no divergence" while measuring nothing at all.
+CAVEMAN_MARKER = "CAVEMAN MODE ACTIVE"
+
+
+def _caveman_inactive(runs):
+    """How many of these trials have no caveman activation marker in their transcript.
+
+    Substring scan of the raw jsonl rather than the parsed actions: the ruleset arrives as
+    SessionStart context, which is not an assistant action and so never reaches actions().
+    """
+    n = 0
+    for path, _reward, _m in runs:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                if not any(CAVEMAN_MARKER in line for line in fh):
+                    n += 1
+        except OSError:
+            n += 1
+    return n
+
+
+def inactive_total(arm_rows, arm):
+    """Trials of `arm` across these rows that ran WITHOUT their intervention (caveman only).
+
+    Surfaced in every renderer's per-arm heading, not just one: an inactive trial is vanilla
+    in disguise and scores a clean ✓, so a reader who only sees the HTML must not be told
+    "trajectory preserved" about a run where the method never loaded.
+    """
+    return sum((r["arms"][arm].get("inactive") or 0) for r in arm_rows)
+
+
 def _cell_stats(cell):
     runs = cell["runs"] if cell else []
     lens, rws, peaks = [], [], []
@@ -368,6 +404,9 @@ def build(args, include_incremental_only=True):
                 rework_ok=overlaps(v["rework"], a["rework"]) if enough else None,
                 milestone=mc, milestone_ok=(overlaps(mv, mc) if (mv and mc) else None),
                 incr=incr.get((task, arm)),
+                # only meaningful for caveman; None elsewhere so the column stays quiet
+                inactive=(_caveman_inactive((idx.get(f"{arm}-{task}") or {}).get("runs", []))
+                          if arm == "caveman" else None),
             )
             row["arms"][arm] = a
         rows.append(row)
@@ -420,6 +459,15 @@ def _load_incremental(root, arms):
             zc = sum(A[s].get("cost_usd", 0) for s in common)
             out[(task, arm)] = {
                 "comp": round(1 - ac / cc, 4), "costd": round(1 - zc / oc, 4),
+                # caveman applies its transform (ruleset + terse prose) on every step, so it is
+                # "engaged" even when the net context change is ~0 — its terse prose can still
+                # move the next decision. This flag keeps fid meaningful (not dimmed as a
+                # passthrough) at comp≈0, exactly as `retrieves` does for headroom CCR.
+                # Read the VALUE, not the key: counterfactual writes caveman_native on every
+                # caveman step (True or False), so a presence test would mark a run whose every
+                # step reverted to the recorded verbose prose as engaged — the one case where
+                # fid really is measuring nothing.
+                "native": any(r.get("caveman_native") for r in A.values()),
                 # per-step wall-clock (only on newer artifacts) — mean over the common steps
                 "latency": _mean_latency(A, common), "latency_ctrl": _mean_latency(C, common),
                 "fid": sum(_faithful_step(A[s]) for s in common) / len(common),
@@ -784,7 +832,10 @@ def table(d):
                       + (" ⊘" if gated(arm, r["sub_gate"]) else ""))
             sv, sa = _solve(r["vanilla"]), _solve(a)
             solve_txt = "—" if sv == "—" and sa == "—" else f"{sv} · {sa}"
-            cells = [(r["task"], None), (arm, None),
+            # an arm that never activated measured nothing — say so on the arm itself, or a
+            # ✓ here reads as "preserved the trajectory" when it means "was never applied"
+            arm_txt = arm if not a.get("inactive") else f"{arm} ⚠{a['inactive']} inactive"
+            cells = [(r["task"], None), (arm_txt, None),
                      (solve_txt, None),
                      (pk_txt, None),
                      (_b(r["vanilla"]["length"]), None), (_b(a["length"]), None),
@@ -794,10 +845,14 @@ def table(d):
                 cells.append((_v(a["milestone_ok"]), a["milestone_ok"]))
             if d["has_incr"]:
                 inc = a.get("incr") or {}
+                # "passthrough" = the arm changed nothing measurable → fid deltas are noise.
+                # comp≈0 usually means that, EXCEPT caveman still applied its transform (native),
+                # so its fid stays meaningful even when the net context change is ~0.
+                moved = abs(inc.get("comp") or 0) >= 0.02 or inc.get("native")
                 if inc.get("fid") is None:
                     fid = "—"
-                elif abs(inc.get("comp") or 0) < 0.02:
-                    fid = "⊘ passthrough"  # no compression -> fid deltas are noise
+                elif not moved:
+                    fid = "⊘ passthrough"
                 else:
                     fid = f"{inc['fid']:.0%} · {inc['fid_ctrl']:.0%}"
                 cells += [(fid, None), (_pct(inc.get("comp")), None),
@@ -817,6 +872,18 @@ SUB = ("vanilla = the noise floor; ✓ = the arm's band overlaps vanilla's, ✗ 
        "fid = per-step action agreement vs the control noise floor; it is only shown when "
        "the arm actually compressed (|comp| ≥ 2%) — ⊘ passthrough means the incremental run proved "
        "no compaction happened, so agreement deltas would be noise. "
+       "⚠ n inactive (caveman) = n trials whose transcript carries no activation marker, so "
+       "the skill never loaded and those trials are vanilla in disguise — read their ✓ as "
+       "'not measured', not 'preserved'. "
+       "caveman is not a proxy, so it should be read against vanilla, NOT vanilla-proxy: it "
+       "does not carry the non-default-base-URL wiring cost, and comparing it to "
+       "vanilla-proxy would credit it with that whole ~8-9k/request difference. "
+       "caveman is read like condense — comp is the accrued-context token measure (its terse "
+       "prose replaces the verbose prose span by span, the same shape as condense's condensed "
+       "blocks). It only touches prose (tool calls/results/code/errors stay verbatim), so its "
+       "comp is small — often ~0 or net-negative once the per-turn ruleset cost is counted — "
+       "but it still counts as engaged (fid stays meaningful), because the terse prose can move "
+       "the next decision even at comp≈0. "
        "No model was called to produce this.")
 
 
@@ -955,7 +1022,10 @@ def _html_report_body(d):
                 + mcell(v["_costs"], a["_costs"], fU)
                 + f'<td class="l"><span class="pill {state}">{H.escape(label)}</span></td>{ms}</tr>'
                 + f'<tr class="det" style="display:none"><td class="l" colspan="{span}">{detail(v, a)}</td></tr>')
-        secs.append(f'<h2>{H.escape(arm)} <span class="dim">vs vanilla</span></h2>'
+        dead = inactive_total(arm_rows, arm)
+        warn = (f' <span class="pill bad">⚠ {dead} trial{"s" if dead > 1 else ""} ran without '
+                f'the skill — read those verdicts as "not measured"</span>') if dead else ""
+        secs.append(f'<h2>{H.escape(arm)} <span class="dim">vs vanilla</span>{warn}</h2>'
                     f'<table><thead><tr><th class="l">task ▸</th><th>length</th><th>tokens</th>'
                     f'<th>$</th><th class="l">verdict</th>{msh}</tr></thead><tbody>'
                     + "".join(trs) + '</tbody></table>')
@@ -1064,6 +1134,9 @@ _INCR_LEGEND = (
     "--judge goal). compaction % / $ savings / speed up = context compressed / cost saved / "
     "per-step wall-clock faster vs control (+ = better = less context / cheaper / faster). ↻N = "
     "CCR retrieve calls a headroom arm made (net compaction can be ~0 yet still engaged). "
+    "caveman is read here like condense — compaction % is its accrued-context change (small, "
+    "often ~0/net-negative since it only terse-ifies prose); it still counts as engaged, so its "
+    "faithful stays a verdict rather than dimmed. "
     "faithful = the % of control's own faithfulness the arm keeps (control = 100% by "
     "construction; its absolute good-rate is shown in parens) — normalising divides out the "
     "sampling/judge floor, so 100% = no measurable loss. Coloured green ≥95% / yellow 85–95% / "
@@ -1160,15 +1233,19 @@ def _USDFMT(x):
 
 
 def _engaged(inc):
-    """Did the arm actually do something to the context? Compression that moved the context
-    (condense, headroom-kompress) OR a CCR retrieve (headroom fetched a compressed output back).
-    If neither, faithfulness is just measuring reconstruction noise."""
-    return abs(inc.get("comp") or 0) >= 0.02 or inc.get("retrieves", 0) > 0
+    """Did the arm actually do something? Compression that moved the context (condense,
+    headroom-kompress), a CCR retrieve (headroom fetched a compressed output back), OR caveman
+    having applied its transform (native) — its terse prose can move the next decision even when
+    the net context change is ~0. If none, faithfulness is reconstruction noise."""
+    return bool(abs(inc.get("comp") or 0) >= 0.02 or inc.get("retrieves", 0) > 0
+                or inc.get("native"))
 
 
 def _comp_cell(inc):
-    """Context compression %, with the CCR retrieve count (↻) appended for a headroom arm so
-    engagement is visible even when net compression is ~0 (it retrieved content back)."""
+    """The 'compaction %' cell: CONTEXT reduction vs control (+ the CCR retrieve count ↻ for
+    headroom). caveman is read here too — its terse prose replaces the verbose prose span by
+    span, so this is its accrued-context change (small, often ~0/net-negative once the ruleset
+    cost counts)."""
     txt = _pct(inc.get("comp"))
     if inc.get("ccr"):
         txt += f" [magenta]↻{inc.get('retrieves', 0)}[/]"
@@ -1338,7 +1415,10 @@ def _full_table(console, d, model):
         arm_rows = [r for r in rows if r["arms"][arm]["_lens"] or r["arms"][arm]["n"]]
         if not arm_rows:
             continue
-        title = f"[bold]{arm} vs vanilla" + (f" · {model}" if model else "") + "[/]"
+        dead = inactive_total(arm_rows, arm)
+        title = (f"[bold]{arm} vs vanilla" + (f" · {model}" if model else "") + "[/]"
+                 + (f" [red]⚠ {dead} trial(s) ran without the skill — "
+                    f"those verdicts measure nothing[/]" if dead else ""))
         t = Table(title=title, caption=_FULL_LEGEND if ai == len(d["arms"]) - 1 else None,
                   caption_justify="left", caption_style="dim", pad_edge=False)
         has_ms = d.get("has_milestone")

@@ -94,6 +94,99 @@ un-gated, so a new method shows a real verdict rather than quietly vanishing fro
 - `headroom-kompress` — token-mode compression *without* retrieval, kept only as an
   ablation (judging headroom's quality by it would be a strawman).
 - `vanilla-proxy` — the passthrough control above.
+- `caveman` — the [caveman](https://github.com/JuliusBrussee/caveman) skill (full mode
+  only), pinned at `v1.9.1`. A different *class* of method, and the distinction matters
+  for how you read it — see below.
+
+### caveman is a generation policy, not a history transform
+
+Every other arm is a **history transform**: hand it the conversation, it hands back a
+smaller one. caveman never touches history. A SessionStart hook injects a terse-output
+ruleset, and the agent writes fragments instead of prose for the rest of the run. Three
+consequences:
+
+- **It reads against `vanilla`, not `vanilla-proxy`.** It's the only non-vanilla arm with
+  no proxy — `ANTHROPIC_BASE_URL` stays default — so it doesn't carry the ~8-9k wiring
+  confound. Reading it against `vanilla-proxy` would credit it with that entire difference.
+- **Read it on `comp`, exactly like condense.** caveman's terse prose replaces the verbose
+  prose *span by span* and accrues into the context — the same shape as condense's condensed
+  blocks (see the incremental section below), just at prose granularity. So the fair token
+  measure is the same one every arm uses: **`comp`**, the accrued-context change vs control.
+  It only touches prose (tool calls, tool results, code and errors stay verbatim), so `comp`
+  is **small — often ~0 or net-negative** once the flat ~750-token ruleset cost per turn is
+  counted, because tool I/O dominates the prefix and caveman never touches it. That small/
+  negative number *is* the honest answer, not a metric to work around. (The ⊘ gate note above
+  applies in reverse: a ⊘ task doesn't mean "nothing fired", it means "probably net negative
+  on context".) It still counts as **engaged** even at `comp≈0` — its terse prose can move the
+  next decision — so its `fid` stays a real verdict rather than being dimmed as a passthrough.
+- **The interesting risk is different.** condense's failure mode is amnesia; caveman's is
+  that an agent's prior messages are its own working scaffold, and terser notes may reason
+  worse. `length` and `milestone` are the axes to watch, not `rework`.
+
+```bash
+uv run minmax-bench quality run --arms caveman --tasks long                  # level: full
+uv run minmax-bench quality run --arms caveman --caveman-mode ultra --tasks long
+```
+
+`--caveman-mode` is `lite` | `full` (default) | `ultra` — the same knob for `quality run`
+and `quality incremental` (it sets `TMB_CAVEMAN_MODE` for the container). Upstream's
+`wenyan-*` levels are rejected on purpose: they switch the output language to classical
+Chinese, which confounds every trajectory metric.
+
+**Silent-inactivity guard.** An arm that installs but never activates is indistinguishable
+from vanilla, and would score a clean ✓ "trajectory preserved" while measuring nothing.
+Two checks prevent that in full mode: agent setup smoke-tests the hook and refuses to run if
+it produces no ruleset (or falls back to its abridged hardcoded one), and the report scans
+each transcript for the activation marker and labels trials that lack it `⚠ n inactive`.
+Incremental has the same hazard in a different shape — a step where caveman returns no usable
+prose keeps the recorded *verbose* narration, so the replayed history is control's — and the
+same answer: reverted steps are counted, the end-of-run readout names the mixture instead of
+claiming a "fully-terse history", a run with zero terse steps reads `caveman: inactive`, and
+the report treats it as `⊘ passthrough` rather than scoring its fidelity.
+
+**In `quality incremental`, caveman freezes the action rails and keeps its terse prose.** A
+naive teacher-forced replay would pin the recorded *verbose* assistant messages — exactly what
+caveman changes — and read as "no effect". But letting caveman *free-run* its actions is also
+wrong: **caveman doesn't change actions**, only prose, and a diverged action has no recorded
+`tool_result` to continue from. So the arm keeps the recorded trajectory's **rails frozen** —
+every `tool_use`, `tool_result`, and thinking block stays verbatim (no id remap, always valid,
+perfectly paired) — and swaps in caveman's own terse narration on **every** step, *including*
+steps where its proposed action diverged. That's safe because the prose in an agent turn is
+dominantly a **reflection on the prior (frozen) tool_result** — which both caveman and control
+saw identically — not a commitment to the next action (caveman drops tool-call narration by
+rule). So the history stays coherent with the frozen action regardless, and it's **genuinely
+terse throughout** rather than half-reverted to verbose.
+
+The per-step **action-fidelity** — would caveman have *proposed* the recorded action given that
+terse history — is the **drift / alignment** signal: high = the terse history didn't change the
+decision, low = it drifted. Measuring it against a genuinely-terse history (rather than a
+corrected one) is the whole point — the run reports `action-aligned %` and the `caveman_diverged`
+count alongside it. Only an actual API error keeps the recorded verbose prose (there's no
+caveman prose to use). The history is append-only — caveman never rewrites an earlier turn —
+so each step's prefix nests the last and the incremental cache is preserved by construction,
+the same as control; a compaction method instead rewrites earlier spans *when it compacts*,
+invalidating the cache at that point (the cost bench's documented cache-bust). We don't
+separately measure caveman's cache here — it's a structural property of an append-only prefix,
+not a result.
+
+`--caveman-mode lite|full|ultra` picks the intensity; the injected ruleset is the exact text
+the pinned hook emits (`data/caveman/ruleset-<mode>.txt`), so incremental and full present the
+same guidance. What this mode still *can't* see is behavioral **compounding** — a mis-proposed
+action never actually executes, because the rails stay recorded, so its downstream effect can't
+propagate. That question is full mode's, where the trajectory is just genuinely different (real
+execution + verifier). The residual artifact here is the turn whose terse prose *does* lead
+forward to a diverged action; caveman's no-narration rule keeps it rare, and a future rewriter
+pass (terse prose written *about* the recorded action) would remove it entirely.
+
+That artifact only exists on turns carrying a **frozen tool_use** — about 60% of real decision
+points are prose *and* a tool call, ~31% are tool-only (no prose to shrink, so they can neither
+be terse nor drift), and ~9% are prose-only. A divergence on a prose-only turn replaces the
+whole message and stays coherent; a divergence next to a frozen action does not. So the run
+splits its drift into **`n beside a different frozen action`** (the artifact, and the exact turn
+set a rewriter would target) and **`n on a prose-only turn (clean)`** — a run can drift a lot
+with no artifact, or a little with all of it stapled, and one number cannot tell them apart.
+Note the alignment rate's denominator is **prose steps**, while the table's `vs original` is
+every successful step, so the two legitimately differ; the readout states both.
 
 ⚠ The same names carry different meanings across the two benches: in the **cost** bench
 `headroom` is the cache-mode strategy and `headroom-kompress` is token-mode; only
@@ -117,7 +210,7 @@ before spending anything.
 | flag | meaning |
 |---|---|
 | `--tasks` | `N` = first N recommended \| `random:N` (with `--seed`) \| a group: `all`/`long`/`short`/`hard`/`medium` (`long` = author timeout ≥ 30m, biasing toward sessions long enough to compact) \| `a,b,c` by name \| omitted = 5. `--list-tasks` shows everything known. |
-| `--arms` | default `condense,headroom`; vanilla always included; also `headroom-kompress`, `vanilla-proxy` |
+| `--arms` | default `condense,headroom`; vanilla always included; also `headroom-kompress`, `vanilla-proxy`, `caveman` |
 | `-m/--model` | default `claude-sonnet-4-6` |
 | `-d/--dataset` | Harbor dataset; only `terminal-bench/terminal-bench-2-1` is validated so far |
 | `--k` | trials per arm/task (default 4); `--k-vanilla` defaults to k+1 — the extra noise-floor run sharpens every verdict |
@@ -168,11 +261,12 @@ condense arm sends your session content to `api.condense.chat`.
 
 | flag | meaning |
 |---|---|
-| `--arms` | default `condense`; also `headroom` (`--headroom-mode token|cache`, auto-starts/stops the proxy; `--ccr/--no-ccr` injects the retrieve loop via `headroom mcp serve` — `--no-ccr` = kompress) |
+| `--arms` | default `condense`; also `headroom` (`--headroom-mode token|cache`, auto-starts/stops the proxy; `--ccr/--no-ccr` injects the retrieve loop via `headroom mcp serve` — `--no-ccr` = kompress); `caveman` (frozen rails, terse-prose drift, `--caveman-mode lite|full|ultra`) |
 | `-n/--limit` | max decision points, contiguous from the start (strided sampling was removed — it distorted cost/compaction numbers) |
 | `--budget-usd` | per-arm spend cap, control included (default 2.0) |
 | `--judge` | `off` \| `goal` (rate each action toward the task — robust, recommended) \| `equivalence` (upgrade grep-vs-rg near-misses to "agrees") |
 | `--ctx-gate` | skip sessions whose peak context stays below this (default 50k; 0 = run anyway) |
+| `--caveman-mode` | caveman intensity: `lite` \| `full` (default) \| `ultra`. Injects the pinned hook's ruleset and keeps caveman's terse prose over frozen tool rails; read on `comp` like condense, plus `action-aligned %` (drift) |
 | `--capture` | run your version-matched Claude Code binary once, locally, to capture the exact system prompt + tools instead of a stored template |
 | `--independent-budgets` | default (`--cap-to-control`) caps every arm at the steps control reached within budget — the paired comparison window, no wasted spend; this flag lets each arm run to its own budget instead ("how far can each arm get"), at the cost of ragged step counts |
 | `--resume/--no-resume` | re-running to the same `--out` skips arms that finished cleanly (`.done` sentinel) — a cancel mid-run picks up at the next arm instead of re-running control |
@@ -271,12 +365,14 @@ on the analysis path).
 | file | side | role |
 |---|---|---|
 | `minmax_bench/quality/generate.py` | generate | the generation engine (full + incremental + milestone judge) |
-| `minmax_bench/quality/engine.py` | generate | library: session I/O, request building, scoring, pricing |
+| `minmax_bench/quality/engine.py` | generate | library: session I/O, request building, scoring, pricing, the caveman frozen-rails replay state (`CavemanState`) |
 | `minmax_bench/quality/report.py` | display | reads artifacts → html/md; never spends |
 | `minmax_bench/quality/passthrough.py` | generate | the do-nothing forwarder behind the `vanilla-proxy` arm |
 | `minmax_bench/quality/paths.py` | both | auto-minted run dirs under `settings.quality_runs_dir` |
 | `minmax_bench/counterfactual.py` | generate | the rich `quality incremental` front-end (picker, cost preview, summary table) |
 | `harbor_agents/headroom_ccr_claude_code.py` | generate | self-contained CCR wiring for the `headroom` arm (preserves base MCP servers) |
+| `harbor_agents/caveman_claude_code.py` | generate | pinned caveman install + activation smoke test for the full-mode `caveman` arm |
+| `data/caveman/ruleset-<mode>.txt` | generate | frozen SessionStart-hook rulesets injected by incremental caveman (pinned; see `data/caveman/PIN`) |
 | `tests/test_quality.py` | — | unit tests for the metric code (`uv run pytest`) |
 
 ## Findings so far

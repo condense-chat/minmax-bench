@@ -1163,3 +1163,541 @@ def test_wizard_parallel_answer_beats_the_flag_default(monkeypatch):
 
     argv = _argv_from_wizard(monkeypatch, k=4)                 # not asked -> sequential
     assert argv[argv.index("--concurrency") + 1] == "1"
+# ------------------------------------------------------------------ caveman arm (full mode)
+def test_caveman_arm_is_not_a_proxy():
+    """caveman must reach api.anthropic.com directly. If it ever routes through a proxy it
+    silently acquires the ~8-9k non-default-base-URL wiring cost that vanilla-proxy exists to
+    isolate, and every token/cost number for the arm becomes incomparable to vanilla."""
+    from minmax_bench.quality import generate as gen
+    base, allow, agent, extra = gen._arm_wiring("caveman", {})
+    assert base == "https://api.anthropic.com" and allow == "api.anthropic.com"
+    assert agent == "harbor_agents.caveman_claude_code:CavemanClaudeCode"
+    assert extra == ["--ae", "TMB_CAVEMAN_MODE=full"]
+    # the mode is a knob, and it must reach the container
+    _b, _a, _g, extra_ultra = gen._arm_wiring("caveman", {"TMB_CAVEMAN_MODE": "ultra"})
+    assert extra_ultra == ["--ae", "TMB_CAVEMAN_MODE=ultra"]
+
+
+def test_caveman_bad_mode_is_rejected_before_spending():
+    """A bad level must fail at validate time, not after a container build on every cell."""
+    from minmax_bench.quality import generate as gen
+    args = SimpleNamespace(arms="caveman", dry_run=True)
+    with pytest.raises(SystemExit) as e:
+        gen._validate_full(args, {"ANTHROPIC_API_KEY": "k", "TMB_CAVEMAN_MODE": "wenyan-full"})
+    # wenyan levels switch the OUTPUT LANGUAGE to classical Chinese — excluded on purpose
+    assert "wenyan-full" in str(e.value) and "lite, full, ultra" in str(e.value)
+    assert gen._validate_full(SimpleNamespace(arms="caveman", dry_run=True),
+                              {"ANTHROPIC_API_KEY": "k"}) == ["vanilla", "caveman"]
+
+
+def test_caveman_is_accepted_by_incremental_and_rides_control_transport():
+    """caveman is a client-side policy, not an endpoint: check_arms must accept it (given
+    control's anthropic auth) without demanding an ARMS entry, and its requests must go to
+    control's transport."""
+    assert eng.check_arms(["control", "caveman"], {"ANTHROPIC_API_KEY": "k"}) == []
+    assert eng.caveman_api_arm("caveman") == "control"
+    assert eng.caveman_api_arm("condense") == "condense"
+    # an actually-unknown arm still fails, and the message now lists caveman as known
+    prob = "\n".join(eng.check_arms(["control", "bogus"], {"ANTHROPIC_API_KEY": "k"}))
+    assert "bogus" in prob and "caveman" in prob
+
+
+def test_caveman_needs_controls_credentials_not_anthropics(monkeypatch):
+    """Regression: credentials belong to the ENDPOINT, and caveman has none of its own.
+    Under UPSTREAM_VIA=bedrock control IS the bedrock entry, so `--arms caveman` must ask for
+    bedrock auth only — checking the literal arm name demanded an ANTHROPIC_API_KEY the run
+    never uses and hard-aborted the preflight for a bedrock-only user."""
+    monkeypatch.setitem(eng.ARMS, "control", {"base": "https://bedrock/anthropic",
+                                              "bedrock": True})
+    monkeypatch.setattr(eng, "auth_mode", lambda env: None)      # no anthropic key/oauth
+    # bedrock creds resolve fine — isolate the ANTHROPIC demand, and keep the test off AWS
+    monkeypatch.setattr("minmax_bench.bedrock.bearer_token", lambda region: "tok")
+    ctrl_only = eng.check_arms(["control"], {})
+    with_cav = eng.check_arms(["control", "caveman"], {})
+    assert not any("no auth found" in p for p in with_cav), with_cav
+    assert with_cav == ctrl_only  # caveman adds no credential demand of its own
+    # a real anthropic-endpoint arm still does demand it
+    assert any("no auth found" in p for p in eng.check_arms(["condense"], {}))
+
+
+def test_caveman_ruleset_carries_marker_for_every_mode():
+    """The frozen rulesets must each start with the activation marker — a stale/empty capture
+    would silently inject nothing and make the arm a no-op."""
+    for mode in eng.CAVEMAN_MODES:
+        assert eng.caveman_ruleset(mode).startswith("CAVEMAN MODE ACTIVE")
+    with pytest.raises(ValueError):
+        eng.caveman_ruleset("wenyan-full")  # excluded (classical Chinese confounds metrics)
+
+
+def test_caveman_inject_prepends_ruleset_into_first_user_turn():
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "do the thing"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}]
+    out = eng.caveman_inject(msgs, "full")
+    assert out[0]["content"][0]["text"].startswith("CAVEMAN MODE ACTIVE")
+    assert out[0]["content"][1]["text"] == "do the thing"   # original block preserved after
+    assert msgs[0]["content"][0]["text"] == "do the thing"  # source untouched (non-mutating)
+
+
+def test_caveman_state_freezes_rails_and_drifts_only_prose():
+    """On a matched action, CavemanState swaps in caveman's terse PROSE but keeps the recorded
+    tool_use verbatim (frozen rails) — no id remap — and the recorded tool_result is unchanged
+    with its ORIGINAL id, so the pair is valid by construction."""
+    msgs = [
+        {"role": "user", "content": [{"type": "text", "text": "task"}]},
+        {"role": "assistant", "content": [   # decision point (recorded)
+            {"type": "text", "text": "Let me carefully read the file to understand it."},
+            {"type": "tool_use", "id": "rec_1", "name": "Read", "input": {"file_path": "a.py"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "rec_1", "content": "print(1)"}]},
+    ]
+    st = eng.CavemanState(msgs, [1], "full")
+    # caveman's terse rendering of the SAME action (its own tool_use id is irrelevant now —
+    # we keep the recorded rail, not caveman's action)
+    rep = [{"type": "text", "text": "Read a.py."},
+           {"type": "tool_use", "id": "cav_9", "name": "Read", "input": {"file_path": "a.py"}}]
+    st.advance(1, rep, matched=True)
+    assert st.native == 1 and st.reverted == 0
+    asst = st.hist[-2]
+    assert asst["content"][0]["text"] == "Read a.py."          # terse prose swapped in
+    assert asst["content"][1]["id"] == "rec_1"                 # RECORDED tool_use kept (frozen)
+    assert asst["content"][1]["input"] == {"file_path": "a.py"}
+    tr = st.hist[-1]["content"][0]                             # recorded result, original id
+    assert tr["tool_use_id"] == "rec_1" and tr["content"] == "print(1)"
+
+
+def test_caveman_state_keeps_terse_prose_even_on_a_diverged_action():
+    """caveman's terse prose is kept EVEN when its proposed action disagreed — the prose is a
+    reflection on the (frozen) prior result, not a commitment to the next action, so it stays
+    coherent with the frozen recorded action. The divergence is counted, not corrected."""
+    msgs = [
+        {"role": "user", "content": [{"type": "text", "text": "task"}]},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "I'll read the file carefully to understand the bug."},
+            {"type": "tool_use", "id": "rec_1", "name": "Read", "input": {"file_path": "a.py"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "rec_1", "content": "orig result"}]},
+    ]
+    st = eng.CavemanState(msgs, [1], "full")
+    # caveman proposed a DIFFERENT action; its terse prose is kept anyway, the rail is frozen
+    st.advance(1, [{"type": "text", "text": "Div by zero line 1."},
+                   {"type": "tool_use", "id": "c", "name": "Bash", "input": {"command": "ls"}}],
+               matched=False)
+    assert st.native == 1 and st.reverted == 0 and st.diverged == 1
+    asst = st.hist[-2]
+    assert asst["content"][0]["text"] == "Div by zero line 1."   # caveman's terse prose kept
+    assert asst["content"][1]["id"] == "rec_1"                   # rail frozen (recorded action)
+    assert st.hist[-1]["content"][0]["content"] == "orig result"
+    # only an API error (no caveman prose) keeps the recorded prose
+    st_err = eng.CavemanState(msgs, [1], "full")
+    st_err.advance(1, None, matched=False)
+    assert st_err.reverted == 1 and st_err.native == 0
+    assert st_err.hist[-2]["content"][0]["text"].startswith("I'll read the file")
+    # a step the recording narrated with NO prose is neither native nor reverted — rail intact
+    msgs2 = [{"role": "user", "content": [{"type": "text", "text": "t"}]},
+             {"role": "assistant", "content": [
+                 {"type": "tool_use", "id": "r", "name": "Read", "input": {"file_path": "a"}}]},
+             {"role": "user",
+              "content": [{"type": "tool_result", "tool_use_id": "r", "content": "x"}]}]
+    st2 = eng.CavemanState(msgs2, [1], "full")
+    st2.advance(1, [{"type": "text", "text": "Read a."},
+                    {"type": "tool_use", "id": "z", "name": "Read", "input": {"file_path": "a"}}],
+                matched=True)
+    assert st2.native == 0 and st2.reverted == 0          # no prose existed to shrink
+    assert st2.hist[-2]["content"][0]["id"] == "r"        # rail verbatim
+
+
+def test_caveman_split_cell_roundtrips():
+    assert report.split_cell("caveman-kv-store") == ("caveman", "kv-store")
+
+
+def test_caveman_inactive_trials_are_surfaced_not_scored_as_preserved(tmp_path):
+    """A trial whose transcript carries no activation marker ran WITHOUT the intervention.
+    It is indistinguishable from vanilla, so it must be flagged — otherwise it lands as a
+    clean ✓ 'trajectory preserved' while having measured nothing at all."""
+    def trial(cell, name, marker):
+        inst = tmp_path / cell / name / "inst"
+        (inst / "verifier").mkdir(parents=True)
+        (inst / "verifier" / "reward.txt").write_text("1")
+        sess = inst / "agent" / "sessions" / "projects" / "-app"
+        sess.mkdir(parents=True)
+        line = {"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"role": "user",
+                            "content": ("CAVEMAN MODE ACTIVE — level: full" if marker
+                                        else "normal session start")}}
+        (sess / "s.jsonl").write_text(json.dumps(line) + "\n")
+
+    trial("caveman-taskA", "2026-01-01__00-00-00", marker=True)
+    trial("caveman-taskA", "2026-01-01__00-00-01", marker=False)
+    idx = report.index_runs(str(tmp_path), "claude-code")
+    runs = idx["caveman-taskA"]["runs"]
+    assert len(runs) == 2
+    assert report._caveman_inactive(runs) == 1        # exactly the unmarked one
+
+
+def test_caveman_inactive_warning_reaches_every_renderer(tmp_path):
+    """md, html and console each build their own tables. A silent-inactivity warning that
+    only lands in one of them is worse than none — html is the DEFAULT format, so a reader
+    would see a clean ✓ with no hint the skill never loaded."""
+    d = {"arms": ["caveman"], "model": "m", "has_milestone": False, "has_incr": False,
+         "rows": [{"task": "t", "sub_gate": False,
+                   "vanilla": dict(_STAT, _lens=[5, 5], length=(5, 5, 5)),
+                   "arms": {"caveman": dict(_STAT, _lens=[5, 5], length=(5, 5, 5),
+                                            inactive=2, length_ok=True, rework_ok=True,
+                                            milestone=None, milestone_ok=None, incr=None)}}]}
+    _head, rows = report.table(d)
+    assert any("inactive" in c[0] for row in rows for c in row), "missing from markdown"
+    assert "ran without the skill" in report._html_report_body(d), "missing from html"
+    from rich.console import Console as _C
+    con = _C(file=__import__("io").StringIO(), width=200, force_terminal=False)
+    report._full_table(con, d, "m")
+    assert "without the skill" in con.file.getvalue(), "missing from console"
+
+
+_STAT = {"n": 2, "attempted": 2, "lost": 0, "started": 2, "solve": 2, "rework": (0, 0, 0),
+         "peak_ctx": 100_000, "_costs": [], "_toks": [], "_lats": [], "_lens": [],
+         "length": (0, 0, 0)}
+
+
+def _tool_pairing_valid(msgs):
+    """Every assistant tool_use is answered by a tool_result in the very next user turn, and
+    there are no orphan results — the invariant Anthropic 400s on if broken."""
+    for i, m in enumerate(msgs):
+        if m["role"] != "assistant":
+            continue
+        use_ids = [b["id"] for b in m["content"] if b.get("type") == "tool_use"]
+        if not use_ids:
+            continue
+        nxt = msgs[i + 1]["content"] if i + 1 < len(msgs) else []
+        res_ids = [b.get("tool_use_id") for b in nxt if b.get("type") == "tool_result"]
+        if sorted(use_ids) != sorted(res_ids):
+            return False
+    return True
+
+
+def test_caveman_accumulated_history_stays_api_valid_across_aligned_and_diverged():
+    """Terse prose kept on an aligned step and again on a diverged one must still yield a
+    message list whose tool_use/tool_result pairing is intact — trivially so, since the rails
+    are frozen to the recording either way."""
+    msgs = [
+        {"role": "user", "content": [{"type": "text", "text": "task"}]},
+        {"role": "assistant", "content": [                         # step 0 (ALIGNED)
+            {"type": "text", "text": "I'll read the file to understand it."},
+            {"type": "tool_use", "id": "rec_a", "name": "Read", "input": {"file_path": "a.py"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "rec_a", "content": "A"}]},
+        {"role": "assistant", "content": [                         # step 1 (DIVERGED)
+            {"type": "text", "text": "Now let me run the tests to confirm."},
+            {"type": "tool_use", "id": "rec_b", "name": "Bash", "input": {"command": "pytest"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "rec_b", "content": "B"}]},
+    ]
+    st = eng.CavemanState(msgs, [1, 3], "full")
+    st.advance(1, [{"type": "text", "text": "Read a.py."},
+                   {"type": "tool_use", "id": "cav_a", "name": "Read",
+                    "input": {"file_path": "a.py"}}], matched=True)     # aligned
+    st.advance(3, [{"type": "text", "text": "Tests green."},
+                   {"type": "tool_use", "id": "cav_x", "name": "Bash",
+                    "input": {"command": "ls"}}], matched=False)        # diverged, prose still kept
+    assert st.native == 2 and st.reverted == 0 and st.diverged == 1
+    assert st.hist[-2]["content"][0]["text"] == "Tests green."          # terse prose on both
+    # every tool_use in the history keeps its RECORDED id (no remap) and its recorded result
+    assert {b["id"] for m in st.prefix() if m["role"] == "assistant"
+            for b in m["content"] if b.get("type") == "tool_use"} == {"rec_a", "rec_b"}
+    assert _tool_pairing_valid(st.prefix()), "caveman history has dangling/orphan tool blocks"
+    # and the request built from that history carries the ruleset + is well-formed
+    args = SimpleNamespace(max_tokens=16, strip_thinking=False, swechat=None,
+                           keep_all_tools=True, drop_beta_config=True)
+    req = eng.build_request({"model": "m", "system": [], "tools": []}, st.prefix(), args, "sid")
+    assert "CAVEMAN MODE ACTIVE" in req["messages"][0]["content"][0]["text"]
+    assert _tool_pairing_valid(req["messages"])
+
+
+def _fake_session(path):
+    """A minimal 2-decision-point Claude Code session jsonl: Read then a final text answer,
+    with recorded usage above any sane ctx gate."""
+    usage = {"input_tokens": 60_000, "output_tokens": 40, "cache_read_input_tokens": 0,
+             "cache_creation_input_tokens": 0}
+    def asst(rid, content):
+        return {"type": "assistant", "requestId": rid,
+                "message": {"role": "assistant", "model": "claude-sonnet-4-6",
+                            "usage": usage, "content": content}}
+    recs = [
+        {"type": "user", "cwd": "/proj", "version": "2.1.0",
+         "message": {"role": "user", "content": "fix the bug in a.py"}},
+        asst("r1", [
+            {"type": "text", "text": "I'll read the file to understand the bug first."},
+            {"type": "tool_use", "id": "rec_a", "name": "Read", "input": {"file_path": "a.py"}}]),
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "rec_a", "content": "def f(): return 1/0"}]}},
+        asst("r2", [{"type": "text", "text": "The bug is a division by zero on line 1."}]),
+    ]
+    path.write_text("\n".join(json.dumps(r) for r in recs))
+
+
+def test_incremental_caveman_end_to_end_offline(tmp_path, monkeypatch):
+    """Drive the real replay() loop for --arms caveman with a mocked API: proves the wiring
+    (per-arm caveman history → build_request → advance) runs, writes a jsonl with the
+    caveman_native flag, and reports the native/reverted split — no network, no spend."""
+
+    from rich.console import Console
+
+    from minmax_bench import counterfactual as cf
+
+    sess = tmp_path / "s.jsonl"
+    _fake_session(sess)
+
+    # canned model reply per (arm, step): control mirrors the recording; caveman returns a
+    # TERSE version of the SAME first action (aligned), then a divergent second action
+    # (diverged — its terse prose is still kept, only the drift is counted).
+    def fake_call_api(arm, req, headers, env):
+        msgs = req["messages"]
+        # step 1 (Read done already) vs step 0: infer by counting assistant turns in prefix
+        n_asst = sum(1 for m in msgs if m["role"] == "assistant")
+        if n_asst == 0:  # first decision point
+            content = [{"type": "text", "text": "Read a.py."},
+                       {"type": "tool_use", "id": "new_a", "name": "Read",
+                        "input": {"file_path": "a.py"}}]
+        else:            # second decision point — caveman diverges (runs a test)
+            content = [{"type": "text", "text": "Run test."},
+                       {"type": "tool_use", "id": "new_b", "name": "Bash",
+                        "input": {"command": "pytest"}}]
+        return {"content": content, "usage": {"input_tokens": 30_000, "output_tokens": 20,
+                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}, None
+
+    monkeypatch.setattr(cf.eng, "call_api", fake_call_api)
+    monkeypatch.setattr(cf.eng, "auth_mode", lambda env: "api-key")
+    # replay()'s api-key guard checks the env directly (not auth_mode); give it a dummy key so
+    # the offline run — which mocks call_api and never actually spends — clears the guard.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-offline")
+
+    out = tmp_path / "run"
+    summary = cf.replay(sess, ["caveman"], budget_usd=5.0, limit=0, max_tokens=64,
+                        out_dir=out, console=Console(quiet=True), assume_yes=True,
+                        model=None, auth="api-key", task="t", judge="off", capture=False,
+                        ctx_gate=0, caveman_mode="full")
+
+    cav = summary["arms"]["caveman"]
+    assert cav["steps_ok"] == 2
+    # both steps had prose and caveman responded, so both are kept terse (native); the second
+    # step's PROPOSED action diverged from the recording (the drift signal), but its prose is
+    # kept anyway and the rail stays frozen
+    assert cav["caveman_native"] == 2 and cav["caveman_reverted"] == 0
+    assert cav["caveman_diverged"] == 1
+    jsonl = (out / "incremental" / "t-caveman.jsonl").read_text().splitlines()
+    lines = [json.loads(x) for x in jsonl]
+    assert lines[0]["caveman_native"] is True and lines[1]["caveman_native"] is True
+    assert lines[0]["replay"]["name"] == "Read"   # scored against the recording
+
+
+def test_report_reads_caveman_like_condense_on_comp_and_stays_engaged(tmp_path):
+    """caveman is read on comp (the accrued-context token measure) like every arm — no special
+    'out' column. But because it applied its transform (native), a comp≈0 caveman run must still
+    count as ENGAGED (fid a real verdict, not '⊘ passthrough') — its terse prose can move the
+    next decision even when the net context change is ~0."""
+    d = tmp_path / "incremental"
+    d.mkdir()
+
+    def write(arm, recs):
+        (d / f"sess-{arm}.jsonl").write_text("\n".join(json.dumps(r) for r in recs))
+
+    def rec(step, ctx, agree=True, native=None):
+        r = {"step": step, "agree_action": agree, "cost_usd": 1.0,
+             "usage": {"input_tokens": ctx, "output_tokens": 50}}
+        if native is not None:
+            r["caveman_native"] = native
+        return r
+
+    # caveman barely moves the context (30k vs 30.1k) — comp ≈ 0, as on real coding sessions
+    write("control", [rec(s, 30_100) for s in range(3)])
+    write("caveman", [rec(s, 30_000, agree=(s == 0), native=True) for s in range(3)])
+    inc = report._load_incremental(str(tmp_path), ["caveman"])[("sess", "caveman")]
+    assert inc["native"] is True
+    assert abs(inc["comp"]) < 0.02              # context essentially unchanged (read like condense)
+    assert "outd" not in inc                    # the output-token special-casing is gone
+
+    # comp cell is the plain context number — no 'out' tag
+    assert "out" not in report._comp_cell(inc)
+    # a caveman run that applied its transform stays engaged even at comp≈0
+    assert report._engaged(inc) is True
+
+    # md table: no 'out' column, and the comp≈0 caveman row is NOT a ⊘ passthrough (fid shown)
+    dd = {"arms": ["caveman"], "model": "m", "has_milestone": False, "has_incr": True,
+          "rows": [{"task": "sess", "sub_gate": False,
+                    "vanilla": dict(_STAT, _lens=[5, 5], length=(5, 5, 5)),
+                    "arms": {"caveman": dict(_STAT, _lens=[5, 5], length=(5, 5, 5),
+                                             inactive=None, length_ok=True, rework_ok=True,
+                                             milestone=None, milestone_ok=None, incr=inc)}}]}
+    head, rows = report.table(dd)
+    assert "out" not in head and "comp" in head
+    flat = " ".join(c[0] for c in rows[0])
+    assert "passthrough" not in flat
+
+    # ...but a run whose EVERY step reverted to the recorded verbose prose applied nothing, and
+    # must fall back to ⊘ passthrough. Regression: `native` read the KEY's presence, and
+    # counterfactual writes caveman_native on every caveman step (True *or* False), so this run
+    # was marked engaged and its fid shown as a verdict while measuring nothing.
+    write("caveman", [rec(s, 30_000, agree=(s == 0), native=False) for s in range(3)])
+    dead = report._load_incremental(str(tmp_path), ["caveman"])[("sess", "caveman")]
+    assert dead["native"] is False
+    assert report._engaged(dead) is False
+    dd["rows"][0]["arms"]["caveman"]["incr"] = dead
+    _h, rows2 = report.table(dd)
+    assert "passthrough" in " ".join(c[0] for c in rows2[0])
+
+
+def test_caveman_empty_prose_keeps_recorded_and_never_makes_an_empty_message():
+    """Regression: a prose-only recorded turn + a caveman reply with no text must NOT collapse
+    to {"content": []} (which 400s and, being append-only, poisons every later step). Keep the
+    recorded prose instead (reverted)."""
+    msgs = [
+        {"role": "user", "content": [{"type": "text", "text": "task"}]},
+        {"role": "assistant", "content": [  # PROSE-ONLY decision point (no tool_use)
+            {"type": "text", "text": "The bug is a division by zero on line 1."}]},
+        {"role": "user", "content": [{"type": "text", "text": "thanks, now fix it"}]},
+    ]
+    st = eng.CavemanState(msgs, [1], "full")
+    # caveman replied with a tool_use only — no text block (its no-narration case)
+    st.advance(1, [{"type": "tool_use", "id": "c", "name": "Edit", "input": {}}], matched=False)
+    assert st.native == 0 and st.reverted == 1
+    asst = st.hist[-2]
+    assert asst["content"], "assistant message must not be empty (would 400)"
+    assert asst["content"][0]["text"].startswith("The bug is")   # recorded prose kept
+    assert _tool_pairing_valid(st.prefix())
+    # and an API error (rep_content None) on a prose-only turn is handled the same way
+    st_err = eng.CavemanState(msgs, [1], "full")
+    st_err.advance(1, None, matched=False)
+    assert st_err.reverted == 1 and st_err.hist[-2]["content"]
+
+
+def test_caveman_pin_agrees_across_all_three_sources():
+    """The pin lives in three places that can't import each other: the harbor agent
+    (CAVEMAN_SHA — what installs), generate.py (CAVEMAN_PIN + probe URL — the preflight), and
+    data/caveman/PIN (which release the frozen rulesets came from). A bump in one without the
+    others fails SILENTLY (the activation marker survives a version change), so assert they
+    agree on both the tag and the sha."""
+    import re
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # harbor agent — read as text (it imports `harbor`, absent from this env)
+    agent_src = open(os.path.join(root, "harbor_agents", "caveman_claude_code.py")).read()
+    agent_ref = re.search(r'CAVEMAN_REF\s*=\s*"([^"]+)"', agent_src).group(1)
+    agent_sha = re.search(r'CAVEMAN_SHA\s*=\s*"([0-9a-f]{40})"', agent_src).group(1)
+    # generate.py — importable (does not import harbor)
+    from minmax_bench.quality import generate as gen
+    probe_sha = re.search(r"[0-9a-f]{40}", gen.CAVEMAN_TARBALL_PROBE).group(0)
+    # data/caveman/PIN — "vX.Y.Z (<40-hex>)"
+    pin_txt = open(os.path.join(root, "data", "caveman", "PIN")).read().strip()
+    pin_ref, pin_sha = re.match(r"(\S+)\s*\(([0-9a-f]{40})\)", pin_txt).groups()
+
+    assert agent_ref == gen.CAVEMAN_PIN == pin_ref, "pin TAG disagrees across sources"
+    assert agent_sha == probe_sha == pin_sha, "pin SHA disagrees across sources"
+
+
+def _caveman_readout(native, reverted, diverged, stapled=None):
+    """render_summary's caveman line for a run with these counts."""
+    import io
+
+    from rich.console import Console
+
+    from minmax_bench import counterfactual as cf
+
+    def by(n):
+        return {i: {"ctx": 100_000, "cost": 1.0, "agree": True, "latency": 0.5} for i in range(n)}
+    s = {"session": "/x/s.jsonl", "model": "m", "steps": 3, "judge": "off", "arms": {
+        "control": {"steps_ok": 3, "agree_action": 3, "agree_exact": 3, "by_step": by(3),
+                    "ctx_series": [100_000] * 3, "errors": 0, "stop_reason": "complete"},
+        "caveman": {"steps_ok": 3, "agree_action": 2, "agree_exact": 1, "by_step": by(3),
+                    "ctx_series": [100_000] * 3, "errors": 0, "stop_reason": "complete",
+                    "caveman_native": native, "caveman_reverted": reverted,
+                    "caveman_diverged": diverged, "caveman_stapled": stapled}}}
+    buf = io.StringIO()
+    # very wide: the readout must not wrap, else filtering by "caveman:" drops its continuation
+    # lines and an assertion on the tail of the sentence silently passes/fails on layout
+    cf.render_summary(s, Console(file=buf, width=10_000))
+    return [ln for ln in buf.getvalue().splitlines() if "caveman:" in ln]
+
+
+def test_caveman_readout_never_claims_a_terse_history_it_did_not_have():
+    """Regression: caveman_reverted was tracked and then never rendered, so a run whose prose
+    fell back to the recorded VERBOSE narration still read as '% action-aligned over a
+    fully-terse history'. With native=0 that printed a red 0% over 0/0 — the incremental twin
+    of the full-mode '⚠ inactive' failure, reported as a result instead of a non-measurement."""
+    # nothing ran terse: say INACTIVE, never a 0% rate over an empty base
+    dead = " ".join(_caveman_readout(native=0, reverted=6, diverged=0))
+    assert "inactive" in dead and "0 steps ran on terse prose" in dead
+    assert "6 reverted" in dead
+    assert "fully-terse" not in dead and "action-aligned" not in dead
+
+    # partly reverted: the mixture is named, not papered over as "fully-terse"
+    mixed = " ".join(_caveman_readout(native=4, reverted=2, diverged=1))
+    assert "75% action-aligned" in mixed          # 3 of 4 terse steps proposed the recording
+    assert "2 step(s) reverted" in mixed and "fully-terse" not in mixed
+
+    # clean run: unchanged wording
+    clean = " ".join(_caveman_readout(native=4, reverted=0, diverged=1))
+    assert "75% action-aligned" in clean and "over a fully-terse history" in clean
+    assert "reverted" not in clean
+
+
+def test_caveman_state_splits_drift_by_whether_a_frozen_action_was_there_to_clash_with():
+    """`diverged` averages two step shapes that mean opposite things. On a turn with a frozen
+    tool_use (~60% of real decision points) the kept terse prose ends up beside an action it was
+    not written for — the residual artifact. On a prose-only turn (~9%) the whole message is
+    replaced, so a divergence is clean disagreement. Only `stapled` tells the two apart."""
+    def turn(prose, tool):
+        c = ([{"type": "text", "text": prose}] if prose else [])
+        if tool:
+            c.append({"type": "tool_use", "id": tool, "name": "Read", "input": {"file_path": "a"}})
+        return {"role": "assistant", "content": c}
+
+    msgs = [
+        {"role": "user", "content": [{"type": "text", "text": "task"}]},
+        turn("I'll read the file to understand the bug.", "rec_a"),   # text+tool  -> stapled
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "rec_a",
+                                      "content": "A"}]},
+        turn(None, "rec_b"),                                          # tool-only  -> invisible
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "rec_b",
+                                      "content": "B"}]},
+        turn("The bug is a division by zero on line 1.", None),       # text-only  -> clean
+    ]
+    st = eng.CavemanState(msgs, [1, 3, 5], "full")
+    terse = [{"type": "text", "text": "Terse."}]
+    st.advance(1, terse, matched=False)   # diverged ON a frozen action
+    st.advance(3, terse, matched=False)   # diverged on a turn with no prose at all
+    st.advance(5, terse, matched=False)   # diverged on a prose-only turn
+
+    assert st.native == 2                 # the tool-only turn had no prose to shrink
+    assert st.diverged == 2               # ...so it cannot drift either
+    assert st.stapled == 1, "only the text+tool turn leaves prose beside a frozen action"
+    # the stapled turn is exactly the artifact: terse prose, recorded action, unchanged result
+    assert st.hist[1]["content"][0]["text"] == "Terse."
+    assert st.hist[1]["content"][1]["id"] == "rec_a"
+    # the prose-only turn is replaced wholesale — nothing to clash with
+    assert st.hist[-1]["content"] == [{"type": "text", "text": "Terse."}]
+    # agreement on an action turn is not stapled, by definition
+    st2 = eng.CavemanState(msgs, [1], "full")
+    st2.advance(1, terse, matched=True)
+    assert st2.diverged == 0 and st2.stapled == 0
+
+
+def test_caveman_readout_splits_stapled_from_clean_drift():
+    """The readout must not report one drift number: a run can drift a lot with zero artifact,
+    or a little with all of it stapled beside a frozen action."""
+    mixed = " ".join(_caveman_readout(native=8, reverted=0, diverged=4, stapled=1))
+    assert "4 drifted" in mixed
+    assert "1 beside a different frozen action" in mixed
+    assert "3 on a prose-only turn (clean)" in mixed
+    # older artifacts (pre-split) carry no stapled count — degrade to the plain number
+    old = " ".join(_caveman_readout(native=8, reverted=0, diverged=4, stapled=None))
+    assert "4 drifted" in old and "frozen action" not in old
+
+
+def test_caveman_readout_states_its_denominator():
+    """action-aligned % is over PROSE steps; the table's 'vs original' is over every successful
+    step. ~30% of real decision points are tool-only (no prose — cannot be terse, cannot drift),
+    so the two legitimately disagree. Unexplained, one of them reads as wrong."""
+    # helper builds a 3-successful-step arm; 2 of those steps carried prose
+    line = " ".join(_caveman_readout(native=2, reverted=0, diverged=1))
+    assert "2 of 3 successful steps had prose" in line
+    assert "cannot drift" in line and "vs original" in line
+

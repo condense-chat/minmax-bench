@@ -404,6 +404,7 @@ class QualityWizardResult:
     ctx_gate: int = 50_000     # 0 = deliberately replay a below-gate session
     independent_budgets: bool = False  # True = each arm to own budget; False = cap to control
     resume: bool = True        # skip arms already finished (.done sentinel) on re-run to same out
+    caveman_mode: str = "full"  # caveman arm intensity: lite | full | ultra
 
 
 def _ask_int(console: Console, prompt: str, default: int, lo: int = 0) -> int:
@@ -589,11 +590,25 @@ def _full_wizard(console: Console) -> QualityWizardResult:
          True, False),
         ("vanilla-proxy", "vanilla-proxy — passthrough control (isolates the proxy-wiring "
                           "confound every proxy arm shares)", True, False),
+        ("caveman", "caveman — terse-output skill; not a proxy, so it reads against plain "
+                    "vanilla", True, False),
     ])
+    # caveman intensity — the SAME knob as the incremental wizard (both set TMB_CAVEMAN_MODE),
+    # only asked when the arm is selected so full and incremental legs of one experiment don't
+    # silently run different levels.
+    caveman_mode = "full"
+    if "caveman" in arms:
+        caveman_mode = _select_one(console, "caveman intensity", [
+            ("full", "full — classic caveman: drop articles, fragments OK (default)", True),
+            ("lite", "lite — no filler/hedging, keep grammar (conservative)", True),
+            ("ultra", "ultra — maximum terseness", True),
+        ])
     # Group shortcuts, biased toward sessions long enough that condense/headroom actually
     # compact. The default 5 are SHORT tasks — an agent solves them without ever crossing
     # the compaction threshold, so a compressing arm just passes through (nothing to measure).
-    compacts = any(a.startswith(("condense", "headroom")) for a in arms)
+    # caveman has no threshold, but its ~750-token/turn ruleset tax only pays for itself once
+    # its own terse messages have accumulated — so short tasks under-serve it too.
+    compacts = any(a.startswith(("condense", "headroom", "caveman")) for a in arms)
     long_group = _resolve_tasks_safe("long")[0] or []
     n_long, n_hard = len(long_group), len(_resolve_tasks_safe("hard")[0] or [])
     n_all = len(_resolve_tasks_safe("all")[0] or [])
@@ -691,7 +706,7 @@ def _full_wizard(console: Console) -> QualityWizardResult:
     return QualityWizardResult(mode="full", arms=",".join(arms), tasks=tasks, model=model,
                                effort=effort, k=k, concurrency=concurrency, budget_usd=budget,
                                milestones=milestones, out=out, force=force, retries=retries,
-                               auth=auth)
+                               auth=auth, caveman_mode=caveman_mode)
 
 
 def _incremental_wizard(console: Console) -> QualityWizardResult:
@@ -740,7 +755,20 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     arms = _multiselect(console, "arms (vanilla control always included)", [
         ("condense", "condense — compaction proxy", True, True),
         ("headroom", "headroom — token proxy + injected retrieve loop (CCR)", True, False),
+        ("caveman", "caveman — terse-output skill; freezes the recorded tool rails, drifts "
+                    "only its terse prose", True, False),
     ])
+    # caveman intensity — only asked when the arm is selected. caveman has no internal
+    # compaction threshold, but the session-length gate (--ctx-gate, applied before any arm
+    # runs) still filters a short caveman-only session out; and its per-turn ruleset tax means
+    # short sessions come out net-negative on context, which the report's comp will show.
+    caveman_mode = "full"
+    if "caveman" in arms:
+        caveman_mode = _select_one(console, "caveman intensity", [
+            ("full", "full — classic caveman: drop articles, fragments OK (default)", True),
+            ("lite", "lite — no filler/hedging, keep grammar (conservative)", True),
+            ("ultra", "ultra — maximum terseness", True),
+        ])
     # inherit the session's OWN model by default — running it faithfully is the point;
     # an arm that can't serve it auto-falls-back at run time (only override deliberately)
     mt = Table(title="[bold]incremental model", show_header=False, box=None)
@@ -823,7 +851,8 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
                                conv=conv, task=task, arms=",".join(arms), model=model,
                                effort=effort, limit=limit, budget_usd=budget, out=out,
                                judge=judge, capture=capture, ctx_gate=ctx_gate,
-                               independent_budgets=independent_budgets, resume=resume, auth=auth)
+                               independent_budgets=independent_budgets, resume=resume, auth=auth,
+                               caveman_mode=caveman_mode)
 
 
 # --------------------------------------------------------------------- auth + setup
