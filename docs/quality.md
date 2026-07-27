@@ -146,8 +146,11 @@ Per arm you get **same-action agreement** (read against the control floor, not 1
 with `--judge goal`, a per-step good/degraded/bad rating; plus **avg context tokens**,
 **$ vs control** (over the common step set, cold-cache step 0 excluded), and a
 **recorded** row — what those turns *actually* consumed when the session ran, making the
-table both a comparison and a backtest. Note the condense arm sends your session content
-to `api.condense.chat`.
+table both a comparison and a backtest. It closes with a plain-English **bottom line** per
+arm — *context saved X% · $ saved Y% · <quality>* — where the quality metric is the one you
+chose (goal-quality under `--judge goal`, same-action fidelity otherwise; the structural
+`exact` column is dimmed under `--judge goal` so it isn't mistaken for the verdict). Note the
+condense arm sends your session content to `api.condense.chat`.
 
 | flag | meaning |
 |---|---|

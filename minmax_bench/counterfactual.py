@@ -985,6 +985,56 @@ _STOP_LABEL = {"complete": "ran full window", "budget": "budget cap",
                "unreachable": "endpoint unreachable", "errors": "consecutive errors"}
 
 
+def _saved_words(x):
+    """Plain-English delta vs control: `x = 1 - arm/control`, so positive = the arm used
+    fewer = a saving. Words, not a bare signed %, so the sign is never ambiguous."""
+    if x is None:
+        return "[dim]—[/]"
+    if x >= 0.005:
+        return f"[green]saved {x:.0%}[/]"
+    if x <= -0.005:
+        return f"[yellow]{-x:.0%} more[/]"
+    return "[dim]~0[/]"
+
+
+def _render_bottom_line(summary, console, common, ctrl, ctrl_c, floor, is_goal, cap_n):
+    """The plain 'what did I save, did quality hold' takeaway, one line per non-control arm.
+    The tables above have every column; this surfaces the two numbers the run is FOR — context
+    and $ saved — plus the quality metric the user ACTUALLY chose (goal-quality under --judge
+    goal, same-action fidelity otherwise), so the headline isn't the structural `exact` column."""
+    cgoal = None
+    if is_goal:
+        cq = _goal_counts(ctrl, common)
+        ct = sum(cq.values())
+        cgoal = cq.get("good", 0) / ct if ct else None
+    lines = []
+    for arm, a in summary["arms"].items():
+        if arm == "control":
+            continue
+        ac = _over(a, common)
+        comp = 1 - ac["ctx"] / ctrl_c["ctx"] if (ac and ctrl_c and ctrl_c["ctx"]) else None
+        costd = 1 - ac["cost"] / ctrl_c["cost"] if (ac and ctrl_c and ctrl_c["cost"]) else None
+        if is_goal:  # the chosen metric: per-step goal quality (good-rate), read vs control's
+            q = _goal_counts(a, common)
+            tot = sum(q.values())
+            gr = q.get("good", 0) / tot if tot else None
+            qual = ("[dim]quality —[/]" if gr is None else
+                    f"[green]quality {gr:.0%}[/]" if (cgoal is None or gr >= cgoal - 0.05)
+                    else f"[red]quality {gr:.0%}[/] [dim](floor {cgoal:.0%})[/]")
+        else:  # same-action fidelity vs the control noise floor
+            agree = ac["agree"] if ac else None
+            qual = ("[dim]faithful —[/]" if agree is None else
+                    f"[green]faithful {agree:.0%}[/]" if (floor is None or agree >= floor - 0.02)
+                    else f"[red]faithful {agree:.0%}[/] [dim](floor {floor:.0%})[/]")
+        lines.append(f"  [cyan]{arm:14}[/] context {_saved_words(comp)} · "
+                     f"$ {_saved_words(costd)} · {qual}")
+    if lines:
+        console.print(f"\n[bold]bottom line[/] [dim](vs control, first {cap_n} steps; "
+                      f"{'goal-quality' if is_goal else 'same-action fidelity'})[/]")
+        for ln in lines:
+            console.print(ln)
+
+
 def render_summary(summary: dict, console: Console) -> None:
     ctrl = summary["arms"].get("control", {})
     common = _common_steps(summary["arms"])
@@ -1069,10 +1119,15 @@ def render_summary(summary: dict, console: Console) -> None:
         # have no by_step latency); compaction (esp. condense-sync) and CCR round-trips add to it
         lat = (ac.get("latency") if ac else None) or a.get("avg_latency_s") or None
         lat_cell = f"{lat:.1f}s" if lat else "—"
+        # 'vs original' and 'exact' are STRUCTURAL same-action metrics; under --judge goal they
+        # are not the chosen metric (goal-quality is the headline table above), so dim both so
+        # a bright 'exact' isn't mistaken for the verdict.
+        exact_val = f"{a['agree_exact'] / n:.0%}" if n else "—"
+        exact_cell = f"[dim]{exact_val}[/]" if is_goal else exact_val
         t.add_row(
             arm, reached_cell, f"[red]{errs}[/]" if errs else "0",
             agree_cell,
-            f"{a['agree_exact'] / n:.0%}" if n else "—",
+            exact_cell,
             ctx_cell,
             f"{comp:+.0%}" if comp is not None else "—",
             cost_cell,
@@ -1080,6 +1135,7 @@ def render_summary(summary: dict, console: Console) -> None:
             lat_cell,
         )
     console.print(t)
+    _render_bottom_line(summary, console, common, ctrl, ctrl_c, floor, is_goal, cap_n)
     # if arms stopped at different depths (an arm hit its budget / error-bailed), say so —
     # the deltas above use the common steps, but the reader should see who stopped short
     reach = {arm: a.get("steps_ok", 0) for arm, a in summary["arms"].items() if a.get("by_step")}
