@@ -668,10 +668,14 @@ def test_goal_mode_suppresses_the_same_action_verdict():
     # goal is the chosen metric: the same-action "below the floor → trajectory loss" verdict
     # (low same-action reads as failure) must NOT appear; the goal verdict must
     assert "trajectory loss" not in goal and "same action vs original" not in goal
-    assert "degrade" in goal  # the goal-based verdict line is present
+    assert "degrade" in goal                       # the goal-based verdict line is present
+    assert "goal-quality" in goal                  # the bottom line names the chosen metric
 
-    off = render("off")  # structural is the metric here, so the same-action verdict SHOULD show
-    assert "same action vs original" in off
+    # structural is the metric here: the bottom line reports it as same-action FIDELITY (the
+    # concise replacement for the old verbose "same action vs original → trajectory loss" prose)
+    off = render("off")
+    assert "same-action fidelity" in off and "faithful" in off
+    assert "trajectory loss" not in off            # still no scary verbose verdict
 
 
 def test_ccr_step_executes_retrieve_then_scores_the_real_action(monkeypatch):
@@ -840,3 +844,46 @@ def test_named_tasks_are_validated_with_a_did_you_mean(monkeypatch, capsys):
     # nothing cached at all -> nothing to validate against, so don't invent an opinion
     monkeypatch.setattr(eng, "dataset_tasks", lambda org="terminal-bench": [])
     assert eng.resolve_tasks("anything") == ["anything"]
+def test_saved_words_reads_as_plain_english():
+    from minmax_bench.counterfactual import _saved_words
+    assert "saved 40%" in _saved_words(0.40)      # positive delta = a saving
+    assert "30% more" in _saved_words(-0.30)      # negative delta = the arm used MORE than control
+    assert "~0" in _saved_words(0.001)            # negligible
+    assert "—" in _saved_words(None)
+
+
+def test_incremental_bottom_line_uses_chosen_metric_and_shows_savings():
+    """The end-of-run bottom line must surface $ + context SAVED in plain words, and lead with
+    the metric the user chose: goal-quality under --judge goal (not the structural `exact`),
+    same-action fidelity otherwise."""
+    import io
+
+    from rich.console import Console
+
+    from minmax_bench import counterfactual as cf
+
+    def by(n, ctx, cost, agree, quality=None):
+        step = {"ctx": ctx, "cost": cost, "agree": agree, "latency": 0.5}
+        if quality:
+            step["quality"] = quality
+        return {i: dict(step) for i in range(n)}
+
+    def summary(judged, cq, aq):
+        return {"session": "/x/s.jsonl", "model": "m", "steps": 20, "judge": judged, "arms": {
+            "control": {"steps_ok": 6, "agree_action": 6, "agree_exact": 6,
+                        "by_step": by(6, 100_000, 1.0, True, cq)},
+            "condense": {"steps_ok": 6, "agree_action": 4, "agree_exact": 3,
+                         "by_step": by(6, 60_000, 0.6, False, aq)}}}
+
+    # goal: bottom line leads with 'quality' (the chosen metric), never 'faithful'
+    buf = io.StringIO()
+    cf.render_summary(summary("goal", "good", "good"), Console(file=buf, width=140))
+    tail = buf.getvalue().split("bottom line")[1]
+    assert "quality" in tail and "faithful" not in tail
+    assert "context saved 40%" in tail and "$ saved 40%" in tail
+
+    # structural (judge off): bottom line leads with same-action fidelity
+    buf2 = io.StringIO()
+    cf.render_summary(summary("off", None, None), Console(file=buf2, width=140))
+    tail2 = buf2.getvalue().split("bottom line")[1]
+    assert "faithful" in tail2 and "context saved 40%" in tail2
