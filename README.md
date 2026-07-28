@@ -34,8 +34,8 @@ Were tokens saved? Were dollars saved? Was quality kept?
   The report opens on this: every task and session pooled into one row per arm, each number
   with a 95% bootstrap CI. A cell is coloured only when its paired delta vs control excludes
   zero — plain means *indistinguishable from control at this n*, which is the common outcome
-  and not a pass. Read the quality columns against **context removed**: an arm at +3% next to
-  one at +48% isn't gentler, it barely fired.
+  and not a pass. Read the quality columns against **context removed**: an arm at +3.5% next
+  to one at +51% isn't gentler, it barely fired.
 
 
 Cost tells you what a strategy saves; quality tells you whether those savings are real.
