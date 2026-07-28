@@ -887,3 +887,92 @@ def test_incremental_bottom_line_uses_chosen_metric_and_shows_savings():
     cf.render_summary(summary("off", None, None), Console(file=buf2, width=140))
     tail2 = buf2.getvalue().split("bottom line")[1]
     assert "faithful" in tail2 and "context saved 40%" in tail2
+
+
+# ---------------------------------------------------------------- overall summary (pooled)
+def _incr_dir(tmp_path, task, arms):
+    """Write incremental artifacts: arms = {arm: [(good, redundant, ctx), ...]} by step."""
+    d = tmp_path / "incremental"
+    d.mkdir(exist_ok=True)
+    for arm, steps in arms.items():
+        recs = [{"step": i, "quality": "good" if g else "bad", "redundant": r,
+                 "agree_action": g, "cost_usd": 1.0, "usage": {"input_tokens": c}}
+                for i, (g, r, c) in enumerate(steps)]
+        (d / f"{task}-{arm}.jsonl").write_text("\n".join(json.dumps(x) for x in recs))
+
+
+def _built(tmp_path, arms="condense"):
+    args = SimpleNamespace(arms=arms, tasks="kv-store-grpc", agent="claude-code",
+                           ctx_gate=50_000, **{"from": str(tmp_path)})
+    return report.build(args)
+
+
+def test_summary_pools_quality_and_redundancy_against_control(tmp_path):
+    """The overall row is the paired pooled rate, not an average of per-task percentages."""
+    ctrl = [(True, False, 100)] * 11 + [(False, False, 100)]      # 10/11 good after step 0
+    arm = [(True, False, 40)] * 6 + [(False, True, 40)] * 6       # 5/11 good, 6/11 redundant
+    _incr_dir(tmp_path, "sess", {"control": ctrl, "condense": arm})
+    s = report.summarize(_built(tmp_path))["condense"]
+    assert s["steps"] == 11                                       # step 0 excluded everywhere
+    assert abs(s["good"][0] - 5 / 11) < 1e-9
+    assert abs(s["good_ctrl"][0] - 10 / 11) < 1e-9
+    assert abs(s["red"][0] - 6 / 11) < 1e-9
+    assert abs(s["comp"] - 0.6) < 1e-9                            # 40 vs 100 per step
+    assert s["good"][1] <= s["good"][0] <= s["good"][2]           # CI brackets the point value
+
+
+def test_summary_delta_ci_flags_only_real_differences():
+    """Colouring is driven by the paired delta CI, never by which side of the mean a value
+    landed — a difference the bootstrap can't separate from zero must stay unmarked."""
+    same = [1, 0] * 40
+    assert report._sig(report._boot_pair(same, same[:])[2], True) is None
+    worse = [0] * 80
+    assert report._sig(report._boot_pair(worse, same)[2], True) == "bad"
+    assert report._sig(report._boot_pair(worse, same)[2], False) == "good"   # lower is better
+
+
+def test_summary_excludes_passthrough_sessions(tmp_path):
+    """A session where the arm never compressed is dropped from the incremental columns —
+    counting it would pull every arm toward control and read as 'trajectory preserved'."""
+    ctrl = [(True, False, 100)] * 6
+    _incr_dir(tmp_path, "fired", {"control": ctrl, "condense": [(False, False, 50)] * 6})
+    _incr_dir(tmp_path, "flat", {"control": ctrl, "condense": [(True, False, 100)] * 6})
+    s = report.summarize(_built(tmp_path))["condense"]
+    assert s["sessions"] == ["fired"] and s["skipped"] == ["flat"]
+    assert s["good"][0] == 0.0                     # only the engaged session counts
+
+
+def test_summary_repeats_control_when_arms_cover_different_material(tmp_path):
+    """Two arms measured on different sessions cannot share one baseline row: the table must
+    repeat control per arm rather than compare an arm to material it never ran."""
+    _incr_dir(tmp_path, "a", {"control": [(True, False, 100)] * 6,
+                              "condense": [(True, False, 50)] * 6})
+    _incr_dir(tmp_path, "b", {"control": [(False, False, 100)] * 6,
+                              "headroom": [(False, False, 50)] * 6})
+    sr = report.summary_rows(_built(tmp_path, arms="condense,headroom"))
+    assert sr["shared"] is False
+    assert [r["arm"] for r in sr["rows"]] == ["control", "condense", "control", "headroom"]
+
+
+def test_summary_full_run_column_counts_lost_trials_as_failures(tmp_path):
+    """Solve rate is over trials REQUESTED, so a crashed trial is a failure, not missing data —
+    otherwise an arm whose bad trials died would outscore one whose bad trials finished."""
+    def row(task, sub_gate):
+        return {"task": task, "sub_gate": sub_gate,
+                "vanilla": {"solve": 2, "attempted": 2, "n": 2},
+                "arms": {"condense": {"solve": 1, "attempted": 2, "n": 1, "incr": None}}}
+    s = report.summarize({"rows": [row("t", False)], "arms": ["condense"]})["condense"]
+    assert s["full"][0] == 0.5 and s["full_ctrl"][0] == 1.0
+
+
+def test_summary_full_run_column_drops_tasks_under_the_compaction_gate():
+    """A task vanilla never grew big enough to compact cannot carry a compaction-quality
+    claim — it is dropped from the pooled column and counted in the open, not averaged in."""
+    def row(task, sub_gate):
+        return {"task": task, "sub_gate": sub_gate,
+                "vanilla": {"solve": 2, "attempted": 2, "n": 2},
+                "arms": {"condense": {"solve": 1, "attempted": 2, "n": 1, "incr": None}}}
+    s = report.summarize({"rows": [row("long", False), row("tiny", True)],
+                          "arms": ["condense"]})["condense"]
+    assert s["full_tasks"] == ["long"] and s["full_short"] == ["tiny"]
+    assert "⊘1 too short" in report._arm_note(s)

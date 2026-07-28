@@ -187,6 +187,54 @@ solve**, each vs the vanilla noise floor: ✓ overlap / ✗ disjoint, ≥2 finis
 (rendered as **fid** next to the control floor, plus **comp** and **$Δ** over the common
 step set). Deterministic, no network.
 
+### the overall table — one row per arm, with error bars
+
+The per-task tables answer *"what happened on this task"*; every cell there is one or a few
+trials, so nothing in them carries an error bar and reading them means holding a column of
+small numbers in your head. The **overall** table, printed first, answers the other question
+— *"across everything that was run, does this arm cost quality, and is the difference bigger
+than the noise?"*
+
+```
+┏━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
+┃arm          ┃     quality ┃     quality ┃   redundant ┃     context┃
+┃             ┃   full runs ┃ incremental ┃  /100 steps ┃     removed┃
+┡━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
+│control      │  52.8 ±25.0 │  78.1 ± 4.7 │   5.0 ± 2.5 │           —│
+│             │    12 tasks │ 317 steps/4s│             │            │
+│condense     │  75.0 ±25.0 │  73.5 ± 4.7 │  11.0 ± 3.5 │      +39.1%│
+│⊘2 too short │             │             │             │            │
+└─────────────┴─────────────┴─────────────┴─────────────┴────────────┘
+```
+
+- **quality (full runs)** — verifier pass rate, macro-averaged per task so a task with many
+  trials can't outvote one with few. Lost trials count as failures.
+- **quality (incremental)** — the share of replayed steps whose action the goal judge rated
+  *good*; without `--judge goal` it falls back to structural agreement with the recording,
+  a much noisier floor.
+- **redundant** — steps that re-fetched information the agent already had, per 100 steps.
+- **context removed** — not a quality axis. It is what the quality columns are the *price
+  of*, and the number without which they can't be read: an arm at `+3%` next to one at
+  `+39%` isn't gentler, it barely fired. `⊘` marks <2%.
+
+Three rules keep it from over-claiming:
+
+1. **Each column is pooled over material where the method could act.** Incremental drops
+   sessions the arm passed through; full drops ⊘ tasks whose peak context never reached the
+   compaction gate. Both counts are printed on the arm row (`⊘2 too short`, `⊘6
+   passthrough`) — nothing is dropped quietly.
+2. **± is a 95% bootstrap CI**, seeded, so the same artifacts always render the same bars.
+   Full-run quality resamples *tasks*; the incremental columns resample the paired *steps*.
+   Steps within a session are correlated and are resampled as independent, so those bars are
+   if anything optimistic.
+3. **A cell is coloured only when its paired delta vs control excludes zero.** Plain is the
+   common outcome at bench-scale k and means *indistinguishable from control* — not a pass.
+
+Each arm carries its own control reference, paired over that arm's material. When the arms
+ran over the same tasks and sessions one control row heads the table; when they didn't,
+control is repeated per arm, because a single baseline row would be comparing an arm against
+material it never ran.
+
 ## The rest of the toolbox
 
 ```bash
