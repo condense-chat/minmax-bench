@@ -203,7 +203,7 @@ than the noise?"*
 │control      │  52.8 ±25.0 │  78.1 ± 4.7 │   5.0 ± 2.5 │           —│
 │             │    12 tasks │ 317 steps/4s│             │            │
 │condense     │  75.0 ±25.0 │  73.5 ± 4.7 │  11.0 ± 3.5 │      +39.1%│
-│⊘2 too short │             │             │             │            │
+│⊘2 too short │ Δ+22.2 ±30.6│  Δ-4.6 ± 5.9│  Δ+6.0 ± 3.2│            │
 └─────────────┴─────────────┴─────────────┴─────────────┴────────────┘
 ```
 
@@ -227,8 +227,12 @@ Three rules keep it from over-claiming:
    Full-run quality resamples *tasks*; the incremental columns resample the paired *steps*.
    Steps within a session are correlated and are resampled as independent, so those bars are
    if anything optimistic.
-3. **A cell is coloured only when its paired delta vs control excludes zero.** Plain is the
-   common outcome at bench-scale k and means *indistinguishable from control* — not a pass.
+3. **Δ under an arm value is its *paired* difference vs control**, with its own CI. The ± on
+   the values themselves are marginal — arm and control move together step-for-step, so they
+   can't be eyeballed against each other, and only the Δ answers "is this a real difference?"
+   A Δ bar straddling zero means *indistinguishable from control at this n*, which is the
+   common outcome and not a pass. Nothing is coloured or marked better/worse: the table
+   prints the numbers and you draw the line.
 
 Each arm carries its own control reference, paired over that arm's material. When the arms
 ran over the same tasks and sessions one control row heads the table; when they didn't,

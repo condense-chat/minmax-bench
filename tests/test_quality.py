@@ -921,14 +921,15 @@ def test_summary_pools_quality_and_redundancy_against_control(tmp_path):
     assert s["good"][1] <= s["good"][0] <= s["good"][2]           # CI brackets the point value
 
 
-def test_summary_delta_ci_flags_only_real_differences():
-    """Colouring is driven by the paired delta CI, never by which side of the mean a value
-    landed — a difference the bootstrap can't separate from zero must stay unmarked."""
+def test_summary_shows_the_paired_delta_instead_of_a_verdict():
+    """Each arm cell carries the paired difference and its CI — no cell is marked better or
+    worse, because a difference the bootstrap can't separate from zero isn't one."""
     same = [1, 0] * 40
-    assert report._sig(report._boot_pair(same, same[:])[2], True) is None
-    worse = [0] * 80
-    assert report._sig(report._boot_pair(worse, same)[2], True) == "bad"
-    assert report._sig(report._boot_pair(worse, same)[2], False) == "good"   # lower is better
+    assert report._boot_pair(same, same[:])[2] == (0.0, 0.0, 0.0)     # identical legs, no delta
+    worse = report._boot_pair([0] * 80, same)[2]
+    assert worse[2] < 0                                              # a real drop clears zero
+    cell = report._cell((0.3, 0.2, 0.4), (-0.5, -0.62, -0.4))         # widest side sets the bar
+    assert cell["txt"] == "30.0 ±10.0" and cell["sub"] == "Δ-50.0 ±12.0"
 
 
 def test_summary_excludes_passthrough_sessions(tmp_path):

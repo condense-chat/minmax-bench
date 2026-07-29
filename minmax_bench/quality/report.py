@@ -608,14 +608,18 @@ def summarize(d):
     return out
 
 
-def _sig(delta, better_is_up):
-    """'good' | 'bad' | None for a delta CI: None whenever it straddles zero (no verdict)."""
+def _delta(delta, scale=100.0, dec=1):
+    """The paired arm-vs-control difference, printed as a number rather than a verdict.
+
+    The ± on a value is a MARGINAL interval; it can't be eyeballed against control's, because
+    the two legs are paired step-for-step and move together. This is that paired difference
+    with its own CI — a bar that clears zero is a real difference, one that straddles it isn't.
+    The table shows the number and leaves that call to the reader.
+    """
     if not delta:
-        return None
+        return ""
     m, lo, hi = delta
-    if lo <= 0 <= hi:
-        return None
-    return "good" if (m > 0) == better_is_up else "bad"
+    return f"Δ{m * scale:+.{dec}f} ±{max(hi - m, m - lo) * scale:.{dec}f}"
 
 
 SUMMARY_COLS = (("quality", "full runs"), ("quality", "incremental"),
@@ -658,20 +662,19 @@ def _arm_note(a):
     return " · ".join(note)
 
 
-def _cell(tri, delta=None, better_is_up=True, sub="", scale=100.0, dec=1, sign=False):
-    """One summary cell, renderer-agnostic: text, its denominator, and a verdict state.
+def _cell(tri, delta=None, sub="", scale=100.0, dec=1):
+    """One summary cell, renderer-agnostic: a value ±CI, with a second line underneath.
 
-    state is 'good'/'bad' only when the paired delta's CI excludes zero. Leaving it None
-    otherwise is the honest default — at bench-scale k most cells are indistinguishable from
-    control, and shading them by which side of the mean they landed would invent a result.
+    That second line is the denominator on a control row and the paired delta on an arm row.
+    No cell carries a good/bad verdict: at bench-scale k most differences are indistinguishable
+    from control, and marking cells by which side of the mean they landed would invent a result
+    the numbers don't support. The delta and its CI say it all, and the reader reads them.
     """
     if not tri:
-        return {"txt": "—", "sub": sub, "state": None}
+        return {"txt": "—", "sub": sub}
     m, lo, hi = tri
     hw = max(hi - m, m - lo)
-    v = f"{m * scale:+.{dec}f}" if sign else f"{m * scale:.{dec}f}"
-    return {"txt": f"{v} ±{hw * scale:.{dec}f}", "sub": sub,
-            "state": _sig(delta, better_is_up) if delta else None}
+    return {"txt": f"{m * scale:.{dec}f} ±{hw * scale:.{dec}f}", "sub": sub or _delta(delta)}
 
 
 def summary_rows(d):
@@ -697,19 +700,18 @@ def summary_rows(d):
         nr = f"{a['red_steps']} steps" if a["red_steps"] and a["red_steps"] != a["steps"] else ""
         return {"arm": "control", "note": "", "control": True, "cells": [
             _cell(a["full_ctrl"], sub=nt), _cell(a["good_ctrl"], sub=ns),
-            _cell(a["red_ctrl"], sub=nr), {"txt": "—", "sub": "", "state": None}]}
+            _cell(a["red_ctrl"], sub=nr), {"txt": "—", "sub": ""}]}
 
     def arm(name):
         a = s[name]
         comp = a["comp"]
         # an arm that removed <2% never really fired: its flat quality columns are an absence
         # of measurement, and saying so here is the difference between "preserved" and "untested"
-        ccell = {"txt": "—", "sub": "", "state": None} if comp is None else {
-            "txt": f"{comp * 100:+.1f}%", "sub": "⊘ barely fired" if abs(comp) < 0.02 else "",
-            "state": "warn" if abs(comp) < 0.02 else None}
+        ccell = {"txt": "—", "sub": ""} if comp is None else {
+            "txt": f"{comp * 100:+.1f}%", "sub": "⊘ barely fired" if abs(comp) < 0.02 else ""}
         return {"arm": name, "note": _arm_note(a), "control": False, "cells": [
-            _cell(a["full"], a["full_d"], True), _cell(a["good"], a["good_d"], True),
-            _cell(a["red"], a["red_d"], False), ccell]}
+            _cell(a["full"], a["full_d"]), _cell(a["good"], a["good_d"]),
+            _cell(a["red"], a["red_d"]), ccell]}
 
     rows = []
     if shared:
@@ -803,8 +805,7 @@ def _plain(text):
 
 
 def _summary_md(d):
-    """The overall summary as a markdown table — same rows the console renders, with the
-    significance state spelled out (✓ better / ✗ worse) since md carries no colour."""
+    """The overall summary as a markdown table — the same rows the console renders."""
     sr = summary_rows(d)
     if not sr:
         return []
@@ -813,11 +814,7 @@ def _summary_md(d):
          "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for row in sr["rows"]:
         label = row["arm"] + (f" ({row['note']})" if row["note"] else "")
-        cells = []
-        for c in row["cells"]:
-            txt = c["txt"] + (f" [{c['sub']}]" if c["sub"] else "")
-            mark = {"good": " ✓", "bad": " ✗"}.get(c["state"], "")
-            cells.append(txt + mark)
+        cells = [c["txt"] + (f" [{c['sub']}]" if c["sub"] else "") for c in row["cells"]]
         o.append("| " + " | ".join([label] + cells) + " |")
     if not sr["shared"]:
         o.append("\nArms ran over different tasks/sessions, so each is shown against its own "
@@ -956,9 +953,8 @@ def _html_summary(d):
         note = f'<span class="s">{H.escape(row["note"])}</span>' if row["note"] else ""
         tds = []
         for c in row["cells"]:
-            cls = {"good": "good", "bad": "bad", "warn": "warn"}.get(c["state"], "")
             sub = f'<span class="d">{H.escape(c["sub"])}</span>' if c["sub"] else ""
-            tds.append(f'<td><span class="{cls}">{H.escape(c["txt"])}</span>{sub}</td>')
+            tds.append(f'<td>{H.escape(c["txt"])}{sub}</td>')
         cls = " v" if row["control"] else ""
         trs.append(f'<tr><td class="l task{cls}"><b>{H.escape(row["arm"])}</b>{note}</td>'
                    + "".join(tds) + "</tr>")
@@ -1055,11 +1051,13 @@ _SUMMARY_LEGEND = (
     "macro-averaged per task so a task with many trials can't outvote one with few; lost trials "
     "count as failures. quality (incremental) = the share of replayed steps whose action the "
     "goal judge rated good (or, unjudged, that structurally matched the recording — a much "
-    "noisier floor). redundant = steps that re-fetched information the agent already had. A "
-    "cell is COLOURED only when its paired delta vs control excludes zero — green better, red "
-    "worse; plain means indistinguishable from control at this n, which is the common case and "
-    "not a pass. context removed is not a quality axis: it is what the quality columns are the "
-    "price of, and [yellow]⊘[/] marks an arm that removed <2% — its flat quality numbers are an "
+    "noisier floor). redundant = steps that re-fetched information the agent already had. Under "
+    "each arm value, Δ is its PAIRED difference vs control with its own CI — the ± on the values "
+    "are marginal and can't be eyeballed against each other. A Δ bar that straddles zero means "
+    "indistinguishable from control at this n, which is the common case and not a pass. No cell "
+    "is marked better or worse: that reading is yours. context removed is not a quality axis: "
+    "it is what the quality columns are the price of, and the number without which they can't "
+    "be read. ⊘ marks an arm that removed <2% — its flat quality numbers are an "
     "absence of measurement, not a preserved trajectory. Both modes count only material where "
     "the method could act, and say what they dropped: ⊘n too short = tasks whose peak context "
     "never reached the compaction gate, ⊘n passthrough = sessions where the arm never engaged. "
@@ -1271,18 +1269,14 @@ def _under(cell, note):
     return f"{cell}\n[dim]{note}[/]" if note else cell
 
 
-_SUM_COLOR = {"good": "green", "bad": "red", "warn": "yellow"}
-
-
 def _summary_cell(c):
-    """Console cell from a shared summary_rows cell: value ±CI, its denominator dim underneath,
-    coloured only when the paired delta cleared zero."""
+    """Console cell from a shared summary_rows cell: value ±CI, with its denominator (control
+    rows) or paired delta (arm rows) dim underneath. Deliberately monochrome — see `_cell`."""
     txt = c["txt"]
     if " ±" in txt:                              # dim the error bar, keep the value bright
         v, _, hw = txt.partition(" ±")
         txt = f"{v} [dim]±{hw}[/]"
-    color = _SUM_COLOR.get(c["state"])
-    return _under(f"[{color}]{txt}[/]" if color else txt, c["sub"])
+    return _under(txt, c["sub"])
 
 
 def _summary_table(console, d, model):
