@@ -24,6 +24,7 @@ import argparse
 import glob
 import json
 import os
+import random
 import re
 
 try:  # rich renders the terminal tables, but analysis must work on a bare python3
@@ -404,6 +405,20 @@ def _load_incremental(root, arms):
                 "fid": sum(_faithful_step(A[s]) for s in common) / len(common),
                 "fid_ctrl": sum(_faithful_step(C[s]) for s in common) / len(common),
                 "redund": sum(bool(A[s].get("redundant")) for s in common),
+                # PAIRED per-step vectors (arm and control aligned index-for-index over the
+                # common steps) — the overall summary pools these across sessions and
+                # bootstraps them for error bars. Kept private: they are raw material for
+                # summarize(), not a displayed field.
+                "_good": [int(_good_step(A[s])) for s in common],
+                "_good_ctrl": [int(_good_step(C[s])) for s in common],
+                "_red": [int(bool(A[s].get("redundant"))) for s in common],
+                "_red_ctrl": [int(bool(C[s].get("redundant"))) for s in common],
+                # only steps where BOTH legs recorded the field — older artifacts predate
+                # redundancy scoring, and a missing flag is unknown, not "not redundant"
+                "_red_ok": [int("redundant" in A[s] and "redundant" in C[s]) for s in common],
+                # token totals behind `comp`, so pooling across sessions can weight by size
+                # instead of averaging percentages of wildly different denominators
+                "_ctx": ac, "_ctx_ctrl": cc,
                 # CCR engagement (headroom): retrieves the agent made, and whether the arm ran
                 # with the retrieve loop wired at all (the field is only written when it is)
                 "retrieves": sum(r.get("ccr_retrieves", 0) for r in A.values()),
@@ -432,21 +447,280 @@ def _scoring(recset):
     return "struct"
 
 
-def _faithful_step(r):
-    """A faithful step took a valid action and didn't redundantly re-fetch info it already had.
+def _good_step(r):
+    """Was this step's action a valid one, ignoring redundancy?
 
     'Valid' depends on how the run was scored. With a GOAL judge (each action rated on its own
-    merit toward the task), a good step is faithful — control replaying itself scores ~100%,
+    merit toward the task), a good step is a good step — control replaying itself scores ~100%,
     so an arm only loses by taking WORSE steps: a trustworthy floor. Without a judge, we fall
     back to STRUCTURAL agreement with the original recorded action, whose ceiling is low even
     for control (the model rarely reproduces its own past sampling) — noisy, not a true 100%.
     """
     q = r.get("quality")
     if q is not None:
-        good = q == "good"                                   # goal judge
-    else:                                                    # structural (equiv upgrades a
-        good = bool(r.get("agree_semantic", r.get("agree_action")))  # near-miss if it ran)
-    return good and not r.get("redundant")
+        return q == "good"                                   # goal judge
+    return bool(r.get("agree_semantic", r.get("agree_action")))  # structural / equiv near-miss
+
+
+def _faithful_step(r):
+    """A faithful step took a valid action AND didn't redundantly re-fetch info it already had.
+
+    The two halves are separable and the overall summary reports them separately (quality vs
+    redundant steps) — this conjunction is the single per-step number the per-task fidelity
+    column is built from."""
+    return _good_step(r) and not r.get("redundant")
+
+
+# ---------------------------------------------------------------- overall summary (pooled)
+# The per-task tables answer "what happened on THIS task"; every cell there is one or a few
+# trials, so nothing in them carries an error bar and a reader is left eyeballing a column of
+# small numbers. This section answers the other question — "across everything that was run,
+# how does each arm compare to the no-compaction baseline, and is the difference bigger than
+# the noise?" — by pooling and attaching a 95% CI to every number.
+#
+# Deliberately still just arithmetic over stored artifacts: no model call, no scipy. The CIs
+# are a seeded bootstrap so the same artifacts always render the same report.
+_BOOT_N = 2000
+_BOOT_SEED = 0xC0FFEE
+
+
+def _ci(draws, mean):
+    """(mean, lo, hi) at 95% from sorted bootstrap draws — percentile method."""
+    if not draws:
+        return (mean, mean, mean)
+    d = sorted(draws)
+    lo = d[int(0.025 * len(d))]
+    hi = d[min(len(d) - 1, int(0.975 * len(d)))]
+    return (mean, lo, hi)
+
+
+def _boot_pair(arm_vec, ctrl_vec, weights=None):
+    """Bootstrap a paired rate comparison.
+
+    arm_vec / ctrl_vec are aligned 0/1 vectors over the SAME units (steps, or tasks). Resamples
+    unit INDICES with replacement, so the arm and its control always move together — the
+    comparison is paired, which is the whole point of teacher-forcing the same steps through
+    both legs. `weights` (per-unit denominators, for task-level rates) makes each unit's
+    contribution its own rate rather than a count.
+
+    Returns (arm(mean,lo,hi), ctrl(mean,lo,hi), delta(mean,lo,hi)) in RATE units (0-1).
+    Caveat kept honest in the legend: steps within one session are correlated and this
+    resamples them as if independent, so step-level bars are, if anything, optimistic.
+    """
+    n = len(arm_vec)
+    if not n:
+        return None, None, None
+    w = weights or [1.0] * n
+    tot = sum(w) or 1.0
+    am = sum(a * x for a, x in zip(arm_vec, w, strict=True)) / tot
+    cm = sum(c * x for c, x in zip(ctrl_vec, w, strict=True)) / tot
+    rng = random.Random(_BOOT_SEED)
+    da, dc, dd = [], [], []
+    idx = range(n)
+    for _ in range(_BOOT_N):
+        s = [rng.choice(idx) for _ in idx]
+        t = sum(w[i] for i in s) or 1.0
+        a = sum(arm_vec[i] * w[i] for i in s) / t
+        c = sum(ctrl_vec[i] * w[i] for i in s) / t
+        da.append(a)
+        dc.append(c)
+        dd.append(a - c)
+    return _ci(da, am), _ci(dc, cm), _ci(dd, am - cm)
+
+
+def _solve_rate(c):
+    """A cell's solve rate, with lost trials counted as failures (the report's convention)."""
+    n = c["attempted"] or c["n"]
+    return (c["solve"] / n) if n else None
+
+
+def summarize(d):
+    """Pool every task/session into ONE row per arm + a baseline row, each number with a CI.
+
+    Three quality axes, from the two modes that measure different things (kept labelled, never
+    blended into a single score):
+      - full runs      solve rate (verifier passed), macro-averaged over tasks so a task with
+                       many trials doesn't outvote one with few; CI bootstraps TASKS.
+      - incremental    per-step action quality (goal judge's `good`, or structural agreement
+                       when the run wasn't goal-judged) and the redundant-step rate; both
+                       paired against control step-for-step, CI bootstraps STEPS.
+      - context        tokens actually removed vs control — not a quality axis, but the one
+                       number without which the quality columns cannot be read (an arm that
+                       compressed nothing has no quality result, only an absence of one).
+
+    Both modes count only material where the method could ACT, and the two exclusions are the
+    same rule wearing different clothes:
+      - incremental drops sessions the arm passed through (`_engaged`: it never compressed,
+        retrieved, or applied its transform);
+      - full drops ⊘ tasks, where vanilla's peak context never reached the compaction gate, so
+        nothing could compact.
+    Including either would pad every arm toward control and let "was never applied" render as
+    "trajectory preserved". Both counts are carried out and shown, so nothing is dropped quietly.
+    """
+    out = {"arms": [], "n_arms": {}, "sessions_skipped": {}}
+    for arm in d["arms"]:
+        # ---- full mode: one solve rate per task, paired with vanilla's on the same task
+        a_rates, v_rates, tasks, short = [], [], [], []
+        for r in d["rows"]:
+            a, v = r["arms"][arm], r["vanilla"]
+            ar, vr = _solve_rate(a), _solve_rate(v)
+            if ar is None or vr is None:
+                continue
+            if r["sub_gate"]:
+                short.append(r["task"])
+                continue
+            a_rates.append(ar)
+            v_rates.append(vr)
+            tasks.append(r["task"])
+        full_a, full_c, full_d = _boot_pair(a_rates, v_rates) if a_rates else (None, None, None)
+
+        # ---- incremental: pool the paired per-step vectors of every ENGAGED session
+        g_a, g_c, r_a, r_c, ctx_a, ctx_c = [], [], [], [], 0, 0
+        sessions, skipped = [], []
+        for r in d["rows"]:
+            inc = r["arms"][arm].get("incr") or {}
+            if not inc.get("_good"):
+                continue
+            if not _engaged(inc):
+                skipped.append(r["task"])
+                continue
+            sessions.append(r["task"])
+            g_a += inc["_good"]
+            g_c += inc["_good_ctrl"]
+            r_a += [x for x, ok in zip(inc["_red"], inc["_red_ok"], strict=True) if ok]
+            r_c += [x for x, ok in zip(inc["_red_ctrl"], inc["_red_ok"], strict=True) if ok]
+            ctx_a += inc.get("_ctx", 0)
+            ctx_c += inc.get("_ctx_ctrl", 0)
+        good_a, good_c, good_d = _boot_pair(g_a, g_c) if g_a else (None, None, None)
+        red_a, red_c, red_d = _boot_pair(r_a, r_c) if r_a else (None, None, None)
+        out["arms"].append(arm)
+        out[arm] = {
+            "full": full_a, "full_ctrl": full_c, "full_d": full_d, "full_tasks": tasks,
+            "full_short": short,
+            "good": good_a, "good_ctrl": good_c, "good_d": good_d,
+            "red": red_a, "red_ctrl": red_c, "red_d": red_d,
+            "comp": (1 - ctx_a / ctx_c) if ctx_c else None,
+            "sessions": sessions, "skipped": skipped,
+            "steps": len(g_a), "red_steps": len(r_a),
+            "scoring": next((r["arms"][arm]["incr"]["scoring"] for r in d["rows"]
+                             if (r["arms"][arm].get("incr") or {}).get("scoring")), None),
+        }
+    return out
+
+
+def _delta(delta, scale=100.0, dec=1):
+    """The paired arm-vs-control difference, printed as a number rather than a verdict.
+
+    The ± on a value is a MARGINAL interval; it can't be eyeballed against control's, because
+    the two legs are paired step-for-step and move together. This is that paired difference
+    with its own CI — a bar that clears zero is a real difference, one that straddles it isn't.
+    The table shows the number and leaves that call to the reader.
+    """
+    if not delta:
+        return ""
+    m, lo, hi = delta
+    return f"Δ{m * scale:+.{dec}f} ±{max(hi - m, m - lo) * scale:.{dec}f}"
+
+
+SUMMARY_COLS = (("quality", "full runs"), ("quality", "incremental"),
+                ("redundant", "/100 steps"), ("context", "removed"))
+
+
+def _ref_arm(s):
+    """The arm with the widest coverage — its control values head the table when all the arms
+    share them."""
+    return max(s["arms"], key=lambda a: (len(s[a]["full_tasks"]), s[a]["steps"]), default=None)
+
+
+def _refs_agree(s, ref):
+    """Do all arms share the reference arm's control values (to within a rounding step)?
+
+    They do whenever the arms ran over the same tasks and sessions — the normal case, and then
+    one control row is enough. When they don't, a single baseline row would be comparing each
+    arm against material it never ran, so the table repeats control per arm instead.
+    """
+    for a in s["arms"]:
+        for k in ("full_ctrl", "good_ctrl", "red_ctrl"):
+            x, y = s[a][k], s[ref][k]
+            if (x is None) != (y is None):
+                return False
+            if x and y and abs(x[0] - y[0]) > 0.005:
+                return False
+    return True
+
+
+def _arm_note(a):
+    """Why an arm's columns might be thinner than they look: material where the method could
+    not act was dropped, or the artifacts are too old to carry redundancy scoring."""
+    note = []
+    if a["full_short"]:
+        note.append(f"⊘{len(a['full_short'])} too short")
+    if a["skipped"]:
+        note.append(f"⊘{len(a['skipped'])} passthrough")
+    if a["steps"] and not a["red_steps"]:
+        note.append("no redundancy data")
+    return " · ".join(note)
+
+
+def _cell(tri, delta=None, sub="", scale=100.0, dec=1):
+    """One summary cell, renderer-agnostic: a value ±CI, with a second line underneath.
+
+    That second line is the denominator on a control row and the paired delta on an arm row.
+    No cell carries a good/bad verdict: at bench-scale k most differences are indistinguishable
+    from control, and marking cells by which side of the mean they landed would invent a result
+    the numbers don't support. The delta and its CI say it all, and the reader reads them.
+    """
+    if not tri:
+        return {"txt": "—", "sub": sub}
+    m, lo, hi = tri
+    hw = max(hi - m, m - lo)
+    return {"txt": f"{m * scale:.{dec}f} ±{hw * scale:.{dec}f}", "sub": sub or _delta(delta)}
+
+
+def summary_rows(d):
+    """The overall summary as renderer-agnostic rows — console, md and HTML all derive from
+    this one function so the three views cannot drift apart (the same contract `_cmp` and
+    `_verdict` hold for the per-task tables).
+
+    Each arm carries its OWN control reference, paired over that arm's material. When the arms
+    ran over the same tasks and sessions those references coincide and one shared control row
+    heads the table; when they don't, control is repeated per arm — the only way the absolute
+    numbers stay comparable down a column.
+    """
+    s = summarize(d)
+    ref = _ref_arm(s)
+    if not ref or not any(s[a]["full"] or s[a]["good"] for a in s["arms"]):
+        return None
+    shared = _refs_agree(s, ref)
+
+    def control(a):
+        nt = f"{len(a['full_tasks'])} task{'s' * (len(a['full_tasks']) != 1)}" \
+            if a["full_tasks"] else ""
+        ns = f"{a['steps']} steps/{len(a['sessions'])}s" if a["sessions"] else ""
+        nr = f"{a['red_steps']} steps" if a["red_steps"] and a["red_steps"] != a["steps"] else ""
+        return {"arm": "control", "note": "", "control": True, "cells": [
+            _cell(a["full_ctrl"], sub=nt), _cell(a["good_ctrl"], sub=ns),
+            _cell(a["red_ctrl"], sub=nr), {"txt": "—", "sub": ""}]}
+
+    def arm(name):
+        a = s[name]
+        comp = a["comp"]
+        # an arm that removed <2% never really fired: its flat quality columns are an absence
+        # of measurement, and saying so here is the difference between "preserved" and "untested"
+        ccell = {"txt": "—", "sub": ""} if comp is None else {
+            "txt": f"{comp * 100:+.1f}%", "sub": "⊘ barely fired" if abs(comp) < 0.02 else ""}
+        return {"arm": name, "note": _arm_note(a), "control": False, "cells": [
+            _cell(a["full"], a["full_d"]), _cell(a["good"], a["good_d"]),
+            _cell(a["red"], a["red_d"]), ccell]}
+
+    rows = []
+    if shared:
+        rows.append(control(s[ref]))
+    for name in s["arms"]:
+        if not shared:
+            rows.append(control(s[name]))
+        rows.append(arm(name))
+    return {"rows": rows, "shared": shared, "summary": s}
 
 
 # ---------------------------------------------------------------- rendering
@@ -525,10 +799,33 @@ SUB = ("vanilla = the noise floor; ✓ = the arm's band overlaps vanilla's, ✗ 
        "No model was called to produce this.")
 
 
+def _plain(text):
+    """Strip rich markup so a legend written for the console reads in md/html too."""
+    return re.sub(r"\[/(?:[a-z][a-z ]*)?\]|\[[a-z][a-z ]*\]", "", text)
+
+
+def _summary_md(d):
+    """The overall summary as a markdown table — the same rows the console renders."""
+    sr = summary_rows(d)
+    if not sr:
+        return []
+    head = ["arm"] + [f"{h} ({s})" for h, s in SUMMARY_COLS]
+    o = ["## Overall\n", _plain(_SUMMARY_LEGEND) + "\n",
+         "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for row in sr["rows"]:
+        label = row["arm"] + (f" ({row['note']})" if row["note"] else "")
+        cells = [c["txt"] + (f" [{c['sub']}]" if c["sub"] else "") for c in row["cells"]]
+        o.append("| " + " | ".join([label] + cells) + " |")
+    if not sr["shared"]:
+        o.append("\nArms ran over different tasks/sessions, so each is shown against its own "
+                 "control — read down an arm's pair, not across the table.")
+    return o + [""]
+
+
 def render_md(d):
     head, rows = table(d)
-    o = ["# Trajectory preservation\n", SUB + "\n",
-         "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    o = ["# Trajectory preservation\n", SUB + "\n"] + _summary_md(d)
+    o += ["## Per task\n", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     o += ["| " + " | ".join(c for c, _ in row) + " |" for row in rows]
     return "\n".join(o) + "\n"
 
@@ -643,6 +940,33 @@ def _html_report_body(d):
     return "".join(secs)
 
 
+def _html_summary(d):
+    """The overall summary section — first thing in the page, same rows as the console."""
+    import html as H
+    sr = summary_rows(d)
+    if not sr:
+        return ""
+    ths = "".join(f'<th>{H.escape(h)}<span class="d">{H.escape(s)}</span></th>'
+                  for h, s in SUMMARY_COLS)
+    trs = []
+    for row in sr["rows"]:
+        note = f'<span class="s">{H.escape(row["note"])}</span>' if row["note"] else ""
+        tds = []
+        for c in row["cells"]:
+            sub = f'<span class="d">{H.escape(c["sub"])}</span>' if c["sub"] else ""
+            tds.append(f'<td>{H.escape(c["txt"])}{sub}</td>')
+        cls = " v" if row["control"] else ""
+        trs.append(f'<tr><td class="l task{cls}"><b>{H.escape(row["arm"])}</b>{note}</td>'
+                   + "".join(tds) + "</tr>")
+    foot = "" if sr["shared"] else (
+        '<div class="foot">Arms ran over different tasks/sessions, so each is shown against its '
+        'own control — read down an arm\'s pair, not across the table.</div>')
+    return ('<h2>overall</h2>'
+            f'<div class="sub">{H.escape(_plain(_SUMMARY_LEGEND))}</div>'
+            f'<table><thead><tr><th class="l">arm</th>{ths}</tr></thead><tbody>'
+            + "".join(trs) + f'</tbody></table>{foot}')
+
+
 def render_html(d):
     import html as H
     model = d.get("model") or ""
@@ -652,6 +976,7 @@ def render_html(d):
             f'<style>{_HTML_STYLE}</style></head><body><div class="wrap">'
             f'<h1>trajectory preservation <span class="dim">{H.escape("· " + model) if model else ""}</span></h1>'
             f'<div class="sub">{H.escape(SUB)}</div>'
+            + _html_summary(d)
             + _html_report_body(d)
             + '<div class="foot">length/tokens/$ show vanilla→arm with the signed delta, coloured '
             'green (shorter/saved) / red (longer/costlier) / grey (within vanilla\'s band) '
@@ -719,6 +1044,25 @@ _INCR_LEGEND = (
     "red <85% when the arm engaged (compressed or CCR-retrieved); else dim (≈100% by "
     "construction — no verdict). — = no incremental data. speed up is wall-clock — read it as a "
     "trend, not exact.")
+_SUMMARY_LEGEND = (
+    "everything in this run, pooled into one row per arm. ± is a 95% bootstrap CI (seeded, so "
+    "the same artifacts always render the same bars): full-run quality resamples TASKS, the two "
+    "incremental columns resample the paired STEPS. quality (full runs) = verifier pass rate, "
+    "macro-averaged per task so a task with many trials can't outvote one with few; lost trials "
+    "count as failures. quality (incremental) = the share of replayed steps whose action the "
+    "goal judge rated good (or, unjudged, that structurally matched the recording — a much "
+    "noisier floor). redundant = steps that re-fetched information the agent already had. Under "
+    "each arm value, Δ is its PAIRED difference vs control with its own CI — the ± on the values "
+    "are marginal and can't be eyeballed against each other. A Δ bar that straddles zero means "
+    "indistinguishable from control at this n, which is the common case and not a pass. No cell "
+    "is marked better or worse: that reading is yours. context removed is not a quality axis: "
+    "it is what the quality columns are the price of, and the number without which they can't "
+    "be read. ⊘ marks an arm that removed <2% — its flat quality numbers are an "
+    "absence of measurement, not a preserved trajectory. Both modes count only material where "
+    "the method could act, and say what they dropped: ⊘n too short = tasks whose peak context "
+    "never reached the compaction gate, ⊘n passthrough = sessions where the arm never engaged. "
+    "Steps within a session are correlated and the bootstrap resamples them as independent, so "
+    "those bars are if anything optimistic. No model was called.")
 _SHORT = "[dim]⊘ short[/]"
 _DASH = "[dim]—[/]"
 
@@ -918,6 +1262,53 @@ def _verdict_cell(v, a, sub_gate):
     return f"[{color}]{label}[/]"
 
 
+def _under(cell, note):
+    """A value with its own denominator on a dim second line. Each column is pooled over a
+    DIFFERENT n — tasks for full runs, steps for the incremental pair — so one combined
+    coverage string next to the arm name would be wrong for at least one column."""
+    return f"{cell}\n[dim]{note}[/]" if note else cell
+
+
+def _summary_cell(c):
+    """Console cell from a shared summary_rows cell: value ±CI, with its denominator (control
+    rows) or paired delta (arm rows) dim underneath. Deliberately monochrome — see `_cell`."""
+    txt = c["txt"]
+    if " ±" in txt:                              # dim the error bar, keep the value bright
+        v, _, hw = txt.partition(" ±")
+        txt = f"{v} [dim]±{hw}[/]"
+    return _under(txt, c["sub"])
+
+
+def _summary_table(console, d, model):
+    """The overall read: one row per arm, pooled across every task and session, with error bars.
+
+    Sits ABOVE the per-task tables on purpose. Those answer "what happened on this task"; a
+    reader scanning them has to hold a dozen small numbers in their head to get to the question
+    they actually came with, which is whether an arm costs quality overall. This answers that
+    first, and the tables below are then the detail behind it.
+    """
+    sr = summary_rows(d)
+    if not sr:
+        return
+    title = "[bold]quality — overall" + (f" · {model}" if model else "") + "[/]"
+    t = Table(title=title, caption=_SUMMARY_LEGEND, caption_justify="left", caption_style="dim",
+              pad_edge=False)
+    t.add_column("arm", no_wrap=True)
+    for head, sub in SUMMARY_COLS:
+        t.add_column(f"{head}\n[dim]{sub}[/]", justify="right", min_width=11)
+    for i, row in enumerate(sr["rows"]):
+        if i and row["control"]:                 # a divider before each repeated control block
+            t.add_section()
+        label = row["arm"] + (f"\n[dim]{row['note']}[/]" if row["note"] else "")
+        t.add_row(label, *[_summary_cell(c) for c in row["cells"]])
+        if i == 0 and sr["shared"]:              # ... or once, under a single shared control
+            t.add_section()
+    console.print(t)
+    if not sr["shared"]:
+        console.print("[dim]  arms ran over different tasks/sessions, so each is shown against "
+                      "its own control — read down an arm's pair, not across the table.[/]")
+
+
 def _full_table(console, d, model):
     """One table PER ARM: each row a task, vanilla's length/tokens/$ then the arm's (colored
     vs vanilla), verdict last. Vanilla is the shared reference, repeated in each arm's table."""
@@ -992,8 +1383,9 @@ def _incremental_table(console, d, model):
 
 
 def render_console(d):
-    """Terminal view: two focused tables (full trajectories, then incremental) so the two
-    measurement modes aren't confounded, followed by a one-glance takeaway."""
+    """Terminal view: the pooled overall summary first (the question most readers arrive with),
+    then two focused tables (full trajectories, then incremental) so the two measurement modes
+    aren't confounded, followed by a one-glance takeaway."""
     if not HAVE_RICH:
         # bare-python3 fallback (fresh clone, nothing installed): the md view carries
         # every axis in one wide table — less pretty, same numbers
@@ -1001,6 +1393,7 @@ def render_console(d):
         return
     console = Console()
     model = d.get("model")
+    _summary_table(console, d, model)
     _full_table(console, d, model)
     _incremental_table(console, d, model)
     _takeaway(console, d)
