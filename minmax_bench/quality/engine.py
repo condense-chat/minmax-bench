@@ -898,6 +898,29 @@ def read_sse(resp):
     return {"content": content, "usage": usage}, None
 
 
+# The identity line Claude Code itself sends as its first system block. Subscription (OAuth)
+# traffic is classified by whether it looks like the CLI, and a request with NO system prompt
+# does not: it gets limited far harder than the real thing. That is how a subscription happily
+# serves a 6-cell full run and then 429s on THREE ~1.5k-token judge calls in a row — the replay
+# carries the captured Claude Code system prompt via build_request, the judge carried nothing.
+# Same root cause as the preflight probe fix (c586eda), one layer down so every caller gets it.
+CC_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+
+
+def with_cc_identity(req):
+    """Give a system-less request the Claude Code identity block; leave everything else alone.
+
+    Deliberately does NOT touch a request that already has a system prompt. The replay's system
+    prompt is the captured one, and prepending to it would change the thing under measurement
+    — arms would no longer be replaying the session Claude Code actually sent. Only requests
+    that carry no system at all (the judges, the preflight probe) are missing the identity, and
+    those are exactly the ones being throttled.
+    """
+    if req.get("system"):
+        return req
+    return {**req, "system": [{"type": "text", "text": CC_IDENTITY}]}
+
+
 def call_api(arm, req, tmpl_headers, env):
     base = ARMS[arm]["base"]
     creds = condense_creds(env) if ARMS[arm].get("condense_auth") else None
@@ -925,6 +948,7 @@ def call_api(arm, req, tmpl_headers, env):
         beta = headers.get("anthropic-beta", "")
         if "oauth-2025-04-20" not in beta:
             headers["anthropic-beta"] = (beta + "," if beta else "") + "oauth-2025-04-20"
+        req = with_cc_identity(req)
     if creds:
         headers["x-condense-auth-token"] = creds["token"]
         if creds["user"]:  # dense sends the user id too; the key-only fallback may lack it

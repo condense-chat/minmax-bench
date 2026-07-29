@@ -3,8 +3,10 @@
 These metrics produce the repo's public findings — they deserve the same test
 surface as the cost bench.
 """
+import io
 import json
 import os
+import urllib.error
 from types import SimpleNamespace
 
 import pytest
@@ -424,6 +426,55 @@ def test_auth_mode_resolution(monkeypatch):
     assert e.auth_mode({}) == "subscription"
     problems = e.check_arms(["control"], {})
     assert not problems  # subscription satisfies auth
+
+
+def test_subscription_calls_carry_the_claude_code_identity(monkeypatch):
+    """A system-less request on OAuth is not recognisable as Claude Code and gets throttled
+    where the replay (which sends the captured system prompt) goes through — that is how a
+    working subscription 429s on every judge call. The identity must be added for OAuth only,
+    must never overwrite a real system prompt, and must not appear on api-key traffic."""
+    sent = {}
+
+    def fake_urlopen(req, *a, **kw):
+        sent["body"] = json.loads(req.data)
+        raise urllib.error.HTTPError(req.full_url, 400, "stop", {}, io.BytesIO(b"{}"))
+
+    monkeypatch.setattr(eng.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(eng, "cc_oauth_token", lambda: "tok")
+    monkeypatch.setattr(eng.time, "sleep", lambda *_: None)
+    bare = {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+
+    eng.call_api("control", bare, {}, {})                       # subscription
+    assert sent["body"]["system"] == [{"type": "text", "text": eng.CC_IDENTITY}]
+
+    kept = {**bare, "system": [{"type": "text", "text": "captured CC prompt"}]}
+    eng.call_api("control", kept, {}, {})                       # replay: left alone
+    assert sent["body"]["system"] == kept["system"]
+
+    eng.call_api("control", bare, {}, {"ANTHROPIC_API_KEY": "k"})  # api key: no spoof needed
+    assert "system" not in sent["body"]
+    assert "system" not in bare                                  # caller's dict never mutated
+
+
+def test_milestone_judge_separates_a_failed_call_from_an_empty_answer(monkeypatch):
+    """`judge returned no usable milestones` is a claim about the judge's OUTPUT. Printing it
+    after a 429 sends the reader to the trajectory instead of the rate limit, so the API error
+    must survive to the caller — and say the transient thing it is."""
+    from minmax_bench.quality import generate as gen
+
+    monkeypatch.setattr(gen.eng, "call_api", lambda *a, **k: (None, "HTTP 429: rate_limit"))
+    obj, err = gen._ask("p", {})
+    assert obj is None and "429" in err
+
+    monkeypatch.setattr(gen.eng, "call_api",
+                        lambda *a, **k: ({"content": [{"text": "no json here"}]}, None))
+    obj, err = gen._ask("p", {})
+    assert obj is None and err is None            # unparseable is NOT an API failure
+
+    monkeypatch.setattr(gen.eng, "auth_mode", lambda _env: "subscription")
+    why = gen._why("HTTP 429: rate_limit", {})
+    assert "rate-limited" in why and "subscription" in why and "cached" in why
+    assert "quota" in why                          # says what it is NOT, too
 
 
 def test_referenced_tool_names_includes_search_discovered_mcp():

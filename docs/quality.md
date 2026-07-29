@@ -129,6 +129,13 @@ before spending anything.
 Every cell writes `attempted.json` first, so killed trials show up as `⚠ lost` in the
 report (counted as unsolved) instead of vanishing.
 
+On a Claude Code subscription (no API key), every upstream call — replay and judges alike —
+carries the CLI's identity system block. Subscription traffic is classified by whether it
+looks like Claude Code, and a request with no system prompt is throttled far harder: without
+this the milestone judge could `429` on three small calls right after the same credentials had
+happily served a whole 6-cell run. A `429` from the judge is transient, not a quota failure —
+re-run it, and `milestones.json` caches per task so you only pay for what's still missing.
+
 ## `quality incremental` — teacher-forced replay of your own session (SPENDS)
 
 How would one of your real sessions have played out under condense? Pick any session from
