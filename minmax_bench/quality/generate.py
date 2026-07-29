@@ -378,13 +378,24 @@ def _preflight_full(arms, env):
     return rows
 
 
+def _apply_auth(args, env):
+    """--auth subscription forces the Claude Code login even when an API key is configured —
+    drop the key so both the auth check and the container agent use the subscription token.
+    'auto' (the default) prefers a key if present.
+
+    EVERY entry point that spends has to call this. `--mode judge` did not, so a standalone
+    re-judge silently ran on the API key while the identical judge inside a
+    `--auth subscription` full run ran on OAuth — the same command reproducing on different
+    credentials, which is exactly the wrong property when you are debugging an auth failure.
+    """
+    if getattr(args, "auth", "auto") != "subscription":
+        return env
+    os.environ.pop("ANTHROPIC_API_KEY", None)  # so harbor doesn't forward it either
+    return {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"}
+
+
 def full(args, env):
-    # --auth subscription forces the Claude Code login even if an API key is
-    # configured — drop the key so both the auth check and the container agent use
-    # the subscription token. 'auto' (default) prefers a key if present.
-    if getattr(args, "auth", "auto") == "subscription":
-        env = {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"}
-        os.environ.pop("ANTHROPIC_API_KEY", None)  # so harbor doesn't forward it either
+    env = _apply_auth(args, env)
     arms = _validate_full(args, env)
     if not args.dry_run:
         rows = _preflight_full(arms, env)
@@ -789,6 +800,8 @@ def _runs(root, arm, task):
 
 
 def judge_milestones(args, env):
+    env = _apply_auth(args, env)
+    print(f"[milestones] auth: {eng.auth_mode(env) or 'NONE'}")
     problems = eng.check_arms(["control"], env)
     if problems:
         sys.exit("milestone judge needs an API key:\n  - " + "\n  - ".join(problems))

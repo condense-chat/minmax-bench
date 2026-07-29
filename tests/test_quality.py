@@ -477,6 +477,23 @@ def test_milestone_judge_separates_a_failed_call_from_an_empty_answer(monkeypatc
     assert "quota" in why                          # says what it is NOT, too
 
 
+def test_judge_honours_auth_subscription_like_the_run_that_produced_it(monkeypatch):
+    """`--mode judge` used to skip the key-drop that `full()` does, so re-judging a run made
+    with --auth subscription silently went out over the API key instead. A command that
+    reproduces on different credentials is useless for debugging an auth failure."""
+    from minmax_bench.quality import generate as gen
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    env = {"ANTHROPIC_API_KEY": "k", "OTHER": "keep"}
+    kept = gen._apply_auth(SimpleNamespace(auth="auto"), env)
+    assert kept["ANTHROPIC_API_KEY"] == "k"                  # auto still prefers the key
+
+    dropped = gen._apply_auth(SimpleNamespace(auth="subscription"), env)
+    assert "ANTHROPIC_API_KEY" not in dropped and dropped["OTHER"] == "keep"
+    assert "ANTHROPIC_API_KEY" not in os.environ             # harbor must not forward it either
+    assert env["ANTHROPIC_API_KEY"] == "k"                   # caller's dict not mutated
+
+
 def test_referenced_tool_names_includes_search_discovered_mcp():
     """Tool-search sessions reference MCP tools by name in results without ever
     calling them; those must still be stubbed or Anthropic 400s on the reference."""
