@@ -79,6 +79,13 @@ vanilla-proxy has the confound subtracted. Add it with
 Compaction *quality* claims must come from tasks whose vanilla runs clear the gate — the
 long half of the curated list (`--tasks long`).
 
+**⊘ applies to compaction methods only** (`report.COMPACTION_GATED`). It is an excuse for a
+*history transform*: no compaction fired, so the method never got to act. It is no excuse for
+a method that acts from the first step regardless of context size — that method's length,
+tokens and cost on a small task are measured and comparable, and blanking its verdict turns a
+whole run into a column of shrugs. The list is an **allowlist**: an arm nobody classified is
+un-gated, so a new method shows a real verdict rather than quietly vanishing from the table.
+
 ## Arms — naming, carefully
 
 - `condense` — the condense proxy (whole-conversation compaction).
@@ -128,6 +135,13 @@ before spending anything.
 
 Every cell writes `attempted.json` first, so killed trials show up as `⚠ lost` in the
 report (counted as unsolved) instead of vanishing.
+
+On a Claude Code subscription (no API key), every upstream call — replay and judges alike —
+carries the CLI's identity system block. Subscription traffic is classified by whether it
+looks like Claude Code, and a request with no system prompt is throttled far harder: without
+this the milestone judge could `429` on three small calls right after the same credentials had
+happily served a whole 6-cell run. A `429` from the judge is transient, not a quota failure —
+re-run it, and `milestones.json` caches per task so you only pay for what's still missing.
 
 ## `quality incremental` — teacher-forced replay of your own session (SPENDS)
 

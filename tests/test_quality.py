@@ -3,8 +3,10 @@
 These metrics produce the repo's public findings — they deserve the same test
 surface as the cost bench.
 """
+import io
 import json
 import os
+import urllib.error
 from types import SimpleNamespace
 
 import pytest
@@ -395,6 +397,66 @@ def test_report_marks_sub_gate_tasks():
     assert row["sub_gate"] is True  # kv-store peaks ~25-35k: compaction can't have fired
 
 
+def _full_row(task="t", peak=36_000, sub_gate=True, vlens=(9, 9, 10), alens=(8, 8, 8)):
+    """One built-report row with enough of a full-run cell for the verdict/table path."""
+    def cell(lens):
+        srt = sorted(lens)
+        return {"_lens": list(lens), "length": (srt[0], srt[len(srt) // 2], srt[-1]),
+                "_toks": [1_000_000] * len(lens), "_costs": [0.20] * len(lens),
+                "peak_ctx": peak, "n": len(lens), "started": len(lens), "solve": len(lens),
+                "attempted": len(lens), "lost": 0, "length_ok": True, "rework_ok": None,
+                "milestone": None, "milestone_ok": None, "incr": None}
+    v, a = cell(vlens), cell(alens)
+    a["length_ok"] = True
+    return {"task": task, "sub_gate": sub_gate, "vanilla": v, "arms": {}}
+
+
+def test_compaction_gate_only_blanks_the_verdict_of_compaction_methods():
+    """⊘ says "vanilla never grew big enough to compact, so nothing compacted". That is a real
+    excuse for a HISTORY TRANSFORM and no excuse at all for a method that acts from step 1 —
+    gating the latter turns a whole small-context run into a column of shrugs while its length,
+    tokens and cost sit right there, measured."""
+    r = _full_row()
+    v, a = r["vanilla"], r["vanilla"]
+    assert report._verdict(v, a, "condense", True)[0] == "⊘ too short"
+    assert report._verdict(v, a, "headroom", True)[0] == "⊘ too short"
+    # unclassified / non-compaction arms get the real verdict
+    assert report._verdict(v, a, "vanilla-proxy", True)[0] != "⊘ too short"
+    assert report._verdict(v, a, "a-brand-new-arm", True)[0] != "⊘ too short"
+    # and above the gate nobody is excused
+    assert report._verdict(v, a, "condense", False)[0] != "⊘ too short"
+    assert report.gated("condense", True) and not report.gated("condense", False)
+
+
+def test_summary_keeps_sub_gate_tasks_for_arms_the_gate_does_not_apply_to():
+    """summarize() drops ⊘ tasks so a compaction claim isn't made about a task nothing
+    compacted. For an arm that always acts, dropping them drops EVERY task — the arm reports no
+    full-run quality at all, which reads as 'not measured' when it was measured fine."""
+    def row(task):
+        return {"task": task, "sub_gate": True,
+                "vanilla": {"solve": 2, "attempted": 2, "n": 2},
+                "arms": {"condense": {"solve": 1, "attempted": 2, "n": 1, "incr": None},
+                         "vanilla-proxy": {"solve": 1, "attempted": 2, "n": 1, "incr": None}}}
+    s = report.summarize({"rows": [row("a"), row("b")], "arms": ["condense", "vanilla-proxy"]})
+    assert s["condense"]["full"] is None                      # gated: nothing comparable
+    assert s["condense"]["full_short"] == ["a", "b"]
+    assert s["vanilla-proxy"]["full"][0] == 0.5               # un-gated: a real pooled rate
+    assert s["vanilla-proxy"]["full_short"] == []
+    assert "too short" not in report._arm_note(s["vanilla-proxy"])
+
+
+def test_full_table_deltas_read_as_savings_not_raw_change():
+    """+ = better, the same convention the incremental table uses. An arm that got 18% cheaper
+    printed −18% here, relying on the green to carry the meaning the sign was contradicting."""
+    cheaper = report._cmp([10, 10], [8, 8])         # arm used less
+    assert round(cheaper["saved"]) == 20 and cheaper["state"] == "good"
+    costlier = report._cmp([10, 10], [13, 13])
+    assert round(costlier["saved"]) == -30 and costlier["state"] == "bad"
+    assert report._cmp([10, 10], [10, 10])["saved"] == 0.0    # never "-0%"
+    cell = report._cmp_cell([10, 10], [8, 8], lambda x: f"{x:.0f}")
+    assert "+20%" in cell and "10" in cell and "8" in cell
+
+
 def test_solve_distinguishes_never_ran_from_crashed(tmp_path):
     """A cell requested but with no trial dir ever opened is aborted/out-of-scope, not a
     0/k failure — it must render as '—', while a cell whose trials opened but produced no
@@ -424,6 +486,72 @@ def test_auth_mode_resolution(monkeypatch):
     assert e.auth_mode({}) == "subscription"
     problems = e.check_arms(["control"], {})
     assert not problems  # subscription satisfies auth
+
+
+def test_subscription_calls_carry_the_claude_code_identity(monkeypatch):
+    """A system-less request on OAuth is not recognisable as Claude Code and gets throttled
+    where the replay (which sends the captured system prompt) goes through — that is how a
+    working subscription 429s on every judge call. The identity must be added for OAuth only,
+    must never overwrite a real system prompt, and must not appear on api-key traffic."""
+    sent = {}
+
+    def fake_urlopen(req, *a, **kw):
+        sent["body"] = json.loads(req.data)
+        raise urllib.error.HTTPError(req.full_url, 400, "stop", {}, io.BytesIO(b"{}"))
+
+    monkeypatch.setattr(eng.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(eng, "cc_oauth_token", lambda: "tok")
+    monkeypatch.setattr(eng.time, "sleep", lambda *_: None)
+    bare = {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+
+    eng.call_api("control", bare, {}, {})                       # subscription
+    assert sent["body"]["system"] == [{"type": "text", "text": eng.CC_IDENTITY}]
+
+    kept = {**bare, "system": [{"type": "text", "text": "captured CC prompt"}]}
+    eng.call_api("control", kept, {}, {})                       # replay: left alone
+    assert sent["body"]["system"] == kept["system"]
+
+    eng.call_api("control", bare, {}, {"ANTHROPIC_API_KEY": "k"})  # api key: no spoof needed
+    assert "system" not in sent["body"]
+    assert "system" not in bare                                  # caller's dict never mutated
+
+
+def test_milestone_judge_separates_a_failed_call_from_an_empty_answer(monkeypatch):
+    """`judge returned no usable milestones` is a claim about the judge's OUTPUT. Printing it
+    after a 429 sends the reader to the trajectory instead of the rate limit, so the API error
+    must survive to the caller — and say the transient thing it is."""
+    from minmax_bench.quality import generate as gen
+
+    monkeypatch.setattr(gen.eng, "call_api", lambda *a, **k: (None, "HTTP 429: rate_limit"))
+    obj, err = gen._ask("p", {})
+    assert obj is None and "429" in err
+
+    monkeypatch.setattr(gen.eng, "call_api",
+                        lambda *a, **k: ({"content": [{"text": "no json here"}]}, None))
+    obj, err = gen._ask("p", {})
+    assert obj is None and err is None            # unparseable is NOT an API failure
+
+    monkeypatch.setattr(gen.eng, "auth_mode", lambda _env: "subscription")
+    why = gen._why("HTTP 429: rate_limit", {})
+    assert "rate-limited" in why and "subscription" in why and "cached" in why
+    assert "quota" in why                          # says what it is NOT, too
+
+
+def test_judge_honours_auth_subscription_like_the_run_that_produced_it(monkeypatch):
+    """`--mode judge` used to skip the key-drop that `full()` does, so re-judging a run made
+    with --auth subscription silently went out over the API key instead. A command that
+    reproduces on different credentials is useless for debugging an auth failure."""
+    from minmax_bench.quality import generate as gen
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    env = {"ANTHROPIC_API_KEY": "k", "OTHER": "keep"}
+    kept = gen._apply_auth(SimpleNamespace(auth="auto"), env)
+    assert kept["ANTHROPIC_API_KEY"] == "k"                  # auto still prefers the key
+
+    dropped = gen._apply_auth(SimpleNamespace(auth="subscription"), env)
+    assert "ANTHROPIC_API_KEY" not in dropped and dropped["OTHER"] == "keep"
+    assert "ANTHROPIC_API_KEY" not in os.environ             # harbor must not forward it either
+    assert env["ANTHROPIC_API_KEY"] == "k"                   # caller's dict not mutated
 
 
 def test_referenced_tool_names_includes_search_discovered_mcp():

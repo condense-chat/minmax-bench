@@ -52,6 +52,26 @@ AGENT_SESSION_GLOB = {  # only claude-code is wired; others are TODO
 # so splitting is a longest-prefix match against the arms the bench knows about
 KNOWN_ARMS = ("headroom-kompress", "vanilla-proxy", "headroom", "condense", "vanilla", "control")
 
+# Arms whose intervention only EXISTS once the harness compacts — the history transforms. ⊘
+# (vanilla's peak context never reached --ctx-gate) means nothing compacted, so for these the
+# method never got to act, and a verdict there would be about wiring, not compaction.
+#
+# Every OTHER arm acts regardless of context size: a passthrough proxy pays its wiring cost on
+# the first request, and so do the arms that transform what the agent writes or reads. Blanking
+# their verdict as "⊘ too short" reports "not comparable" about the one thing that WAS
+# comparable — a whole small-context run renders as a column of shrugs while its length, tokens
+# and cost sit right there, measured and comparable.
+#
+# An ALLOWLIST, not a blocklist: an arm nobody classified is un-gated, so a new method shows a
+# real verdict instead of quietly vanishing from the table. The direction of the default matters
+# more than the default being right — a wrong verdict gets argued with, a blank one doesn't.
+COMPACTION_GATED = ("condense", "headroom", "headroom-kompress")
+
+
+def gated(arm, sub_gate):
+    """Does the ⊘ compaction gate apply to THIS arm on a sub-gate task?"""
+    return bool(sub_gate) and arm in COMPACTION_GATED
+
 
 def split_cell(name):
     """'<arm>-<task>' -> (arm, task) by longest known-arm prefix; (None, name) if no match."""
@@ -566,7 +586,7 @@ def summarize(d):
             ar, vr = _solve_rate(a), _solve_rate(v)
             if ar is None or vr is None:
                 continue
-            if r["sub_gate"]:
+            if gated(arm, r["sub_gate"]):
                 short.append(r["task"])
                 continue
             a_rates.append(ar)
@@ -760,7 +780,8 @@ def table(d):
         for arm in d["arms"]:
             a = r["arms"][arm]
             pk = r["vanilla"]["peak_ctx"]
-            pk_txt = "—" if not pk else f"{pk / 1000:.0f}k" + (" ⊘" if r["sub_gate"] else "")
+            pk_txt = ("—" if not pk else f"{pk / 1000:.0f}k"
+                      + (" ⊘" if gated(arm, r["sub_gate"]) else ""))
             sv, sa = _solve(r["vanilla"]), _solve(a)
             solve_txt = "—" if sv == "—" and sa == "—" else f"{sv} · {sa}"
             cells = [(r["task"], None), (arm, None),
@@ -889,7 +910,7 @@ def _html_report_body(d):
             return '<td>—</td>'
         st = ST[c["state"]]
         return (f'<td><span class="v">{fmt(c["van"])}→</span><span class="{st}">{fmt(c["arm"])}</span>'
-                f'<span class="d {st}">{c["pct"]:+.0f}%</span></td>')
+                f'<span class="d {st}">{c["saved"]:+.0f}%</span></td>')
 
     def detail(v, a):
         bits = [f'<span><span class="k">length</span> vanilla [{", ".join(map(str, v["_lens"]))}] '
@@ -917,7 +938,7 @@ def _html_report_body(d):
         trs = []
         for r in arm_rows:
             v, a, sub = r["vanilla"], r["arms"][arm], r["sub_gate"]
-            label, state = _verdict(v, a, sub)
+            label, state = _verdict(v, a, arm, sub)
             pk = v["peak_ctx"] // 1000
             ms = ""
             if d["has_milestone"]:
@@ -927,7 +948,8 @@ def _html_report_body(d):
                 ms = f'<td><span class="{mst}">{m[1] * 100:.0f}%</span></td>' if m else '<td>—</td>'
             trs.append(
                 f'<tr class="row" onclick="tg(this)"><td class="l task"><span class="caret">▸</span> '
-                f'<b>{H.escape(r["task"])}</b><span class="s">peak {pk}k{" ⊘" if sub else ""} · '
+                f'<b>{H.escape(r["task"])}</b><span class="s">peak {pk}k'
+                f'{" ⊘" if gated(arm, sub) else ""} · '
                 f'solve {a["solve"]}/{a["attempted"]}</span></td>'
                 + mcell(v["_lens"], a["_lens"], fL) + mcell(v["_toks"], a["_toks"], fT)
                 + mcell(v["_costs"], a["_costs"], fU)
@@ -978,9 +1000,11 @@ def render_html(d):
             f'<div class="sub">{H.escape(SUB)}</div>'
             + _html_summary(d)
             + _html_report_body(d)
-            + '<div class="foot">length/tokens/$ show vanilla→arm with the signed delta, coloured '
-            'green (shorter/saved) / red (longer/costlier) / grey (within vanilla\'s band) '
-            '— independently, so token-savings that cost more show green next to red. '
+            + '<div class="foot">length/tokens/$ show vanilla→arm with the SAVING below '
+            '(+ = better: fewer steps / fewer tokens / less money — same sign convention as '
+            'the incremental table), coloured green (saved) / red (cost more) / grey (within '
+            'vanilla\'s band) — independently, so token-savings that cost more show green '
+            'next to red. '
             'Click a row for per-trial values and incremental compaction / faithful / $ savings.</div>'
             '</div><script>function tg(r){var d=r.nextElementSibling;'
             'var o=d.style.display!=="none";d.style.display=o?"none":"";'
@@ -1018,13 +1042,15 @@ def main(argv=None):
 # with control on its own row. rework/milestone/ctx detail stays in report.html.
 _FULL_LEGEND = (
     "one table per arm; each row a task. length / tokens / $ each show [dim]vanilla[/]→arm (mean "
-    "steps, total tokens, USD/trial) with the signed delta below, coloured INDEPENDENTLY: green "
-    "below vanilla's spread (shorter / saved), red above (longer / costlier), dim within — so an "
+    "steps, total tokens, USD/trial) with the SAVING below — signed like every other savings "
+    "column in this report, [bold]+ = BETTER[/] (fewer steps / fewer tokens / less money), − = "
+    "worse. Coloured INDEPENDENTLY: green below vanilla's spread, red above, dim within — so an "
     "arm that cuts tokens yet costs more, the cache-bust tax, shows green next to red. verdict = "
     "length preservation (the load-bearing "
     "axis): same work (within vanilla's band) / drifted ↑ longer / shorter ↓ / ⊘ too short "
-    "(vanilla never crossed the compaction gate — nothing compacted, so any change is "
-    "behavioural, not compaction). n1 = single run, a trend not a verdict (needs ≥2/arm). "
+    "(vanilla never crossed the compaction gate, so a method that only acts ON a compaction "
+    "never acted — shown for those arms only; a method that acts from step 1 regardless of "
+    "context size gets a real verdict here). n1 = single run, a trend not a verdict (≥2/arm). "
     "milestone = mean % of the task's subgoals the arm reached (LLM-judged, approach-agnostic), "
     "green when it matches vanilla's band / red when below (only shown with --milestones). "
     "Under each task: peak context + solve rate (⚠lost trials count as fails). No model was called.")
@@ -1060,15 +1086,12 @@ _SUMMARY_LEGEND = (
     "be read. ⊘ marks an arm that removed <2% — its flat quality numbers are an "
     "absence of measurement, not a preserved trajectory. Both modes count only material where "
     "the method could act, and say what they dropped: ⊘n too short = tasks whose peak context "
-    "never reached the compaction gate, ⊘n passthrough = sessions where the arm never engaged. "
+    "never reached the compaction gate (counted only for methods that act ON a compaction — a "
+    "method that acts from the first step keeps those tasks), ⊘n passthrough = sessions where "
+    "the arm never engaged. "
     "Steps within a session are correlated and the bootstrap resamples them as independent, so "
     "those bars are if anything optimistic. No model was called.")
-_SHORT = "[dim]⊘ short[/]"
 _DASH = "[dim]—[/]"
-
-
-def _icon(ok):
-    return "✓" if ok is True else ("✗" if ok is False else "—")
 
 
 def _colok(text, ok):
@@ -1090,39 +1113,33 @@ def _runs(c):
     return f"{c['n']}×"
 
 
-def _len_delta(v, a, sub_gate):
-    """Arm length vs control's median as a signed %, + ✓/✗ verdict; nulled when too short."""
-    vm = v["length"][1] if v["length"] else None
-    am = a["length"][1] if a["length"] else None
-    if am is None or not vm:
-        return _DASH
-    if sub_gate:
-        return _SHORT
-    core = f"{(am / vm - 1) * 100:+.0f}%"
-    if a["length_ok"] is not None:
-        core += f" {_icon(a['length_ok'])}"
-    return _colok(core, a["length_ok"])
-
-
 def _cmp(ctrl_list, arm_list):
     """The ONE metric comparison both the console and HTML derive from, so they can't drift.
-    Returns {van, arm, pct, state} or None. state: good = arm below vanilla's spread
-    (shorter/saved), bad = above (longer/costlier), within = inside the band."""
+    Returns {van, arm, saved, state} or None. state: good = arm below vanilla's spread
+    (shorter/saved), bad = above (longer/costlier), within = inside the band.
+
+    `saved` is signed the way every other savings column in this bench is signed — + is BETTER,
+    i.e. less of the thing. It is deliberately NOT the raw arm/vanilla delta: this table sat
+    next to the incremental one, whose compaction % / $ savings / speed up all read + for good,
+    and printed −18% in green for an arm that got 18% CHEAPER. Two savings conventions in one
+    report is one too many, and the green was doing the work the sign should have done.
+    """
     if not ctrl_list or not arm_list:
         return None
     lo, hi = min(ctrl_list), max(ctrl_list)
     cm, am = sum(ctrl_list) / len(ctrl_list), sum(arm_list) / len(arm_list)
     state = "good" if am < lo else "bad" if am > hi else "within"
-    return {"van": cm, "arm": am, "pct": (am / cm - 1) * 100 if cm else 0.0, "state": state}
+    saved = (1 - am / cm) * 100 if cm else 0.0
+    return {"van": cm, "arm": am, "saved": saved or 0.0, "state": state}  # `or` kills -0.0
 
 
 def _cmp_cell(ctrl_list, arm_list, fmt):
-    """Console cell: vanilla→arm on line 1, signed delta below, coloured by _cmp's state."""
+    """Console cell: vanilla→arm on line 1, signed SAVING below, coloured by _cmp's state."""
     c = _cmp(ctrl_list, arm_list)
     if not c:
         return _DASH
     color = {"good": "green", "bad": "red", "within": "dim"}[c["state"]]
-    return f"[dim]{fmt(c['van'])}[/]→[{color}]{fmt(c['arm'])}[/]\n[{color}]{c['pct']:+.0f}%[/]"
+    return f"[dim]{fmt(c['van'])}[/]→[{color}]{fmt(c['arm'])}[/]\n[{color}]{c['saved']:+.0f}%[/]"
 
 
 def _milestone_cell(a):
@@ -1235,13 +1252,15 @@ def _LENFMT(x):
     return f"{x:.0f}"
 
 
-def _verdict(v, a, sub_gate):
+def _verdict(v, a, arm, sub_gate):
     """Shared length-preservation verdict → (label, state). state ∈ good|bad|warn|na. Statistical
     (band overlap) when both arms have ≥2 runs; else DIRECTIONAL vs vanilla's spread, tagged n1 (a
-    single run reads a trend, not significance). Both console and HTML render from this."""
+    single run reads a trend, not significance). Both console and HTML render from this.
+
+    `arm` is what decides whether ⊘ applies at all — see COMPACTION_GATED."""
     if not a["_lens"] or not v["length"]:
         return ("—", "na")
-    if sub_gate:
+    if gated(arm, sub_gate):
         return ("⊘ too short", "na")
     lo, hi, am = v["length"][0], v["length"][2], a["length"][1]
     if a["length_ok"] is True:
@@ -1255,9 +1274,9 @@ def _verdict(v, a, sub_gate):
     return ("~ same n1", "good")
 
 
-def _verdict_cell(v, a, sub_gate):
+def _verdict_cell(v, a, arm, sub_gate):
     """Console verdict cell — rich-markup wrapper around the shared _verdict."""
-    label, state = _verdict(v, a, sub_gate)
+    label, state = _verdict(v, a, arm, sub_gate)
     color = {"good": "green", "bad": "red", "warn": "yellow", "na": "dim"}[state]
     return f"[{color}]{label}[/]"
 
@@ -1326,22 +1345,25 @@ def _full_table(console, d, model):
         t.add_column("task", no_wrap=True)
         # one column per metric, each showing vanilla→arm + delta (see _cmp_cell) — far less
         # crammed than separate vanilla/arm columns, and the arm's absolute value is still there
+        # the second header line is load-bearing: without it a reader has to infer from
+        # colour whether +18% means the arm spent more or less
         for c in ("length", "tokens", "$"):
-            t.add_column(c, justify="right")
+            t.add_column(f"{c}\n[dim]saved[/]", justify="right")
         t.add_column("verdict", justify="left", no_wrap=True)
         if has_ms:
             t.add_column("milestone", justify="right")  # subgoals reached vs vanilla
         for r in arm_rows:
             v, a, sub = r["vanilla"], r["arms"][arm], r["sub_gate"]
             peak = v["peak_ctx"] // 1000
-            taskcell = (f"{r['task']}\n[dim]peak {peak}k{' ⊘' if sub else ''} · "
+            short = ' ⊘' if gated(arm, sub) else ''
+            taskcell = (f"{r['task']}\n[dim]peak {peak}k{short} · "
                         f"solve {a['solve']}/{a['attempted']}[/]")
             cells = [
                 taskcell,
                 _cmp_cell(v["_lens"], a["_lens"], _LENFMT),
                 _cmp_cell(v["_toks"], a["_toks"], _TOKFMT),
                 _cmp_cell(v["_costs"], a["_costs"], _USDFMT),
-                _verdict_cell(v, a, sub),
+                _verdict_cell(v, a, arm, sub),
             ]
             if has_ms:
                 cells.append(_milestone_cell(a))
@@ -1413,11 +1435,13 @@ def _takeaway(console, d):
         graded = (len(r["vanilla"]["_lens"]) >= 2
                   and any(len(r["arms"][arm]["_lens"]) >= 2 for arm in d["arms"]))
         if graded:
-            (tooshort if r["sub_gate"] else comparable).add(r["task"])
+            short = all(gated(arm, r["sub_gate"]) for arm in d["arms"])
+            (tooshort if short else comparable).add(r["task"])
     replayed = {r["task"] for r in d["rows"] for arm in d["arms"]
                 if (r["arms"][arm].get("incr") or {}).get("fid") is not None}
-    diverge = [f"{r['task']}/{arm} length" for r in d["rows"] if not r["sub_gate"]
-               for arm in d["arms"] if r["arms"][arm].get("length_ok") is False]
+    diverge = [f"{r['task']}/{arm} length" for r in d["rows"]
+               for arm in d["arms"] if r["arms"][arm].get("length_ok") is False
+               and not gated(arm, r["sub_gate"])]
     for r in d["rows"]:                                   # fidelity meaningfully below floor
         floor = _floor_for(r, d["arms"])
         if floor is None or floor < 0.9:  # control should score ≥90% under a calibrated judge;

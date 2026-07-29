@@ -378,13 +378,24 @@ def _preflight_full(arms, env):
     return rows
 
 
+def _apply_auth(args, env):
+    """--auth subscription forces the Claude Code login even when an API key is configured —
+    drop the key so both the auth check and the container agent use the subscription token.
+    'auto' (the default) prefers a key if present.
+
+    EVERY entry point that spends has to call this. `--mode judge` did not, so a standalone
+    re-judge silently ran on the API key while the identical judge inside a
+    `--auth subscription` full run ran on OAuth — the same command reproducing on different
+    credentials, which is exactly the wrong property when you are debugging an auth failure.
+    """
+    if getattr(args, "auth", "auto") != "subscription":
+        return env
+    os.environ.pop("ANTHROPIC_API_KEY", None)  # so harbor doesn't forward it either
+    return {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"}
+
+
 def full(args, env):
-    # --auth subscription forces the Claude Code login even if an API key is
-    # configured — drop the key so both the auth check and the container agent use
-    # the subscription token. 'auto' (default) prefers a key if present.
-    if getattr(args, "auth", "auto") == "subscription":
-        env = {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"}
-        os.environ.pop("ANTHROPIC_API_KEY", None)  # so harbor doesn't forward it either
+    env = _apply_auth(args, env)
     arms = _validate_full(args, env)
     if not args.dry_run:
         rows = _preflight_full(arms, env)
@@ -742,17 +753,40 @@ def _summary(path):
 
 
 def _ask(prompt, env):
+    """(parsed_json | None, error | None). The two failures are kept APART on purpose: "the
+    API refused the call" and "the model answered something unparseable" are the same `None`
+    to a caller that only checks truthiness, and collapsing them printed `judge returned no
+    usable milestones` — a sentence about the judge's OUTPUT — after three calls that never
+    reached a model. That reads as "this task has no milestones" and sends you looking at the
+    trajectory instead of at the 429 two lines above."""
     req = {"model": DEFAULT_MODEL, "max_tokens": 1500, "temperature": 0,
            "messages": [{"role": "user", "content": prompt}]}
     resp, err = eng.call_api("control", req, {"anthropic-version": "2023-06-01"}, env)
     if err:
-        print(f"[milestones] judge call failed: {err[:160]}", file=sys.stderr)
-        return None
+        return None, err
     t = "".join(b.get("text", "") for b in resp["content"]).strip()
     try:
-        return json.loads(t[t.index("{"): t.rindex("}") + 1])
+        return json.loads(t[t.index("{"): t.rindex("}") + 1]), None
     except (ValueError, json.JSONDecodeError):
-        return None
+        return None, None
+
+
+def _why(err, env):
+    """One line the reader can act on, instead of a raw JSON error body.
+
+    A 429 here is almost never "you are out of quota": the full run that produced these
+    trajectories just finished on the same credentials. It is the judge's own traffic being
+    throttled, and it is transient — milestones.json caches per task, so a re-run only pays
+    for what is still missing.
+    """
+    short = " ".join(str(err).split())[:160]
+    if any(s in short for s in ("HTTP 429", "rate_limit", "overloaded", "HTTP 529")):
+        who = ("your Claude Code subscription" if eng.auth_mode(env) == "subscription"
+               else "your API key")
+        return (f"rate-limited ({who}) — transient, not a quota failure. Re-run the judge "
+                f"in a few minutes; already-judged tasks are cached, so you only pay for "
+                f"the rest.\n    {short}")
+    return short
 
 
 def _runs(root, arm, task):
@@ -766,11 +800,13 @@ def _runs(root, arm, task):
 
 
 def judge_milestones(args, env):
+    env = _apply_auth(args, env)
+    print(f"[milestones] auth: {eng.auth_mode(env) or 'NONE'}")
     problems = eng.check_arms(["control"], env)
     if problems:
         sys.exit("milestone judge needs an API key:\n  - " + "\n  - ".join(problems))
     arms = ["vanilla"] + [a for a in args.arms.split(",") if a]
-    result, mpath = {}, f"{args.out}/milestones.json"
+    result, mpath, failed = {}, f"{args.out}/milestones.json", []
     # CACHE judge results: a judge call is real spend, so reuse already-judged tasks from a
     # prior milestones.json and only judge what's missing — unless --force (the wizard's "full
     # retry"), which re-judges everything. Failed/skipped tasks aren't cached (never entered
@@ -790,7 +826,11 @@ def judge_milestones(args, env):
             print(f"[milestones] {task}: no SOLVED vanilla run to ground milestones — skipped")
             continue
         t, s = _summary(ref)
-        m = _ask(EXTRACT.format(task=t, summary=s), env)
+        m, err = _ask(EXTRACT.format(task=t, summary=s), env)
+        if err:
+            print(f"[milestones] {task}: judge call failed — {_why(err, env)}", file=sys.stderr)
+            failed.append(task)
+            continue
         ms = (m or {}).get("milestones") or []
         if not ms:
             print(f"[milestones] {task}: judge returned no usable milestones — skipped")
@@ -807,7 +847,10 @@ def judge_milestones(args, env):
                       f"{len(eligible)} runs (per-arm cap)")
             for p in paths:
                 _, s2 = _summary(p)
-                c = _ask(COVER.format(task=t, ms=json.dumps(ms), summary=s2), env)
+                c, cerr = _ask(COVER.format(task=t, ms=json.dumps(ms), summary=s2), env)
+                if cerr:
+                    print(f"[milestones] {task}/{arm}: coverage call failed — "
+                          f"{_why(cerr, env)}", file=sys.stderr)
                 cov = (c or {}).get("coverage") or []
                 if cov:
                     covs.append(sum(bool(x.get("achieved")) for x in cov) / len(ms))
@@ -816,6 +859,13 @@ def judge_milestones(args, env):
         json.dump(result, open(mpath, "w"), indent=1)  # per-task: a late crash keeps earlier work
     json.dump(result, open(mpath, "w"), indent=1)
     print(f"[milestones] wrote {mpath}")
+    # Say it once more at the end. The per-task errors scroll past under the run's own output,
+    # and the report that follows simply has no milestone column — an absence that looks like
+    # "milestones were off" rather than "the judge never ran".
+    if failed:
+        print(f"[milestones] {len(failed)} task(s) unjudged: {', '.join(failed)} — the report "
+              f"below has NO milestone column for them. Re-run the judge to fill it in "
+              f"(judged tasks are cached).", file=sys.stderr)
 
 
 def main(argv=None):
