@@ -397,6 +397,66 @@ def test_report_marks_sub_gate_tasks():
     assert row["sub_gate"] is True  # kv-store peaks ~25-35k: compaction can't have fired
 
 
+def _full_row(task="t", peak=36_000, sub_gate=True, vlens=(9, 9, 10), alens=(8, 8, 8)):
+    """One built-report row with enough of a full-run cell for the verdict/table path."""
+    def cell(lens):
+        srt = sorted(lens)
+        return {"_lens": list(lens), "length": (srt[0], srt[len(srt) // 2], srt[-1]),
+                "_toks": [1_000_000] * len(lens), "_costs": [0.20] * len(lens),
+                "peak_ctx": peak, "n": len(lens), "started": len(lens), "solve": len(lens),
+                "attempted": len(lens), "lost": 0, "length_ok": True, "rework_ok": None,
+                "milestone": None, "milestone_ok": None, "incr": None}
+    v, a = cell(vlens), cell(alens)
+    a["length_ok"] = True
+    return {"task": task, "sub_gate": sub_gate, "vanilla": v, "arms": {}}
+
+
+def test_compaction_gate_only_blanks_the_verdict_of_compaction_methods():
+    """⊘ says "vanilla never grew big enough to compact, so nothing compacted". That is a real
+    excuse for a HISTORY TRANSFORM and no excuse at all for a method that acts from step 1 —
+    gating the latter turns a whole small-context run into a column of shrugs while its length,
+    tokens and cost sit right there, measured."""
+    r = _full_row()
+    v, a = r["vanilla"], r["vanilla"]
+    assert report._verdict(v, a, "condense", True)[0] == "⊘ too short"
+    assert report._verdict(v, a, "headroom", True)[0] == "⊘ too short"
+    # unclassified / non-compaction arms get the real verdict
+    assert report._verdict(v, a, "vanilla-proxy", True)[0] != "⊘ too short"
+    assert report._verdict(v, a, "a-brand-new-arm", True)[0] != "⊘ too short"
+    # and above the gate nobody is excused
+    assert report._verdict(v, a, "condense", False)[0] != "⊘ too short"
+    assert report.gated("condense", True) and not report.gated("condense", False)
+
+
+def test_summary_keeps_sub_gate_tasks_for_arms_the_gate_does_not_apply_to():
+    """summarize() drops ⊘ tasks so a compaction claim isn't made about a task nothing
+    compacted. For an arm that always acts, dropping them drops EVERY task — the arm reports no
+    full-run quality at all, which reads as 'not measured' when it was measured fine."""
+    def row(task):
+        return {"task": task, "sub_gate": True,
+                "vanilla": {"solve": 2, "attempted": 2, "n": 2},
+                "arms": {"condense": {"solve": 1, "attempted": 2, "n": 1, "incr": None},
+                         "vanilla-proxy": {"solve": 1, "attempted": 2, "n": 1, "incr": None}}}
+    s = report.summarize({"rows": [row("a"), row("b")], "arms": ["condense", "vanilla-proxy"]})
+    assert s["condense"]["full"] is None                      # gated: nothing comparable
+    assert s["condense"]["full_short"] == ["a", "b"]
+    assert s["vanilla-proxy"]["full"][0] == 0.5               # un-gated: a real pooled rate
+    assert s["vanilla-proxy"]["full_short"] == []
+    assert "too short" not in report._arm_note(s["vanilla-proxy"])
+
+
+def test_full_table_deltas_read_as_savings_not_raw_change():
+    """+ = better, the same convention the incremental table uses. An arm that got 18% cheaper
+    printed −18% here, relying on the green to carry the meaning the sign was contradicting."""
+    cheaper = report._cmp([10, 10], [8, 8])         # arm used less
+    assert round(cheaper["saved"]) == 20 and cheaper["state"] == "good"
+    costlier = report._cmp([10, 10], [13, 13])
+    assert round(costlier["saved"]) == -30 and costlier["state"] == "bad"
+    assert report._cmp([10, 10], [10, 10])["saved"] == 0.0    # never "-0%"
+    cell = report._cmp_cell([10, 10], [8, 8], lambda x: f"{x:.0f}")
+    assert "+20%" in cell and "10" in cell and "8" in cell
+
+
 def test_solve_distinguishes_never_ran_from_crashed(tmp_path):
     """A cell requested but with no trial dir ever opened is aborted/out-of-scope, not a
     0/k failure — it must render as '—', while a cell whose trials opened but produced no

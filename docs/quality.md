@@ -79,6 +79,13 @@ vanilla-proxy has the confound subtracted. Add it with
 Compaction *quality* claims must come from tasks whose vanilla runs clear the gate — the
 long half of the curated list (`--tasks long`).
 
+**⊘ applies to compaction methods only** (`report.COMPACTION_GATED`). It is an excuse for a
+*history transform*: no compaction fired, so the method never got to act. It is no excuse for
+a method that acts from the first step regardless of context size — that method's length,
+tokens and cost on a small task are measured and comparable, and blanking its verdict turns a
+whole run into a column of shrugs. The list is an **allowlist**: an arm nobody classified is
+un-gated, so a new method shows a real verdict rather than quietly vanishing from the table.
+
 ## Arms — naming, carefully
 
 - `condense` — the condense proxy (whole-conversation compaction).
