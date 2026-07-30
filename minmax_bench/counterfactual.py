@@ -430,7 +430,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
            model: str | None = None, auth: str = "auto", task: str = "session",
            judge: str = "off", capture: bool = False, headroom_mode: str = "token",
            ccr: bool = True, ctx_gate: int = 50_000, independent_budgets: bool = False,
-           resume: bool = True) -> dict:
+           resume: bool = True, effort: str | None = None) -> dict:
     env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
     if auth == "subscription":
         # force the Claude Code login path even when an API key is configured
@@ -630,7 +630,8 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
     strip_thinking = replay_model != (meta["model"] or replay_model)
     drop_beta = False if captured else cross_model
     args = SimpleNamespace(max_tokens=max_tokens, strip_thinking=strip_thinking,
-                           swechat=None, keep_all_tools=True, drop_beta_config=drop_beta)
+                           swechat=None, keep_all_tools=True, drop_beta_config=drop_beta,
+                           effort=effort)
 
     # every decision point, in order — a contiguous nested-prefix sequence so the incremental
     # prompt-cache model is faithful (each step writes a 1-turn delta, reads the rest). --limit
@@ -645,6 +646,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
     console.print(Panel.fit(
         f"[bold]session[/] {session.name}   [bold]decision points[/] {len(sel)}/{len(points)}"
         f"   [bold]model[/] {replay_model}"
+        f"{f'   [bold]effort[/] {effort}' if effort else ''}"
         f"{' [yellow](thinking stripped: cross-model)[/]' if cross_model else ''}\n"
         f"[bold]arms[/] control + {', '.join(arms)}   "
         f"[bold]rough cost/arm[/] ${lo:.2f}–${hi:.2f} (capped at ${budget_usd:.2f} each)\n"
@@ -668,7 +670,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
     # <system-reminder>/CLAUDE.md blocks that ensure_reminders may have prepended)
     task_hint = _task_hint(msgs)
     summary: dict = {"session": str(session), "model": replay_model, "steps": len(sel),
-                     "judged": judge, "arms": {}}
+                     "effort": effort, "judged": judge, "arms": {}}
     from minmax_bench.quality import generate as gen
     # control runs FIRST; unless --independent-budgets, cap every later arm at the number of
     # steps control actually completed within budget. The metric is a per-step PAIRED

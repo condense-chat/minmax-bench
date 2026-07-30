@@ -848,6 +848,12 @@ def build_request(tmpl_body, prefix, args, session_id):
         for m in req["messages"]:
             m["content"] = [b for b in m["content"]
                             if b.get("type") not in ("thinking", "redacted_thinking")]
+    # explicit effort override (wizard / --effort): stamped onto every request, control and
+    # arms alike, so the comparison stays paired. Applied even when drop_beta_config stripped
+    # the template's output_config — the user asked for it; a model that can't take effort
+    # 400s loudly rather than silently ignoring the choice. Unset = recorded config as-is.
+    if getattr(args, "effort", None):
+        req["output_config"] = {**req.get("output_config", {}), "effort": args.effort}
     # incremental prompt caching across sequential replays (prefixes are nested)
     last_msg = req["messages"][-1]
     last = last_msg["content"]
