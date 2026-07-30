@@ -35,6 +35,7 @@ class Rates:
 _FALLBACK: dict[str, Rates] = {
     # Anthropic. sonnet-5 / opus-4-8 fallbacks approximate the prior generation;
     # tokencost overrides with real rates when its table carries the SKU.
+    "claude-opus-5": Rates(5e-6, 25e-6, 0.5e-6, 6.25e-6),
     "claude-opus-4-8": Rates(5e-6, 25e-6, 0.5e-6, 6.25e-6),
     "claude-opus-4-5": Rates(5e-6, 25e-6, 0.5e-6, 6.25e-6),
     "claude-sonnet-5": Rates(3e-6, 15e-6, 0.3e-6, 3.75e-6),
