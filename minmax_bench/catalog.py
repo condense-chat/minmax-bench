@@ -27,6 +27,7 @@ CATALOG: list[ModelChoice] = [
     ModelChoice("haiku 4.5", "claude-haiku-4-5", "anthropic", default=True),
     ModelChoice("sonnet 5", "claude-sonnet-5", "anthropic"),
     ModelChoice("opus 4.8", "claude-opus-4-8", "anthropic"),
+    ModelChoice("opus 5", "claude-opus-5", "anthropic"),
     ModelChoice("gpt-5-mini", "gpt-5-mini", "openai"),
     ModelChoice("gpt-4.1", "gpt-4.1", "openai"),
     ModelChoice("gpt-5", "gpt-5", "openai"),

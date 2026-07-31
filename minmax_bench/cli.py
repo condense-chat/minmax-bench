@@ -62,6 +62,7 @@ def quality_run(
     tasks: str | None = typer.Option(None, "--tasks", help="N recommended | random:N (with --seed) | group (all|long|short|hard|medium) | a,b,c | omitted = 5. `long`=author timeout ≥30m, biasing toward sessions long enough to compact. See --list-tasks."),
     arms: str = typer.Option("condense,headroom", "--arms", help="Methods to run; vanilla baseline always included. Also: headroom-kompress (ablation), vanilla-proxy (passthrough control — isolates the proxy-wiring confound)."),
     model: str | None = typer.Option(None, "--model", "-m", help="Model id (default claude-sonnet-4-6)."),
+    effort: str | None = typer.Option(None, "--effort", help="Thinking effort for the container's Claude Code: low | medium | high | xhigh | max (default: unset — Claude Code's own default, high)."),
     dataset: str = typer.Option(_Q_DATASET, "--dataset", "-d", help="Harbor dataset (only the default is validated)."),
     k: int = typer.Option(4, "--k", help="Trials per arm/task."),
     k_vanilla: int | None = typer.Option(None, "--k-vanilla", help="Trials for the vanilla baseline (default k+1)."),
@@ -92,7 +93,7 @@ def quality_run(
     # bare + interactive → guided wizard (like the cost bench's `run`). The wizard
     # can pick EITHER full or incremental trajectories and its own source.
     if (sys.stdin.isatty() and not yes and not dry_run and tasks is None and model is None
-            and arms == "condense,headroom" and dataset == _Q_DATASET):
+            and effort is None and arms == "condense,headroom" and dataset == _Q_DATASET):
         from .interactive import run_quality_wizard
         try:
             w = run_quality_wizard(console)
@@ -104,7 +105,7 @@ def quality_run(
             report_main(["--from", w.out, "--arms", w.arms, "--tasks", w.tasks])
             return
         if w.mode == "incremental":
-            _run_incremental(session=w.session, arms=w.arms, model=w.model,
+            _run_incremental(session=w.session, arms=w.arms, model=w.model, effort=w.effort,
                              limit=w.limit, budget_usd=w.budget_usd, max_tokens=6000,
                              out=w.out, task=w.task, auth=w.auth, assume_yes=True, judge=w.judge,
                              capture=w.capture, ctx_gate=w.ctx_gate,
@@ -113,6 +114,7 @@ def quality_run(
         arms, tasks, model, k, budget_usd, milestones, out, force, retries, auth = (
             w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out, w.force, w.retries,
             w.auth)
+        effort = w.effort
     if not out:  # auto-mint a fresh dir under the configured root, like the cost bench
         from minmax_bench.quality.paths import new_run_dir
         out = new_run_dir("full", (tasks or dataset).replace(",", "-"))
@@ -121,6 +123,7 @@ def quality_run(
             "--wall-timeout", str(wall_timeout), "--retries", str(retries)]
     _flag(argv, "--tasks", tasks)
     _flag(argv, "--model", model)
+    _flag(argv, "--effort", effort)
     _flag(argv, "--k-vanilla", k_vanilla)
     _flag(argv, "--seed", seed)
     _flag(argv, "--agent-timeout-mult", agent_timeout_mult)
@@ -220,7 +223,7 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None,
                      auth: str, assume_yes: bool, judge: str = "off", steps: bool = True,
                      capture: bool = False, headroom_mode: str = "token", ccr: bool = True,
                      ctx_gate: int = 50_000, independent_budgets: bool = False,
-                     resume: bool = True) -> None:
+                     resume: bool = True, effort: str | None = None) -> None:
     """Rich incremental (teacher-forced, per-step) run of one session — picker when no
     --session, model auto-fallback, cost preview, per-arm progress, a summary table with the
     recorded backtest anchor, and a per-step good/semi/bad/redundant readout. Writes
@@ -235,7 +238,7 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None,
                          max_tokens=max_tokens, out_dir=Path(out), console=console,
                          assume_yes=assume_yes, model=model, auth=auth, task=task, judge=judge,
                          capture=capture, headroom_mode=headroom_mode, ccr=ccr, ctx_gate=ctx_gate,
-                         independent_budgets=independent_budgets, resume=resume)
+                         independent_budgets=independent_budgets, resume=resume, effort=effort)
     except SystemExit as e:
         raise typer.Exit(e.code if isinstance(e.code, int) else 1) from None
     render_summary(summary, console)
@@ -250,6 +253,7 @@ def quality_incremental(
     session: str | None = typer.Argument(None, help="A session .jsonl (default: pick from ~/.claude/projects)."),
     arms: str = typer.Option("condense", "--arms", help="Arms to compare besides control (condense, headroom)."),
     model: str | None = typer.Option(None, "--model", "-m", help="Model to run the incremental on (default: the session's own, with auto-fallback if an arm can't serve it)."),
+    effort: str | None = typer.Option(None, "--effort", help="Thinking effort override stamped onto every replayed request (low | medium | high | xhigh | max). Default: inherit the session's recorded thinking config."),
     limit: int = typer.Option(0, "--limit", "-n", help="Max decision points, contiguous from the start (0 = all). Strided sampling was removed — it distorted the cost/compaction numbers."),
     budget_usd: float = typer.Option(2.0, "--budget-usd", help="Per-arm spend cap (control included)."),
     max_tokens: int = typer.Option(6000, "--max-tokens", help="Per-step output cap."),
@@ -277,7 +281,7 @@ def quality_incremental(
     from minmax_bench.quality.paths import new_run_dir
     stem = Path(session).stem[:8] if session else "picked"
     out_dir = out or new_run_dir("incremental", stem)
-    _run_incremental(session=session, arms=arms, model=model, limit=limit,
+    _run_incremental(session=session, arms=arms, model=model, effort=effort, limit=limit,
                      budget_usd=budget_usd, max_tokens=max_tokens, out=out_dir, task=task,
                      auth=auth, assume_yes=yes, judge=judge, steps=steps, capture=capture,
                      headroom_mode=headroom_mode, ccr=ccr, ctx_gate=ctx_gate,

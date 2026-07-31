@@ -366,8 +366,14 @@ QUALITY_MODELS = [
     ("claude-sonnet-4-6", "Sonnet 4.6 — the validated default", True),
     ("claude-haiku-4-5", "Haiku 4.5 — cheapest", False),
     ("claude-sonnet-5", "Sonnet 5", False),
-    ("claude-opus-4-8", "Opus 4.8 — most capable", False),
+    ("claude-opus-4-8", "Opus 4.8", False),
+    ("claude-opus-5", "Opus 5 — most capable", False),
 ]
+
+# Claude effort ladder (thinking depth). The API and Claude Code both default to
+# "high" when nothing is set (Claude Code's one exception: Opus 4.7 defaults to
+# xhigh) — so "default" here means high, NOT medium.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 
 @dataclass
@@ -376,6 +382,7 @@ class QualityWizardResult:
     arms: str
     model: str | None
     out: str
+    effort: str | None = None       # thinking effort; None = leave the default (high)
     auth: str = "auto"              # auto | api-key | subscription (choice when both present)
     # full
     tasks: str = "5"
@@ -453,6 +460,26 @@ def _pick_model(console: Console) -> str:
     if raw.isdigit() and 1 <= int(raw) <= len(QUALITY_MODELS):
         return QUALITY_MODELS[int(raw) - 1][0]
     return raw or QUALITY_MODELS[0][0]
+
+
+def _pick_effort(console: Console, *, incremental: bool = False) -> str | None:
+    """Thinking effort for the run. Returns None for 'default', which means DON'T set
+    anything: full mode then runs Claude Code at its own default (high — xhigh only on
+    Opus 4.7), and incremental replays the session's recorded thinking config untouched.
+    There is no 'medium' default anywhere — medium is an explicit cost-saving step down."""
+    default_label = ("inherit — replay the session's recorded thinking config as-is"
+                     if incremental else
+                     "model default — high (nothing set; Claude Code's own default)")
+    opts = [("default", f"{default_label}   [green]← recommended[/]", True)] + [
+        (lv, lbl, True) for lv, lbl in (
+            ("low", "low — cheapest/fastest; short scoped work"),
+            ("medium", "medium — cost-saving step down from the default"),
+            ("high", "high — the standard default; balanced"),
+            ("xhigh", "xhigh — hardest coding/agentic work"),
+            ("max", "max — deepest reasoning, most tokens"),
+        )]
+    choice = _select_one(console, "thinking effort", opts)
+    return None if choice == "default" else choice
 
 
 def _quality_preflight(console: Console, arms: list[str], *, need_docker: bool) -> None:
@@ -596,6 +623,10 @@ def _full_wizard(console: Console) -> QualityWizardResult:
             break
         console.print(f"[yellow]{why}[/]")
     model = _pick_model(console)
+    # thinking effort — forwarded to the container's Claude Code (`claude --effort` via
+    # harbor's reasoning_effort agent kwarg); every arm's agent subclasses ClaudeCode,
+    # so all arms run at the same level and the comparison stays paired.
+    effort = _pick_effort(console)
     k = _ask_int(console, "[cyan]trials per arm[/] (k — ≥2 for a verdict; 4 recommended)",
                  4, lo=1)
     budget = _ask_float(console, "[cyan]per-trial $ cap[/]", 5.0)
@@ -627,6 +658,7 @@ def _full_wizard(console: Console) -> QualityWizardResult:
     shown = ", ".join(task_list[:6]) + (f", … +{ntasks - 6}" if ntasks > 6 else "")
     console.print(Panel.fit(
         f"[bold]full trajectories[/]   [bold]model[/] {model}   "
+        f"[bold]effort[/] {effort or 'default (high)'}   "
         f"[bold]k[/] {k} (vanilla {kv})\n[bold]tasks[/] ({ntasks}) {shown}\n"
         f"[bold]arms[/] vanilla + {', '.join(arms)}\n"
         f"[bold]milestones[/] {'yes' if milestones else 'no'}   [bold]out[/] {out}\n"
@@ -637,8 +669,8 @@ def _full_wizard(console: Console) -> QualityWizardResult:
     if not Confirm.ask("[cyan]run it?[/]", default=True, console=console):
         raise KeyboardInterrupt
     return QualityWizardResult(mode="full", arms=",".join(arms), tasks=tasks, model=model,
-                               k=k, budget_usd=budget, milestones=milestones, out=out,
-                               force=force, retries=retries, auth=auth)
+                               effort=effort, k=k, budget_usd=budget, milestones=milestones,
+                               out=out, force=force, retries=retries, auth=auth)
 
 
 def _incremental_wizard(console: Console) -> QualityWizardResult:
@@ -704,6 +736,10 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         model = QUALITY_MODELS[int(raw) - 1][0]
     else:
         model = raw
+    # thinking effort — an OVERRIDE stamped onto every replayed request's
+    # output_config.effort (control and arms alike, so the comparison stays paired).
+    # Inherit is the faithful default: the recorded config replays untouched.
+    effort = _pick_effort(console, incremental=True)
     limit = _ask_int(console, "[cyan]max decision points[/] (0 = all; contiguous from the start)", 0)
     budget = _ask_float(console, "[cyan]per-arm $ cap[/]", 2.0)
     # control runs first; by default the later arms are capped at the steps control reached
@@ -749,7 +785,8 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
     _quality_preflight(console, arms, need_docker=False)
     model_lbl = f"inherit ({own})" if model is None else model
     console.print(Panel.fit(
-        f"[bold]incremental trajectory[/]   [bold]model[/] {model_lbl}\n"
+        f"[bold]incremental trajectory[/]   [bold]model[/] {model_lbl}   "
+        f"[bold]effort[/] {effort or 'inherit'}\n"
         f"[bold]session[/] {Path(session).name}\n"
         f"[bold]arms[/] control + {', '.join(arms)}   "
         f"[bold]limit[/] {limit or 'all'}\n"
@@ -763,7 +800,7 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
         raise KeyboardInterrupt
     return QualityWizardResult(mode="incremental", source=src, session=session, swechat=swechat,
                                conv=conv, task=task, arms=",".join(arms), model=model,
-                               limit=limit, budget_usd=budget, out=out,
+                               effort=effort, limit=limit, budget_usd=budget, out=out,
                                judge=judge, capture=capture, ctx_gate=ctx_gate,
                                independent_budgets=independent_budgets, resume=resume, auth=auth)
 

@@ -424,18 +424,25 @@ def full(args, env):
     mf_path = os.path.join(out, "run-manifest.json")
     if os.path.exists(mf_path) and not args.force and not args.dry_run:
         mf = json.load(open(mf_path))
-        if mf.get("model") != model or mf.get("dataset") != args.dataset:
+        # effort joins the gate: cells run at different effort levels are as incomparable
+        # as cells run on different models (old manifests carry no effort key -> None,
+        # which only conflicts when the resume asks for an explicit level)
+        if (mf.get("model") != model or mf.get("dataset") != args.dataset
+                or mf.get("effort") != args.effort):
             sys.exit(f"[conflict] {out} already holds a run with model={mf.get('model')} "
-                     f"dataset={mf.get('dataset')}; you asked for model={model} "
-                     f"dataset={args.dataset}. Reusing it would mix incomparable results — "
-                     f"use a fresh --out, or --force to overwrite.")
+                     f"dataset={mf.get('dataset')} effort={mf.get('effort')}; you asked for "
+                     f"model={model} dataset={args.dataset} effort={args.effort}. Reusing it "
+                     f"would mix incomparable results — use a fresh --out, or --force to "
+                     f"overwrite.")
     if not args.dry_run:
-        json.dump({"model": model, "dataset": args.dataset}, open(mf_path, "w"))
+        json.dump({"model": model, "dataset": args.dataset, "effort": args.effort},
+                  open(mf_path, "w"))
     kv = _k_for(args, "vanilla")
     trials = len(tasks) * (kv + args.k * (len(arms) - 1))
     _console.print(f"[bold]plan[/] {len(arms)} arms ({', '.join(arms)}) × {len(tasks)} tasks "
                    f"× k={args.k} (vanilla {kv}) = {trials} trials, cost ceiling "
-                   f"~${trials * args.budget_usd:.0f} (${args.budget_usd:g}/trial cap)")
+                   f"~${trials * args.budget_usd:.0f} (${args.budget_usd:g}/trial cap)"
+                   + (f"   [bold]effort[/] {args.effort}" if args.effort else ""))
     _console.print(f"[bold]auth[/] {_auth_label(env)}")
     grid = _CellGrid(arms, tasks, kv, args.k, args.budget_usd)
     # a live status grid for the run (matches the wizard's rich look); dry-run stays plain
@@ -465,6 +472,10 @@ def full(args, env):
                            "-n", str(args.concurrency),
                            "-o", cell, "--ak", f"max_budget_usd={args.budget_usd}",
                            "--allow-agent-host", allow, *_agent_auth_env(env), *extra]
+                    if args.effort:
+                        # harbor's ClaudeCode reasoning_effort kwarg -> `claude --effort`;
+                        # every arm's agent subclasses ClaudeCode, so all arms inherit it
+                        cmd += ["--ak", f"reasoning_effort={args.effort}"]
                     # agent SETUP (install Claude Code + node/deps per container) has its OWN
                     # timeout (harbor default 360s), separate from EXECUTION — bump it for every
                     # arm so a cold image doesn't kill trials before the agent even runs.
@@ -525,7 +536,7 @@ def full(args, env):
                         # attempted — report.py exposes survivorship instead of shrinking n
                         os.makedirs(cell, exist_ok=True)
                         json.dump({"k": k, "arm": arm, "task": task, "model": model,
-                                   "attempt": attempt,
+                                   "effort": args.effort, "attempt": attempt,
                                    "started_utc": datetime.now(UTC).isoformat(timespec="seconds")},
                                   open(f"{cell}/attempted.json", "w"))
                         timed_out = False
@@ -889,6 +900,12 @@ def main(argv=None):
                          "line always prints the chosen tasks for reproducibility)")
     ap.add_argument("--out", default="results/jobs/run")
     ap.add_argument("--model", default=None)
+    ap.add_argument("--effort", default=None,
+                    choices=["low", "medium", "high", "xhigh", "max"],
+                    help="thinking effort for the container's Claude Code (harbor "
+                         "reasoning_effort kwarg -> `claude --effort`); every arm gets the "
+                         "same level so the comparison stays paired. Omit = Claude Code's "
+                         "own default (high).")
     # full
     ap.add_argument("--k", type=int, default=4,
                     help="trials per arm/task; band-overlap verdicts need >=2 and get "
