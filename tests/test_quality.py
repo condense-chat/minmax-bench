@@ -554,6 +554,33 @@ def test_judge_honours_auth_subscription_like_the_run_that_produced_it(monkeypat
     assert env["ANTHROPIC_API_KEY"] == "k"                   # caller's dict not mutated
 
 
+def test_preflight_catches_a_custom_agent_module_that_is_not_there(tmp_path, monkeypatch):
+    """Harbor imports `pkg.mod:Class` from the cwd, so a missing agent file fails every trial
+    of that arm — fatally, before any spend. The check must not IMPORT: harbor is a uv tool
+    with its own venv, so importing would fail for a file that is present and fine."""
+    from minmax_bench.quality import generate as gen
+
+    assert gen._agent_import_error("vanilla", {}) is None    # harbor built-in — nothing to check
+    assert gen._agent_import_error("condense", {}) is None
+
+    monkeypatch.chdir(tmp_path)
+    bad = gen._agent_import_error("headroom", {})
+    assert "not found" in bad and "harbor_agents/headroom_ccr_claude_code.py" in bad
+    assert "wrong branch" in bad                             # names the actual cause
+
+    mod = tmp_path / "harbor_agents" / "headroom_ccr_claude_code.py"
+    mod.parent.mkdir()
+    mod.write_text("from harbor.agents.installed.claude_code import ClaudeCode\n")
+    assert gen._agent_import_error("headroom", {}) == ""      # present + valid, harbor absent
+
+    mod.write_text("def broken(:\n")
+    assert "unusable" in gen._agent_import_error("headroom", {})
+
+    rows = gen._preflight_full(["headroom"], {"ANTHROPIC_API_KEY": "k"})
+    row = next(r for r in rows if r[0] == "headroom agent")
+    assert row[1] is False and row[3] is True                 # fatal, so the run aborts
+
+
 def test_referenced_tool_names_includes_search_discovered_mcp():
     """Tool-search sessions reference MCP tools by name in results without ever
     calling them; those must still be stubbed or Anthropic 400s on the reference."""
