@@ -342,6 +342,29 @@ def _docker_alive():
         return False
 
 
+def _agent_import_error(arm, env):
+    """Is this arm's custom agent module usable? None = built-in agent, "" = ok, else why not.
+
+    Harbor imports `--agent pkg.mod:Class` from the cwd, so an arm's agent is only as present
+    as the checkout under it. Resolve + compile rather than import: these agents subclass
+    harbor's ClaudeCode, and harbor is a uv tool with its own venv, so importing would fail on
+    a file that is present and fine.
+    """
+    agent = _arm_wiring(arm, env)[2]
+    if ":" not in agent:                                   # harbor built-in ("claude-code")
+        return None
+    mod = agent.split(":", 1)[0]
+    path = os.path.join(os.getcwd(), *mod.split(".")) + ".py"
+    if not os.path.isfile(path):
+        return (f"{mod} not found — expected {os.path.relpath(path)} (wrong branch or wrong "
+                f"cwd? harbor imports the agent from the directory you run it in)")
+    try:
+        compile(open(path, encoding="utf-8").read(), path, "exec")
+    except (SyntaxError, OSError) as e:
+        return f"{os.path.relpath(path)} is unusable: {type(e).__name__}: {e}"
+    return ""
+
+
 def _preflight_full(arms, env):
     """Dependency preflight before spending (like the cost bench's run preflight):
     every dependency each requested arm needs, as (name, ok, detail, fatal). Docker
@@ -353,6 +376,10 @@ def _preflight_full(arms, env):
         ("Anthropic auth", bool(eng.auth_mode(env)),
          eng.auth_mode(env) or "ANTHROPIC_API_KEY or `claude setup-token`", True),
     ]
+    for arm in arms:
+        bad = _agent_import_error(arm, env)
+        if bad is not None:
+            rows.append((f"{arm} agent", not bad, bad or "importable", True))
     if "condense" in arms:
         creds = eng.condense_creds(env)
         via = (f"dense profile ({creds['user'][:8]}…)" if creds and creds.get("user")
