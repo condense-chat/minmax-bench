@@ -1105,3 +1105,61 @@ def test_summary_full_run_column_drops_tasks_under_the_compaction_gate():
                           "arms": ["condense"]})["condense"]
     assert s["full_tasks"] == ["long"] and s["full_short"] == ["tiny"]
     assert "⊘1 too short" in report._arm_note(s)
+
+
+# ---------------------------------------------------------------- wizard: parallel sessions
+def _cli_defaults():
+    """Every `quality run` parameter at its real default.
+
+    Read off the signature rather than hand-listed: calling a typer command directly leaves
+    OptionInfo sentinels in place of defaults, so a parameter added later would silently arrive
+    as a sentinel and the test would pass while exercising nothing.
+    """
+    import inspect
+
+    import typer
+
+    from minmax_bench import cli
+    return {name: (p.default.default if isinstance(p.default, typer.models.OptionInfo)
+                   else p.default)
+            for name, p in inspect.signature(cli.quality_run).parameters.items()}
+
+
+def _argv_from_wizard(monkeypatch, **wizard_kw):
+    """Run `quality run` down its WIZARD branch and return the argv it hands the driver.
+
+    Every parameter is passed explicitly: typer defaults are OptionInfo objects when the
+    command function is called directly, so an omitted one is a sentinel, not its value.
+    """
+    import sys
+
+    from minmax_bench import cli
+    from minmax_bench.interactive import QualityWizardResult
+    from minmax_bench.quality import generate as gen
+
+    seen = {}
+    monkeypatch.setattr(gen, "main", lambda argv: seen.update(argv=argv))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(
+        "minmax_bench.interactive.run_quality_wizard",
+        lambda _c: QualityWizardResult(mode="full", arms="condense", model="m", out="o",
+                                       tasks="2", **wizard_kw))
+    cli.quality_run(**_cli_defaults())
+    return seen["argv"]
+
+
+def test_wizard_parallel_sessions_default_is_one():
+    """Sequential unless asked for: parallel containers contend for CPU/RAM/disk, which can
+    shift the trajectories this bench measures."""
+    from minmax_bench.interactive import QualityWizardResult
+    assert QualityWizardResult(mode="full", arms="condense", model=None, out="o").concurrency == 1
+
+
+def test_wizard_parallel_answer_beats_the_flag_default(monkeypatch):
+    """The wizard's answer has to win over --concurrency's default. A knob that silently
+    stays 1 is worse than no knob, because the run looks like it obeyed."""
+    argv = _argv_from_wizard(monkeypatch, k=4, concurrency=3)
+    assert argv[argv.index("--concurrency") + 1] == "3"
+
+    argv = _argv_from_wizard(monkeypatch, k=4)                 # not asked -> sequential
+    assert argv[argv.index("--concurrency") + 1] == "1"

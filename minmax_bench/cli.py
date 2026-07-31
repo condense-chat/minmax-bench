@@ -69,7 +69,7 @@ def quality_run(
     budget_usd: float = typer.Option(5.0, "--budget-usd", help="Per-trial spend cap (Harbor max_budget_usd)."),
     wall_timeout: int = typer.Option(2400, "--wall-timeout", help="Per-trial wall-clock FLOOR (seconds). The effective cap auto-sizes up to each task's own author budget (× the arm's exec multiplier) + build/setup/verify overhead, so long tasks aren't guillotined; raise this to give slow arms even more room."),
     retries: int = typer.Option(0, "--retries", help="Extra re-attempts for a cell that crashed or timed out (no reward.txt), until every trial resolves to a verdict (reward 0 or 1) or attempts run out. A trial that ran and scored — even 0 — is NOT retried. 0 = single pass."),
-    concurrency: int = typer.Option(1, "--concurrency", help="Parallel trials per cell (harbor -n)."),
+    concurrency: int = typer.Option(1, "--concurrency", help="Trials of one cell run at once (harbor -n). 1 = sequential, one agent session at a time. Cells run one at a time, so this is capped by k; each parallel trial is a whole container plus a live agent session on the same credentials, so RAM and rate limits bound it, not CPU. Same total spend, N× the burn rate."),
     milestones: bool = typer.Option(False, "--milestones", help="Also run the LLM milestone judge."),
     out: str | None = typer.Option(None, "--out", help="Results root (default: a fresh auto-minted dir under settings.quality_runs_dir, like the cost bench — never clobbers)."),
     seed: int | None = typer.Option(None, "--seed", help="Seed for --tasks random:N."),
@@ -115,6 +115,7 @@ def quality_run(
             w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out, w.force, w.retries,
             w.auth)
         effort = w.effort
+        concurrency = w.concurrency   # wizard answer wins over the flag default
     if not out:  # auto-mint a fresh dir under the configured root, like the cost bench
         from minmax_bench.quality.paths import new_run_dir
         out = new_run_dir("full", (tasks or dataset).replace(",", "-"))
