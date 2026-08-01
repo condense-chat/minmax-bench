@@ -48,6 +48,9 @@ PRICES = {
     "claude-sonnet-5": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
     "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_write": 1.25, "cache_read": 0.10},
     "claude-opus-4": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.50},
+    # opus 5 ships at opus 4.8's price; the "claude-opus-4" prefix above does not cover it,
+    # so without this entry it silently fell through to the sonnet fallback (-40% on every rate)
+    "claude-opus-5": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.50},
     "claude-fable-5": {"input": 10.0, "output": 50.0, "cache_write": 12.50, "cache_read": 1.00},
 }
 DEFAULT_PRICE_MODEL = "claude-sonnet-4-6"

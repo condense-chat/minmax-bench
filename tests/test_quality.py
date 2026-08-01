@@ -1105,3 +1105,62 @@ def test_summary_full_run_column_drops_tasks_under_the_compaction_gate():
                           "arms": ["condense"]})["condense"]
     assert s["full_tasks"] == ["long"] and s["full_short"] == ["tiny"]
     assert "⊘1 too short" in report._arm_note(s)
+
+
+def _qcell(lens, solve, attempted, milestone_ok=None):
+    """A minimal _cell_stats-shaped dict for verdict tests."""
+    return {"_lens": lens, "length": report.band(lens), "rework": None,
+            "_toks": [], "_costs": [], "_lats": [], "peak_ctx": 100_000,
+            "n": len(lens), "started": len(lens), "solve": solve, "attempted": attempted,
+            "lost": 0, "length_ok": True, "rework_ok": None,
+            "milestone": None, "milestone_ok": milestone_ok, "incr": None}
+
+
+def test_shorter_trajectory_is_not_a_divergence():
+    """The verdict is about QUALITY, not length. An arm that reaches the same result in half
+    the steps has done what the method exists to do — calling that "drifted" read as a failure
+    and was the whole complaint. Longer still surfaces, but as a COST note on a held verdict."""
+    v = _qcell([26, 28, 27, 25, 26], solve=5, attempted=5)
+    shorter = _qcell([13, 14, 15, 13], solve=4, attempted=4)
+    longer = _qcell([48, 52, 45, 50], solve=4, attempted=4)
+
+    label, state = report._verdict(v, shorter, "caveman", False)
+    assert state == "good" and "quality held" in label
+    assert "short" not in label and "drift" not in label
+
+    label, state = report._verdict(v, longer, "caveman", False)
+    assert state == "warn" and "↑ longer" in label      # a cost signal, not a quality failure
+    assert "quality lost" not in label
+
+
+def test_quality_needs_both_solve_and_milestone():
+    """Neither signal excuses the other: the verifier is ground truth for "did it do the task",
+    the milestone judge catches an arm that still passes having done materially less."""
+    v = _qcell([26] * 5, solve=4, attempted=5)                       # vanilla 80%
+
+    # solve regression bigger than one trial (80% -> 50%) is a loss even with milestones OK
+    assert report._verdict(v, _qcell([26] * 4, 2, 4, milestone_ok=True),
+                           "caveman", False)[1] == "bad"
+    # a milestone regression is a loss even when the verifier is untouched
+    assert report._verdict(v, _qcell([26] * 4, 4, 4, milestone_ok=False),
+                           "caveman", False)[1] == "bad"
+    # a one-trial wobble (80% -> 75%, inside 1/4) is noise at this k, not a regression
+    assert report._verdict(v, _qcell([26] * 4, 3, 4, milestone_ok=True),
+                           "caveman", False)[1] == "good"
+
+
+def test_report_refuses_an_empty_results_root(tmp_path, capsys):
+    """Pure-display command: having nothing to display is always a mistake worth stopping on.
+    It used to render a complete-looking report of blank cells and exit 0 — indistinguishable
+    from "the arm genuinely produced nothing", and trivially hit via a relative --from from the
+    wrong cwd."""
+    import pytest
+    with pytest.raises(SystemExit) as e:
+        report.main(["--from", str(tmp_path / "nope"), "--arms", "caveman"])
+    assert e.value.code != 0
+    assert "not a directory" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as e:
+        report.main(["--from", str(tmp_path), "--arms", "caveman"])
+    assert e.value.code != 0
+    assert "no finished trials" in capsys.readouterr().err
