@@ -37,10 +37,12 @@ except ImportError:  # fresh clone, no install — fall back to the plain-text v
 # one session parser for the spend side (generate/engine) and the display side.
 from minmax_bench.quality.engine import (
     SESSION_GLOB,
+    cost_usd,
     ctx_tokens,
     extract_action,
     parse_session,
     peak_ctx,
+    recorded_usage,
     resolve_tasks,
 )
 
@@ -240,19 +242,37 @@ def _is_sidechain(path):
     return False
 
 
-def _trial_metrics(trial_dir):
+def _trial_metrics(trial_dir, session_path=None):
     """cost_usd + total tokens + wall-clock seconds from a trial's result.json ({} if absent).
-    Tokens = input + cache + output (the whole trajectory's spend), matching the cost basis."""
+    Tokens = input + cache + output (the whole trajectory's spend), matching the cost basis.
+
+    Harbor records the token counts but leaves `cost_usd` null on a trial killed by the agent
+    wall timeout. Reading the two independently keeps such a trial in BOTH columns — gating
+    tokens on cost used to drop it from tokens too, so a task whose trials all timed out
+    vanished from tokens and $ entirely, which is exactly where the burn is most interesting
+    (it ran until the wall). When cost is missing we price the recorded transcript usage
+    ourselves, so the two columns stay over the same trial set: a tokens mean covering more
+    trials than its $ mean is not comparable down the row.
+    """
     try:
         r = json.load(open(os.path.join(trial_dir, "result.json")))
     except (OSError, json.JSONDecodeError):
         return {}
     ar = r.get("agent_result") or {}
     m = {}
+    tok = sum(ar.get(k) or 0 for k in
+              ("n_input_tokens", "n_cache_tokens", "n_output_tokens"))
+    if tok:
+        m["tok"] = tok
     if ar.get("cost_usd") is not None:
         m["cost"] = ar["cost_usd"]
-        m["tok"] = (ar.get("n_input_tokens", 0) + ar.get("n_cache_tokens", 0)
-                    + ar.get("n_output_tokens", 0))
+    elif tok and session_path:
+        model = ((ar.get("model_info") or {}).get("name")
+                 or ((r.get("agent_info") or {}).get("model_info") or {}).get("name"))
+        try:
+            m["cost"] = sum(cost_usd(u, model) for u in recorded_usage(session_path))
+        except (OSError, ValueError, KeyError):
+            pass
     try:
         from datetime import datetime
         s = datetime.fromisoformat(r["started_at"].replace("Z", "+00:00"))
@@ -286,7 +306,7 @@ def index_runs(root, agent):
         cell = idx.setdefault(key, {"runs": [], "attempted": None, "seen": set()})
         if s not in cell["seen"]:
             cell["seen"].add(s)
-            cell["runs"].append((s, open(rt).read().strip(), _trial_metrics(inst)))
+            cell["runs"].append((s, open(rt).read().strip(), _trial_metrics(inst, s)))
     for ap in glob.glob(f"{root}/**/attempted.json", recursive=True):
         key = os.path.basename(os.path.dirname(ap))
         try:
