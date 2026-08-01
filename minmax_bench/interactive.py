@@ -387,6 +387,7 @@ class QualityWizardResult:
     # full
     tasks: str = "5"
     k: int = 4
+    concurrency: int = 1             # trials of a cell run at once; 1 = one session at a time
     budget_usd: float = 5.0
     milestones: bool = True
     force: bool = False              # True = full re-run (redo completed cells); False = resume
@@ -630,6 +631,23 @@ def _full_wizard(console: Console) -> QualityWizardResult:
     effort = _pick_effort(console)
     k = _ask_int(console, "[cyan]trials per arm[/] (k — ≥2 for a verdict; 4 recommended)",
                  4, lo=1)
+    # harbor's -n: trials of ONE cell running at once. Default 1, and the reason is measurement,
+    # not caution — parallel containers contend for CPU/RAM/disk, which slows the commands the
+    # agent runs and can change the trajectory this bench exists to measure. That confound lands
+    # on whichever arm happened to share the machine, so it does not cancel out.
+    concurrency = _ask_int(
+        console, "[cyan]parallel sessions[/] (trials of a cell run at once; 1 = sequential)",
+        1, lo=1)
+    if concurrency > 1:
+        # Cells run one at a time, so parallelism cannot exceed the trials IN a cell — say so
+        # rather than let someone pick 8 and quietly get k.
+        eff = min(concurrency, k)
+        console.print(
+            f"[dim]  → capped by k: at most {eff} at once (vanilla {min(concurrency, k + 1)}). "
+            f"Same total spend, {eff}× the burn rate.[/]\n"
+            f"[yellow]  → {eff} containers + agent sessions live at once: they contend for "
+            f"CPU/RAM/disk, which can slow the agent's commands and shift trajectories. "
+            f"sequential keeps the measurement cleanest.[/]")
     budget = _ask_float(console, "[cyan]per-trial $ cap[/]", 5.0)
     milestones = Confirm.ask("[cyan]also run the LLM milestone judge?[/]", default=True,
                              console=console)
@@ -668,6 +686,7 @@ def _full_wizard(console: Console) -> QualityWizardResult:
             console, "  [cyan]execution timeout multiplier[/] (applies to every arm)", 3, lo=1)
     _quality_preflight(console, arms, need_docker=True)
     ntasks = len(task_list)
+    par_note = f"{min(concurrency, k)} sessions at once"
     kv = k + 1
     trials = ntasks * (kv + k * len(arms))
     shown = ", ".join(task_list[:6]) + (f", … +{ntasks - 6}" if ntasks > 6 else "")
@@ -679,6 +698,7 @@ def _full_wizard(console: Console) -> QualityWizardResult:
         f"[bold]milestones[/] {'yes' if milestones else 'no'}   [bold]out[/] {out}\n"
         f"[bold]mode[/] {'[red]full retry (re-run all)[/]' if force else 'resume (fill missing)'}"
         f"{f'  ·  auto-retry ×{retries}' if retries else ''}   [bold]auth[/] {auth}\n"
+        f"[bold]parallel[/] {'sequential (1 session)' if concurrency == 1 else par_note}   "
         f"[bold]agent timeout[/] "
         f"{f'×{agent_timeout_mult} (all arms)' if agent_timeout_mult else 'task default'}\n"
         f"[bold]{trials} trials[/], cost ceiling ~[bold]${trials * budget:.0f}[/] "
@@ -686,9 +706,9 @@ def _full_wizard(console: Console) -> QualityWizardResult:
     if not Confirm.ask("[cyan]run it?[/]", default=True, console=console):
         raise KeyboardInterrupt
     return QualityWizardResult(mode="full", arms=",".join(arms), tasks=tasks, model=model,
-                               effort=effort, k=k, budget_usd=budget, milestones=milestones,
-                               out=out, force=force, retries=retries, auth=auth,
-                               agent_timeout_mult=agent_timeout_mult)
+                               effort=effort, k=k, concurrency=concurrency, budget_usd=budget,
+                               milestones=milestones, out=out, force=force, retries=retries,
+                               auth=auth, agent_timeout_mult=agent_timeout_mult)
 
 
 def _incremental_wizard(console: Console) -> QualityWizardResult:

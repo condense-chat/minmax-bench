@@ -141,7 +141,7 @@ before spending anything.
 | `--force` | full retry: re-run everything. Default is **automatic resume** — re-run the same command/`--out` and finished cells are skipped |
 | `--milestones` | also run the LLM milestone judge → `milestones.json` (grounded in a solved vanilla run, which is then excluded from vanilla's own coverage scoring) |
 | `--out` | results root (default: fresh auto-minted dir under `settings.quality_runs_dir`, `runs/quality/…` — never clobbers) |
-| `--concurrency` | parallel trials per cell (harbor `-n`) |
+| `--concurrency` | trials of one cell run at once (harbor `-n`); **default 1 = sequential**, and the wizard asks. Cells run one at a time so it is capped by `k`. Same total spend, N× the burn rate — but N containers contending for CPU/RAM/disk can slow the agent's commands and shift the trajectories this bench measures, so sequential is the clean setting |
 | `--agent-timeout-mult` / `--setup-timeout-mult` | Harbor exec/setup timeout multipliers (headroom auto-3; slow container installs) |
 | `--auth` | `auto` \| `api-key` \| `subscription` (force the Claude Code login — no API key needed) |
 | `--dry-run` | print the Harbor commands without running |
