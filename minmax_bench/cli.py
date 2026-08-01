@@ -115,6 +115,8 @@ def quality_run(
             w.arms, w.tasks, w.model, w.k, w.budget_usd, w.milestones, w.out, w.force, w.retries,
             w.auth)
         effort = w.effort
+        if w.agent_timeout_mult is not None:
+            agent_timeout_mult = w.agent_timeout_mult
     if not out:  # auto-mint a fresh dir under the configured root, like the cost bench
         from minmax_bench.quality.paths import new_run_dir
         out = new_run_dir("full", (tasks or dataset).replace(",", "-"))

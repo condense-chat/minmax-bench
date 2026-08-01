@@ -391,6 +391,7 @@ class QualityWizardResult:
     milestones: bool = True
     force: bool = False              # True = full re-run (redo completed cells); False = resume
     retries: int = 0                 # extra re-attempts for a crashed/timed-out cell
+    agent_timeout_mult: int | None = None  # None = each task's own timeout_sec (headroom auto-3)
     # incremental
     source: str = ""                # "own" | "file" | "swechat"
     session: str | None = None
@@ -651,6 +652,20 @@ def _full_wizard(console: Console) -> QualityWizardResult:
                    "resolve — genuine reward-0 fails are kept, not retried)",
                    default=False, console=console):
         retries = _ask_int(console, "  [cyan]max extra attempts per cell[/]", 2, lo=1)
+    # Agent EXECUTION timeout. The default (each task's own timeout_sec) is the Terminal-Bench
+    # spec: exceeding it is how the benchmark defines failure, and raising it makes solve rates
+    # incomparable to a standard run. Two reasons to raise it anyway, so the knob is offered
+    # rather than buried: (1) headroom already gets 3x automatically (it installs headroom-ai +
+    # the MCP SDK before it can work), so a headroom-vs-vanilla TOKEN comparison hands headroom
+    # three times the rope unless every arm is levelled here; (2) deliberately measuring an arm
+    # that would otherwise be cut off mid-trajectory. Raising it does NOT rescue a non-
+    # terminating agent — it just buys the loop more time to burn.
+    agent_timeout_mult = None
+    if Confirm.ask("[cyan]raise the agent execution timeout?[/] (default No = each task's own "
+                   "timeout_sec, the Terminal-Bench spec; note [bold]headroom always gets "
+                   "3x[/] regardless)", default=False, console=console):
+        agent_timeout_mult = _ask_int(
+            console, "  [cyan]execution timeout multiplier[/] (applies to every arm)", 3, lo=1)
     _quality_preflight(console, arms, need_docker=True)
     ntasks = len(task_list)
     kv = k + 1
@@ -664,13 +679,16 @@ def _full_wizard(console: Console) -> QualityWizardResult:
         f"[bold]milestones[/] {'yes' if milestones else 'no'}   [bold]out[/] {out}\n"
         f"[bold]mode[/] {'[red]full retry (re-run all)[/]' if force else 'resume (fill missing)'}"
         f"{f'  ·  auto-retry ×{retries}' if retries else ''}   [bold]auth[/] {auth}\n"
+        f"[bold]agent timeout[/] "
+        f"{f'×{agent_timeout_mult} (all arms)' if agent_timeout_mult else 'task default'}\n"
         f"[bold]{trials} trials[/], cost ceiling ~[bold]${trials * budget:.0f}[/] "
         f"(${budget:g}/trial cap)", title="ready", border_style="green"))
     if not Confirm.ask("[cyan]run it?[/]", default=True, console=console):
         raise KeyboardInterrupt
     return QualityWizardResult(mode="full", arms=",".join(arms), tasks=tasks, model=model,
                                effort=effort, k=k, budget_usd=budget, milestones=milestones,
-                               out=out, force=force, retries=retries, auth=auth)
+                               out=out, force=force, retries=retries, auth=auth,
+                               agent_timeout_mult=agent_timeout_mult)
 
 
 def _incremental_wizard(console: Console) -> QualityWizardResult:
