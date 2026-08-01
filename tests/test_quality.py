@@ -1221,3 +1221,17 @@ def test_wizard_parallel_answer_beats_the_flag_default(monkeypatch):
 
     argv = _argv_from_wizard(monkeypatch, k=4)                 # not asked -> sequential
     assert argv[argv.index("--concurrency") + 1] == "1"
+
+
+def test_wizard_carries_both_parallelism_and_timeout_to_the_driver(monkeypatch):
+    """These two wizard answers land on adjacent lines of the same cli.py branch and were
+    added on separate branches, so a bad merge silently drops one — the run then goes
+    sequential, or at the task's default timeout, while the ready panel claimed otherwise."""
+    argv = _argv_from_wizard(monkeypatch, k=4, concurrency=3, agent_timeout_mult=2)
+    assert argv[argv.index("--concurrency") + 1] == "3"
+    assert argv[argv.index("--agent-timeout-mult") + 1] == "2"
+
+    # and neither is forced on a wizard that didn't ask for it
+    argv = _argv_from_wizard(monkeypatch, k=4)
+    assert argv[argv.index("--concurrency") + 1] == "1"
+    assert "--agent-timeout-mult" not in argv
