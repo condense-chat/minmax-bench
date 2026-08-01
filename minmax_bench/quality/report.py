@@ -17,6 +17,10 @@ Offline axes (always, no model calls): length / rework / solve, each vs the vani
 only if their artifacts exist. Verdicts are deliberately coarse: with k≈3 runs, band overlap can
 only catch GROSS divergence — "OK" means "no detectable divergence at this k", not equivalence.
 
+The per-task verdict is QUALITY divergence (solve + milestone, both must hold), not length.
+Length is a cost axis and asymmetric: longer than vanilla rides along as "✓ held · ↑ longer",
+shorter is what the method is for and is never marked against an arm.
+
   minmax-bench quality report --from results/jobs/run1 --tasks kv-store-grpc
   minmax-bench quality report --from results/jobs --tasks a,b --arms condense,headroom --format md
 """
@@ -1046,6 +1050,17 @@ def main(argv=None):
     ap.add_argument("--format", default="html", choices=["html", "md"])
     ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
+    # An unreadable or empty --from used to render a complete-looking report with every cell
+    # blank and exit 0 — indistinguishable from "the arm genuinely produced nothing", and the
+    # easiest way to hit it is a relative path from the wrong cwd. Fail loudly instead: this
+    # command is pure display, so having nothing to display is always a mistake worth stopping on.
+    root = args.__dict__["from"]
+    if not os.path.isdir(root):
+        ap.error(f"--from {root!r} is not a directory (relative to cwd {os.getcwd()!r})")
+    if not glob.glob(f"{root}/**/verifier/reward.txt", recursive=True) \
+            and not glob.glob(f"{root}/**/incremental/*-control.jsonl", recursive=True):
+        ap.error(f"--from {root!r} holds no finished trials and no incremental replays — "
+                 "nothing to report. Check the path, or point it at the run's output dir.")
     d = build(args)
     render_console(d)
     out = args.out or f"report.{args.format}"
@@ -1066,11 +1081,15 @@ _FULL_LEGEND = (
     "column in this report, [bold]+ = BETTER[/] (fewer steps / fewer tokens / less money), − = "
     "worse. Coloured INDEPENDENTLY: green below vanilla's spread, red above, dim within — so an "
     "arm that cuts tokens yet costs more, the cache-bust tax, shows green next to red. verdict = "
-    "length preservation (the load-bearing "
-    "axis): same work (within vanilla's band) / drifted ↑ longer / shorter ↓ / ⊘ too short "
-    "(vanilla never crossed the compaction gate, so a method that only acts ON a compaction "
+    "QUALITY preservation, not length: ✓ quality held / ✗ quality lost, judged on milestone "
+    "coverage when the judge ran and otherwise on the verifier (a loss must exceed one trial's "
+    "worth of the arm's own denominator, since k≈4 makes a single trial worth 20-25%). Doing "
+    "the same work in FEWER steps is the point of these methods and is never marked against an "
+    "arm; running LONGER is a real cost signal, so it rides along as ✓ held · ↑ longer rather "
+    "than as a failure. ⊘ too short = "
+    "vanilla never crossed the compaction gate, so a method that only acts ON a compaction "
     "never acted — shown for those arms only; a method that acts from step 1 regardless of "
-    "context size gets a real verdict here). n1 = single run, a trend not a verdict (≥2/arm). "
+    "context size gets a real verdict here. n1 = single run, a trend not a verdict (≥2/arm). "
     "milestone = mean % of the task's subgoals the arm reached (LLM-judged, approach-agnostic), "
     "green when it matches vanilla's band / red when below (only shown with --milestones). "
     "Under each task: peak context + solve rate (⚠lost trials count as fails). No model was called.")
@@ -1272,26 +1291,51 @@ def _LENFMT(x):
     return f"{x:.0f}"
 
 
-def _verdict(v, a, arm, sub_gate):
-    """Shared length-preservation verdict → (label, state). state ∈ good|bad|warn|na. Statistical
-    (band overlap) when both arms have ≥2 runs; else DIRECTIONAL vs vanilla's spread, tagged n1 (a
-    single run reads a trend, not significance). Both console and HTML render from this.
+def _quality_held(v, a):
+    """Did the arm keep vanilla's QUALITY on this task? -> True / False / None (can't tell).
 
+    Two signals, and quality has to survive BOTH — they fail in different ways and neither
+    excuses the other. The verifier is ground truth for "did it do the task", so a solve
+    regression is a loss however good the subgoal coverage looks; the milestone judge is finer
+    and approach-agnostic, so it can catch an arm that still passes but got there having done
+    materially less. Milestone is only consulted when the judge actually ran.
+
+    The verifier arm of the test is deliberately blunt: at k≈4 one trial is worth 20-25%, so a
+    loss has to exceed one trial's worth of the arm's own denominator before it counts. A
+    3/5 -> 2/4 wobble is one trial landing differently, not a regression.
+    """
+    va, aa = v["attempted"] or v["n"], a["attempted"] or a["n"]
+    if not va or not aa:
+        return a["milestone_ok"]           # no verifier denominator; milestone or None
+    solve_held = (a["solve"] / aa) >= (v["solve"] / va) - (1.0 / aa)
+    return solve_held and (a["milestone_ok"] is not False)
+
+
+def _verdict(v, a, arm, sub_gate):
+    """Shared verdict → (label, state). state ∈ good|bad|warn|na.
+
+    The verdict is about QUALITY divergence, not trajectory length. Length used to decide it,
+    which mislabelled the good case: an arm that reaches the same result in 14 steps instead of
+    27 was reported as having "drifted", when doing the same work in fewer steps is the outcome
+    these methods are FOR. Length still matters in one direction — running LONGER than vanilla
+    costs real money and can mean the agent wandered — so it rides along as a cost note on the
+    verdict rather than as the verdict itself. Shorter is never penalised.
+
+    Needs ≥2 runs per arm for a real verdict; a single run reads as a trend (n1).
     `arm` is what decides whether ⊘ applies at all — see COMPACTION_GATED."""
     if not a["_lens"] or not v["length"]:
         return ("—", "na")
     if gated(arm, sub_gate):
         return ("⊘ too short", "na")
-    lo, hi, am = v["length"][0], v["length"][2], a["length"][1]
-    if a["length_ok"] is True:
-        return ("same work", "good")
-    if a["length_ok"] is False:
-        return ("drifted ↑ longer", "bad") if am > hi else ("shorter ↓", "warn")
-    if am > hi:                                           # k<2 → directional, not a real verdict
-        return ("drifted ↑ longer n1", "bad")
-    if am < lo:
-        return ("shorter ↓ n1", "warn")
-    return ("~ same n1", "good")
+    held = _quality_held(v, a)
+    n1 = " n1" if a["length_ok"] is None else ""      # length_ok is None exactly when k<2
+    longer = a["length"][1] > v["length"][2]          # arm's mean above vanilla's spread
+    if held is None:
+        return (f"—{n1}", "na")
+    if not held:
+        return (f"✗ quality lost{n1}", "bad")
+    # quality held; flag only the expensive direction of a length change
+    return (f"✓ held · ↑ longer{n1}", "warn") if longer else (f"✓ quality held{n1}", "good")
 
 
 def _verdict_cell(v, a, arm, sub_gate):
@@ -1459,9 +1503,17 @@ def _takeaway(console, d):
             (tooshort if short else comparable).add(r["task"])
     replayed = {r["task"] for r in d["rows"] for arm in d["arms"]
                 if (r["arms"][arm].get("incr") or {}).get("fid") is not None}
-    diverge = [f"{r['task']}/{arm} length" for r in d["rows"]
-               for arm in d["arms"] if r["arms"][arm].get("length_ok") is False
-               and not gated(arm, r["sub_gate"])]
+    # divergence means QUALITY divergence — an arm that did the same work in fewer steps has
+    # not diverged, it has won. A longer trajectory is a cost signal and is called out
+    # separately below, not as a failure.
+    diverge = [f"{r['task']}/{arm}" for r in d["rows"] for arm in d["arms"]
+               if not gated(arm, r["sub_gate"])
+               and r["arms"][arm]["_lens"] and r["vanilla"]["length"]
+               and _quality_held(r["vanilla"], r["arms"][arm]) is False]
+    longer = [f"{r['task']}/{arm}" for r in d["rows"] for arm in d["arms"]
+              if not gated(arm, r["sub_gate"])
+              and r["arms"][arm]["_lens"] and r["vanilla"]["length"]
+              and r["arms"][arm]["length"][1] > r["vanilla"]["length"][2]]
     for r in d["rows"]:                                   # fidelity meaningfully below floor
         floor = _floor_for(r, d["arms"])
         if floor is None or floor < 0.9:  # control should score ≥90% under a calibrated judge;
@@ -1481,9 +1533,12 @@ def _takeaway(console, d):
         parts.append(f"incremental: {len(replayed)} tasks")
     console.print("[bold]takeaway[/]  " + " · ".join(parts or ["nothing comparable yet"]))
     if diverge:
-        console.print("[red]  ✗ diverges vs control:[/] " + ", ".join(diverge))
+        console.print("[red]  ✗ quality diverges vs control:[/] " + ", ".join(diverge))
     elif comparable or replayed:
-        console.print("[green]  ✓ no divergence detected[/]")
+        console.print("[green]  ✓ no quality divergence detected[/]")
+    if longer:
+        console.print("[yellow]  ↑ longer than control (costs more, quality unaffected):[/] "
+                      + ", ".join(longer))
     # a low control floor means faithfulness was scored by structural match (no goal judge),
     # whose ceiling is sampling-driven — the comparison is noise-dominated, not trustworthy
     lowfloor = sum(1 for r in d["rows"]

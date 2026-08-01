@@ -45,13 +45,27 @@ axis by axis:
 
 | axis | question |
 |---|---|
-| **length** | does compaction change the # of steps? *(the load-bearing axis)* |
+| **length** | does compaction change the # of steps? *(a **cost** axis, and asymmetric: longer than vanilla is a real signal — more turns means more money, and often a wandering agent — while **shorter is the point of the method**, never a mark against it)* |
 | **rework** | does it re-fetch info it already had? *(compaction amnesia; range-aware — post-edit re-inspection counts as verification, not rework)* |
 | **milestone** | does it accomplish the same subgoals? *(approach-agnostic, LLM-judged at temperature 0, arm-blind; the reference run is excluded from vanilla's own coverage)* |
 | **solve** | does it still pass the verifier? *(trials that crash or hit the wall timeout count as failures — `⚠ lost` — not as missing data)* |
 | **fid** | teacher-forced per-step action agreement, shown next to the **control incremental run's** agreement (the noise floor) — only the gap below the floor is signal |
 
-A verdict is **✓** if the method's band *overlaps* vanilla's, **✗** if disjoint — and
+**The per-task verdict is about quality, not length.** `✓ quality held` / `✗ quality lost`
+is decided by **solve** and **milestone** together — quality has to survive both, because
+they fail differently and neither excuses the other. The verifier is ground truth for "did
+it do the task", so a solve regression is a loss however good the subgoal coverage looks;
+the milestone judge is finer and approach-agnostic, so it catches an arm that still passes
+having done materially less. The verifier arm of the test is deliberately blunt: at k≈4 one
+trial is worth 20-25%, so a loss must exceed one trial's worth of the arm's own denominator
+— a 3/5 → 2/4 wobble is one trial landing differently, not a regression.
+
+Length rides along only in the expensive direction, as `✓ held · ↑ longer`. An arm that
+reached the same result in 14 steps instead of 27 has not diverged — that is what these
+methods are *for* — so shorter is never marked against it. (Earlier versions decided the
+verdict on length alone and labelled that case "drifted", which read as a failure.)
+
+A band comparison is **✓** if the method's band *overlaps* vanilla's, **✗** if disjoint — and
 needs **≥ 2 finished runs per arm** (a single run can't be told from a fluke; this kills
 the k=1 mirage where length and cost swing wildly). Read ✓ honestly: with small k, band
 overlap only detects *gross* divergence — "no detectable divergence at this k", not
