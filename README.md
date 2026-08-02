@@ -1,46 +1,65 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/img/logo-dark.svg">
-  <img alt="minmax-bench" src="docs/img/logo.svg" height="56">
-</picture>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/logo-dark.svg">
+    <img alt="minmax-bench" src="docs/img/logo.svg" height="56">
+  </picture>
+</p>
 
-**A battlefield for cost-saving strategies.**
+<p align="center">
+  <strong>A battlefield for cost-saving strategies.</strong><br>
+  Were tokens saved? Were dollars saved? Was quality kept?
+</p>
 
-Were tokens saved? Were dollars saved? Was quality kept?
+<p align="center">
+  <a href="#how-it-works"><strong>How it works</strong></a> ·
+  <a href="#strategies"><strong>Strategies</strong></a> ·
+  <a href="#quick-start"><strong>Quick start</strong></a> ·
+  <a href="#see-cached-results"><strong>See cached results</strong></a> ·
+  <a href="#docs"><strong>Docs</strong></a>
+</p>
+
+<p align="center">
+  <img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-blue.svg">
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/python-%E2%89%A53.11-3776AB.svg">
+  <img alt="Runs with uv" src="https://img.shields.io/badge/runtime-uv-black.svg">
+  <img alt="Anthropic and Bedrock" src="https://img.shields.io/badge/providers-Anthropic%20%C2%B7%20Bedrock-black.svg">
+</p>
+
+---
 
 ## How it works
 
-**minmax-bench** consists of two benchmark types:
+Every context-compression tool advertises token savings. Tokens are not dollars, and
+dollars are not the whole story: a strategy that breaks the prompt cache trades cheap
+cache-reads for expensive cache-writes, and one that degrades the agent pays back its
+"savings" with interest in extra turns. **minmax-bench** runs the same sessions through
+each strategy and measures both sides of the trade:
 
-- **cost** (the **minimize target**): analyzes how many tokens a given **strategy**
-  saves, and how much of that survives as actual dollars. The analysis is cache-aware:
-  with a suboptimal strategy you can save tokens yet end up with a *larger* bill, because
-  breaking the prompt cache trades cheap cache-reads for expensive cache-writes.
+### cost — the *minimize* target
 
-  → [docs/cost.md](docs/cost.md)
+How many tokens a strategy saves, and how much of that survives as actual dollars.
+The analysis is cache-aware: **with a suboptimal strategy you can save tokens yet end
+up with a larger bill.** Methodology: [docs/cost.md](docs/cost.md).
 
-  ![cost report: per-bucket tokens & cost saved](docs/img/cost-report.png)
+![Cost report: per-bucket tokens and cost saved, cache-aware](docs/img/cost-report.png)
 
-- **quality** (the **maximize target**): analyzes how well the agent's trajectory is
-  preserved under a given **strategy** compared to a control. This comes in two flavors:
-  - **full**: run complete trajectories and compare them. Closest to reality, but
-    requires a number of reruns to eliminate variance.
-  - **incremental**: a more deterministic analysis. Does the model produce the same
-    step given identical pre-/post-**strategy** input?
+### quality — the *maximize* target
 
-  → [docs/quality.md](docs/quality.md)
+How well the agent's trajectory is preserved under a strategy, compared to a control.
+Two flavors: **full** runs complete trajectories and compares them — closest to
+reality, but needs reruns to beat variance; **incremental** is deterministic — does
+the model produce the same step given identical pre-/post-strategy input?
+Methodology: [docs/quality.md](docs/quality.md).
 
-  ![quality report: pooled per arm, with error bars](docs/img/quality-overall.png)
+![Quality report: pooled per arm, with error bars](docs/img/quality-overall.png)
 
-  The report opens on this: every task and session pooled into one row per arm, each number
-  with a 95% bootstrap CI and, under it, the **paired** delta vs control. Nothing is marked
-  better or worse — a Δ bar straddling zero just means *indistinguishable from control at this
-  n*, which is the common outcome and not a pass. Read the quality columns against **context
-  removed**: an arm at +3.5% next to one at +51% isn't gentler, it barely fired.
+Nothing is marked better or worse — a Δ bar straddling zero means *indistinguishable
+from control at this n*, which is the common outcome and not a pass. Read the quality
+columns against **context removed**: an arm at +3.5% next to one at +51% isn't
+gentler, it barely fired.
 
-
-Cost tells you what a strategy saves; quality tells you whether those savings are real.
-A method that makes the agent take more turns pays back its "savings" with interest.
-Read them together.
+**Cost tells you what a strategy saves; quality tells you whether those savings are
+real.** Read them together.
 
 ## Strategies
 
@@ -56,33 +75,26 @@ The contenders, and how they line up
 | `condense-sync` | whole-conversation compaction, blocking until it lands | [condense.chat](https://condense.chat) | proxy, rewrite\* | anthropic, bedrock |
 | `condense-async` | compaction in the background, paced by realistic think time | [condense.chat](https://condense.chat) | proxy, rewrite\* | anthropic, bedrock |
 
-Legend:
+**mode** is how a strategy is measured (cost bench only): **proxy** sends the real
+request through the strategy's proxy to the provider — real usage, real costs;
+**rewrite** uses the strategy's rewrite API and simulates caching locally, so a much
+larger dataset costs next to nothing. **transport** is the provider API behind the
+bench's own model calls: the Anthropic API (API key *or* Claude subscription login)
+or AWS Bedrock. \* organization account only.
 
-- **\***: organization account only.
-- **mode**: how a strategy is measured (cost bench only). **proxy** sends the real
-  request through the strategy's proxy to the provider: real usage, real costs.
-  **rewrite** uses the strategy's rewrite API and simulates caching locally, letting you
-  run a much larger dataset without incurring major costs.
-- **transport**: the provider API used for the bench's own model calls: the
-  **Anthropic API** (with an API key *or* your **Claude subscription** login) or
-  **AWS Bedrock**.
-
-## Install
+## Quick start
 
 Requires [uv](https://docs.astral.sh/uv/) and Python ≥ 3.11.
 
 ```bash
-uv sync                       # core
-uv sync --extra hf            # + HuggingFace loaders for the SWE-chat dataset
+uv sync                       # core (add --extra hf for the SWE-chat dataset loaders)
 uv run minmax-bench setup     # guided: detect creds, fill in keys, write .env
 ```
 
 `setup` walks you through Anthropic access (API key **or** Claude Code login), the
-condense arm (`dense login`), and the optional dataset token. `minmax-bench info` shows
-the resolved state at any time. Prefer manual? `cp .env.dist .env` and fill in only what
-you run.
-
-## Quick start
+condense arm (`dense login`), and the optional dataset token. `minmax-bench info`
+shows the resolved state at any time. Prefer manual? `cp .env.dist .env` and fill in
+only what you run.
 
 No keys? The offline demo re-scores and replays the committed reference runs:
 
@@ -92,8 +104,8 @@ uv run minmax-bench replay 202f98bd-a2f1-4390-8307-658b451b7727   # animated evo
 uv run minmax-bench strategies                                    # list the matrix
 ```
 
-With keys, each bench has a guided run (`minmax-bench run` is the front door that asks
-which one you want):
+With keys, each bench has a guided run — `minmax-bench run` is the front door that
+asks which one you want:
 
 ```bash
 uv run minmax-bench run               # wizard: type, dataset, strategies, model, mode/transport
@@ -121,8 +133,8 @@ uv run minmax-bench quality incremental
 
 ## See cached results
 
-`runs/` ships three committed **reference runs**. Every number recomputes from stored
-usage, no keys, no network, zero spend:
+`runs/` ships three committed reference runs. Every number recomputes from stored
+usage — no keys, no network, zero spend:
 
 ```bash
 uv run minmax-bench report 202f98bd-a2f1-4390-8307-658b451b7727
@@ -131,17 +143,18 @@ uv run minmax-bench report 5c61ab52-8eea-4fee-97a4-5c64ee5344af
 uv run minmax-bench replay <any of the above>                      # animated
 ```
 
-- **`run-202f98bd`**: headroom vs headroom-kompress vs condense-async, Haiku 4.5,
-  truncated to 190k. The clean head-to-head: condense-async saves **~28%** cost,
-  headroom (cache mode) ~14%, headroom-kompress ~2% (token savings die in cache-writes).
-- **`run-cba32b86`**: untruncated long sessions (~$73.6 baseline): condense's savings
-  *grow* with chain length, reaching 53% in the 400k+ band.
-- **`run-5c61ab52`**: Opus 4.8 over 64 sessions / \~11.7k turns in `--mode rewrite`
-  (zero spend): condense-sync **\~73% tokens / \~64% cost** (\~$549 off \~$861); headroom
-  slightly negative at this scale.
+| run | setup | headline |
+|---|---|---|
+| `202f98bd` | headroom vs headroom-kompress vs condense-async, Haiku 4.5, truncated to 190k | the clean head-to-head: condense-async saves **~28%** cost, headroom (cache mode) ~14%, headroom-kompress ~2% — token savings die in cache-writes |
+| `cba32b86` | untruncated long sessions, ~$73.6 baseline | condense's savings *grow* with chain length, reaching **53%** in the 400k+ band |
+| `5c61ab52` | Opus 4.8, 64 sessions / ~11.7k turns, `--mode rewrite` (zero spend) | condense-sync **~73% tokens / ~64% cost** (~$549 off ~$861); headroom slightly negative at this scale |
 
 ## Docs
 
-- [docs/cost.md](docs/cost.md) covers the cost-bench methodology: harness simulation, bucketing, cache modeling, run store.
-- [docs/quality.md](docs/quality.md) covers the quality-bench methodology: noise floor, axes, compaction gate, full + incremental.
-- [docs/architecture.md](docs/architecture.md) explains how strategies, mode, and transport come together; module map.
+- [docs/cost.md](docs/cost.md) — cost-bench methodology: harness simulation, bucketing, cache modeling, run store.
+- [docs/quality.md](docs/quality.md) — quality-bench methodology: noise floor, axes, compaction gate, full + incremental.
+- [docs/architecture.md](docs/architecture.md) — how strategies, mode, and transport come together; module map.
+
+## Licence
+
+[MIT](LICENSE) — © condense.chat.
