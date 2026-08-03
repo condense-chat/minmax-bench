@@ -430,8 +430,13 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
            model: str | None = None, auth: str = "auto", task: str = "session",
            judge: str = "off", capture: bool = False, headroom_mode: str = "token",
            ccr: bool = True, ctx_gate: int = 50_000, independent_budgets: bool = False,
-           resume: bool = True, effort: str | None = None) -> dict:
+           resume: bool = True, effort: str | None = None,
+           caveman_mode: str = "full") -> dict:
     env = {**eng.load_env(str(REPO_ROOT / ".env")), **dict(os.environ)}
+    cav_mode = caveman_mode
+    if "caveman" in arms and cav_mode not in eng.CAVEMAN_MODES:
+        console.print(f"[red]caveman mode {cav_mode!r} not in {eng.CAVEMAN_MODES}[/]")
+        raise SystemExit(1)
     if auth == "subscription":
         # force the Claude Code login path even when an API key is configured
         # (.env or environment) — this is how you TEST the no-API-key experience
@@ -514,7 +519,9 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
                  "messages": [{"role": "user", "content": "Say ok."}]}
         if tmpl_body.get("system"):
             probe["system"] = tmpl_body["system"]
-        for arm in all_arms:
+        # caveman rides control's transport, so probing it separately is redundant — dedupe
+        # to the real endpoints so a caveman-only run still probes (via control) exactly once.
+        for arm in dict.fromkeys(eng.caveman_api_arm(a) for a in all_arms):
             _, err = eng.call_api(arm, probe, tmpl_headers, env)
             if err:
                 return arm, err
@@ -690,6 +697,12 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
         # carries the step window it defined, so a resumed condense/headroom stay capped.
         cur_sig = {"n_sel": len(sel), "budget": budget_usd, "model": replay_model,
                    "judge": judge, "independent": independent_budgets}
+        # caveman's mode changes what it does, so a resumed caveman arm on a different mode must
+        # re-run. Add the key ONLY for caveman: adding it (even as None) for every arm would not
+        # match the sentinels written before this key existed, forcing every already-finished
+        # control/condense/headroom to re-run and re-spend on resume.
+        if arm == "caveman":
+            cur_sig["caveman_mode"] = cav_mode
         if resume and done_path.exists() and path.exists():
             try:
                 saved = json.loads(done_path.read_text())
@@ -721,6 +734,15 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
         ccr_active = ccr and arm == "headroom"
         n_retrieves = 0
         mcp = None
+        # caveman is a client-side generation policy: it rides control's endpoint and replays
+        # against its OWN accumulated history (CavemanState). Because caveman changes only the
+        # PROSE, that history FREEZES the recorded rails (tool_use + tool_results + thinking,
+        # verbatim) and swaps in caveman's terse narration only — its proposed action is scored
+        # for fidelity but never rewrites the rails. The ruleset is injected as session-start
+        # context INSIDE that history (CavemanState.__init__ → caveman_inject), the way the
+        # SessionStart hook does, so the system prompt is untouched.
+        cav = eng.CavemanState(msgs, points, cav_mode) if arm == "caveman" else None
+        api_arm = eng.caveman_api_arm(arm)
         with path.open("w") as f, Progress(
             TextColumn(f"[cyan]{arm:9}[/]"), BarColumn(),
             TextColumn("{task.completed}/{task.total} [dim]{task.fields[stat]}[/]"),
@@ -747,6 +769,7 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
                     break
                 rec = {"arm": arm, "step": step, "msg_index": i}
                 nr = 0
+                cav_rep, cav_matched = None, False  # caveman: what to fold into its history
                 try:  # an unexpected error in one step is recorded, not fatal to the run
                     orig = eng.extract_action(msgs[i]["content"])
                     rec["orig"] = orig
@@ -759,8 +782,11 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
                                                                    sid, tmpl_headers, env, mcp)
                         n_retrieves += nr
                     else:
-                        req = eng.build_request(tmpl_body, msgs[:i], args, sid)
-                        resp, err = eng.call_api(arm, req, tmpl_headers, env)
+                        # caveman replays its OWN accumulated (terse) history; every other arm
+                        # teacher-forces the recorded prefix msgs[:i].
+                        prefix = cav.prefix() if cav is not None else msgs[:i]
+                        req = eng.build_request(tmpl_body, prefix, args, sid)
+                        resp, err = eng.call_api(api_arm, req, tmpl_headers, env)
                     latency = time.monotonic() - t0
                     if err:
                         rec["error"] = err
@@ -773,6 +799,10 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
                         # score against the session's REAL cwd so `cd <proj> && …` artifacts
                         # normalize (local sessions run in their project dir, not /app)
                         exact, action, sim = eng.score(orig, rep, cwd=meta["cwd"] or "/app")
+                        # caveman keeps its terse PROSE over the frozen recorded step (see
+                        # CavemanState.advance); `matched` (structural agree_action) is passed
+                        # only to count divergence. The history advances once, in the tail below.
+                        cav_rep, cav_matched = resp.get("content", []), bool(action)
                         # semantic agreement (judge=equivalence): an LLM upgrades a structural
                         # near-miss that is a functionally-equivalent decision (grep vs rg). Only
                         # judge disagreements — matches already agree.
@@ -836,6 +866,14 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
                     first_err = first_err or rec["error"]
                 if ccr_active and mcp and mcp.ok:
                     rec["ccr_retrieves"] = nr
+                # advance caveman's history exactly once per step (keep its terse prose over the
+                # frozen recorded rails; recorded prose kept only when caveman gave none) — runs
+                # on the error/exception paths too (cav_rep stays None there), so the history
+                # never falls out of step with the recorded decision points.
+                if cav is not None:
+                    before = cav.native
+                    cav.advance(i, cav_rep, cav_matched)
+                    rec["caveman_native"] = cav.native > before
                 # accumulate what the ORIGINAL trajectory has now seen, so a later step that
                 # re-fetches it counts as redundant (compaction amnesia the arm should avoid)
                 _mark_seen(rec.get("orig"), seen_files, seen_cmds)
@@ -867,6 +905,17 @@ def replay(session: Path, arms: list[str], *, budget_usd: float, limit: int,
             "avg_latency_s": round(lat_total / n_ok, 3) if n_ok else 0.0,
             "ctx_series": ctx_series, "quality": qual, "by_step": by_step,
             "ccr_retrieves": n_retrieves, "ccr": bool(ccr_active and mcp and mcp.ok),
+            # caveman only: prose steps kept terse (native ≈ all of them; reverted only on an
+            # API error), and of those how many had caveman's proposed action DIVERGE from the
+            # recording — the alignment/drift signal (also captured structurally by agree_action).
+            # The rails are frozen throughout, so the history is genuinely terse regardless.
+            "caveman_native": (cav.native if cav is not None else None),
+            "caveman_reverted": (cav.reverted if cav is not None else None),
+            "caveman_diverged": (cav.diverged if cav is not None else None),
+            # of the diverged steps, those whose turn also carried a frozen tool_use — the ONLY
+            # ones where terse prose ends up beside an action it was not written for. Divergence
+            # on a prose-only turn replaces the whole message, so it is clean signal.
+            "caveman_stapled": (cav.stapled if cav is not None else None),
             "judge_usd": round(judge_spent, 4),
             # cost_usd is the arm's REPLAY spend only (judge cost is a measurement overhead,
             # reported separately) so the arm-vs-control $ comparison stays clean; the budget
@@ -1095,6 +1144,56 @@ def render_summary(summary: dict, console: Console) -> None:
     # vs control only, no raw absolutes.
     _render_incr_clean(summary, console, summary.get("model"))
     _render_bottom_line(summary, console, common, ctrl, ctrl_c, floor, is_goal, cap_n)
+    # caveman is read like condense: its terse prose replaces the verbose prose span by span and
+    # accrues into the context, so the fair token measure is the accrued context (the 'ctx vs
+    # control' column above) — small, often ~0/net-negative since it only touches prose. The
+    # caveman-specific readout is the DRIFT: over that fully-terse history, how often did its
+    # proposed action still match the recording.
+    for a in summary["arms"].values():
+        nat, div = a.get("caveman_native"), a.get("caveman_diverged")
+        if nat is None:
+            continue
+        rev = a.get("caveman_reverted") or 0
+        if not nat:
+            # Every prose step fell back to the RECORDED verbose narration (API errors, or
+            # replies with no text). The history caveman replayed against was vanilla's, so
+            # nothing about the method was measured — the incremental twin of the full-mode
+            # '⚠ inactive' guard. Say so instead of printing a red 0% over an empty base.
+            console.print(
+                f"[red]caveman: inactive — 0 steps ran on terse prose[/] ({rev} reverted to the "
+                f"recorded verbose narration). [dim]The replayed history was the control's, so "
+                f"the numbers above measure nothing about caveman — check the errors column.[/]")
+            continue
+        aligned = nat - (div or 0)
+        arate = aligned / nat * 100
+        acol = "green" if arate >= 66 else "yellow" if arate >= 33 else "red"
+        # only claim a FULLY terse history when no step reverted; otherwise name the mixture,
+        # since a reverted step puts control's verbose prose back into the measured prefix
+        base = ("a fully-terse history" if not rev else
+                f"a mostly-terse history ([yellow]{rev} step(s) reverted to recorded prose[/])")
+        # State the denominator: this rate is over PROSE steps, while 'vs original' above is
+        # over every successful step. ~30% of real decision points are tool-only (no prose to
+        # shrink, so they can neither be terse nor drift), so the two numbers legitimately
+        # disagree — say why, or the reader reads one of them as wrong.
+        ok = a.get("steps_ok") or 0
+        scope = (f"{nat} of {ok} successful steps had prose" if ok >= nat
+                 else f"{nat} prose steps")
+        # Split the drift by whether the turn also carried a frozen action. Only those steps
+        # leave terse prose beside an action it was not written for (the residual artifact);
+        # divergence on a prose-only turn replaces the whole message and stays coherent.
+        div, stap = div or 0, a.get("caveman_stapled")
+        if div and stap is not None:
+            shape = (f"{div} drifted — [yellow]{stap} beside a different frozen action[/], "
+                     f"{div - stap} on a prose-only turn (clean)")
+        else:
+            shape = f"{div} drifted"
+        console.print(
+            f"[dim]caveman:[/] [{acol}]{arate:.0f}% action-aligned[/] over {base} "
+            f"({aligned}/{nat} terse steps proposed the recorded action; {shape}). "
+            f"[dim]Denominator is prose steps only ({scope}) — tool-only steps carry no prose "
+            f"and cannot drift, so this will not match 'vs original' above. Terse prose accrues "
+            f"into the context (read tokens on 'ctx vs control', like condense); the drift is "
+            f"real, not a correction artifact.[/]")
     # concise notes only (the verbose explanations were dropped to keep the end-of-run clean):
     # who stopped early (not in the delta table), any total failures, and the judge spend.
     reach = {arm: a.get("steps_ok", 0) for arm, a in summary["arms"].items() if a.get("by_step")}

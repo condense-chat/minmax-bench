@@ -74,13 +74,17 @@ The contenders, and how they line up
 | `headroom-kompress` | the same proxy in token mode: Kompress rewrites history for max compression | [headroom-ai](https://pypi.org/project/headroom-ai/) | proxy, rewrite | anthropic, bedrock |
 | `condense-sync` | whole-conversation compaction, blocking until it lands | [condense.chat](https://condense.chat) | proxy, rewrite\* | anthropic, bedrock |
 | `condense-async` | compaction in the background, paced by realistic think time | [condense.chat](https://condense.chat) | proxy, rewrite\* | anthropic, bedrock |
+| `caveman` | terse-output skill: shrinks what the agent *writes*, so its own messages accumulate smaller | [caveman](https://github.com/JuliusBrussee/caveman) | skill (quality bench only) | anthropic |
 
 **mode** is how a strategy is measured (cost bench only): **proxy** sends the real
 request through the strategy's proxy to the provider — real usage, real costs;
 **rewrite** uses the strategy's rewrite API and simulates caching locally, so a much
-larger dataset costs next to nothing. **transport** is the provider API behind the
-bench's own model calls: the Anthropic API (API key *or* Claude subscription login)
-or AWS Bedrock. \* organization account only.
+larger dataset costs next to nothing. **skill** is not a proxy at all — the
+intervention runs inside the agent, changing how it writes rather than rewriting its
+history, so it has no cost-bench counterpart and is read against plain `vanilla`.
+**transport** is the provider API behind the bench's own model calls: the Anthropic
+API (API key *or* Claude subscription login) or AWS Bedrock. \* organization account
+only.
 
 ## Quick start
 
