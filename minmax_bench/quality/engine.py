@@ -264,9 +264,18 @@ def check_arms(arms, env):
     """
     problems = []
     for arm in arms:
-        if arm not in ARMS:
-            problems.append(f"arm {arm!r} has no replay endpoint "
-                            f"(known: {', '.join(sorted(ARMS))})")
+        # caveman is a client-side generation policy, not an endpoint: it reaches the model
+        # through control's transport (see caveman_api_arm) and applies its ruleset + free-run
+        # correction in-process. So it needs control's auth, checked below, but no ARMS entry.
+        if arm == "caveman" or arm in ARMS:
+            continue
+        problems.append(f"arm {arm!r} has no replay endpoint "
+                        f"(known: {', '.join(sorted(ARMS))}, caveman)")
+    # Credentials are a property of the ENDPOINT, and caveman has none of its own — it rides
+    # control's. Checking the literal arm name here would ask a bedrock-only user for an
+    # Anthropic key that `--arms caveman` never uses (control is the bedrock entry, caveman
+    # resolves to it), aborting the run on auth it does not need.
+    arms = [caveman_api_arm(a) for a in arms]
     needs_anthropic_auth = any(not ARMS.get(a, {}).get("bedrock") for a in arms)
     if needs_anthropic_auth and not auth_mode(env):
         problems.append(
@@ -747,6 +756,163 @@ def ccr_step(arm, tmpl_body, prefix, args, sid, tmpl_headers, env, mcp, max_retr
                         "tool_use_id": tu["id"], "content": result}]})
         n += 1
     return resp, err, n, overhead  # hit the retrieve cap → score whatever it last produced
+
+
+# -------------------------------------------------------------------- caveman (generation policy)
+# caveman is not a proxy but a generation POLICY: the SessionStart hook injects a terse-output
+# ruleset and the agent writes fragments, so its context savings come from its OWN smaller
+# messages accumulating. Full mode installs the real skill in the container; incremental replay
+# (no container/hook) reproduces it here — inject the SAME frozen ruleset the pinned hook emits
+# (data/caveman/ruleset-<mode>.txt) as session-start context, then free-run with correction
+# (CavemanState) so the recorded trajectory still teacher-forces the step SET while each step's
+# CONTEXT is caveman-native. Kept in lockstep with harbor_agents/caveman_claude_code.py.
+CAVEMAN_MODES = ("lite", "full", "ultra")
+_CAVEMAN_MARKER = "CAVEMAN MODE ACTIVE"
+_caveman_ruleset_cache: dict = {}
+
+
+def caveman_api_arm(arm):
+    """The endpoint an arm's requests go to. caveman is not a proxy — it rides control's
+    transport (api.anthropic.com / the bedrock upstream) and does its work client-side."""
+    return "control" if arm == "caveman" else arm
+
+
+def caveman_ruleset(mode="full"):
+    """The frozen session-start ruleset text for a level (data/caveman/ruleset-<mode>.txt).
+
+    This is the exact text the pinned SessionStart hook emits, captured once so incremental
+    replay presents byte-identical guidance to what full mode's container injects. Cached.
+    """
+    if mode not in CAVEMAN_MODES:
+        raise ValueError(f"caveman mode {mode!r} not in {CAVEMAN_MODES}")
+    if mode not in _caveman_ruleset_cache:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        path = os.path.join(root, "data", "caveman", f"ruleset-{mode}.txt")
+        text = open(path, encoding="utf-8").read().rstrip("\n")
+        if not text.startswith(_CAVEMAN_MARKER):
+            raise ValueError(f"{path} does not start with the activation marker — stale capture?")
+        _caveman_ruleset_cache[mode] = text
+    return _caveman_ruleset_cache[mode]
+
+
+def caveman_inject(msgs, mode="full"):
+    """Prepend the caveman ruleset into the first user turn, the way the SessionStart hook
+    injects it as session-start context. Returns a NEW list; originals are untouched."""
+    block = {"type": "text", "text": caveman_ruleset(mode)}
+    out = [dict(m) for m in msgs]
+    for k, m in enumerate(out):
+        if m.get("role") == "user":
+            body = m["content"] if isinstance(m["content"], list) else [
+                {"type": "text", "text": m.get("content") or ""}]
+            out[k] = {**m, "content": [block, *body]}
+            return out
+    return [{"role": "user", "content": [block]}, *out]
+
+
+class CavemanState:
+    """caveman history for incremental replay: FREEZE the action rails, keep caveman's prose.
+
+    caveman by its own rules changes ONLY the assistant's prose — tool calls, tool results,
+    code and errors stay verbatim. So the faithful replay keeps the recorded trajectory's rails
+    fixed and swaps in caveman's terse narration:
+
+      - the tool_use blocks, the tool_results, and any thinking stay exactly as recorded
+        (frozen rails) — no id remap, no action divergence, so the history is always valid and
+        perfectly paired with control's step set;
+      - each assistant message's PROSE is replaced by caveman's own terse text — ALWAYS, even
+        when its proposed action disagreed with the recording. The prose in an agent turn is
+        dominantly a REFLECTION on the prior (frozen) tool_result — which both caveman and
+        control saw identically — not a commitment to the next action (caveman drops tool-call
+        narration by rule), so it stays coherent with the frozen action regardless. Keeping it
+        means the accumulated history is GENUINELY terse, so the drift we measure is real, not
+        a corrected artifact. (Only an actual API error / a step the recording narrated nothing
+        keeps the recorded prose — there is no caveman prose to use.)
+
+    The per-step action-fidelity — does caveman's PROPOSED action match the recording, given a
+    terser history — is measured by the caller and IS the drift/alignment signal. We do not let
+    that proposed drift rewrite the rails; a bad action compounding is full mode's job (real
+    execution). ``native`` counts prose steps kept terse (≈ all of them), ``diverged`` the
+    subset where caveman's proposed action disagreed.
+
+    ``diverged`` covers two step shapes that mean OPPOSITE things, so ``stapled`` splits them:
+
+      - the recorded turn had prose AND a tool_use (~60% of real decision points): the action is
+        frozen, so caveman's terse narration now sits beside a DIFFERENT action than the one it
+        was written for. Counted in ``stapled`` — this is the whole residual artifact, and the
+        only place it exists;
+      - the recorded turn was prose-only (~9%): there is no frozen action to conflict with, the
+        turn is replaced wholesale, and the history stays perfectly coherent. Pure signal.
+
+    A run can therefore drift a lot with zero artifact, or a little with all of it stapled, and
+    only the split tells them apart — it is also exactly the turn set a future rewriter pass
+    (terse prose written ABOUT the recorded action) would target.
+    The history is append-only (an earlier turn is never rewritten), so each step's prefix nests
+    the last and the incremental cache is preserved by construction — same as control; only a
+    span-rewriting compaction breaks it. (A structural property, not a measured result.)
+    """
+
+    def __init__(self, msgs, points, mode="full"):
+        self.msgs = msgs
+        self.points = points
+        first = points[0] if points else len(msgs)
+        self.hist = caveman_inject([copy.deepcopy(m) for m in msgs[:first]], mode)
+        self.native = 0     # prose steps kept terse (caveman responded)
+        self.reverted = 0   # prose steps kept recorded (only on an error / no caveman prose)
+        self.diverged = 0   # of the terse steps, how many had caveman's action disagree
+        self.stapled = 0    # of those, how many had a FROZEN ACTION for the prose to clash with
+
+    def prefix(self):
+        return self.hist
+
+    def _following(self, i):
+        nxt = next((p for p in self.points if p > i), len(self.msgs))
+        return [copy.deepcopy(m) for m in self.msgs[i + 1:nxt]]
+
+    def advance(self, i, rep_content, matched):
+        """Extend the history after scoring decision point ``i`` (frozen rails, terse prose).
+
+        ``rep_content`` is caveman's generated assistant content — we take only its TEXT
+        (prose) and keep it whenever caveman produced NON-EMPTY prose; on an error or a reply
+        with no text we keep the recorded prose (blanking it would leave an empty message that
+        400s and, since the history is append-only, poisons every later step). ``matched`` is
+        score()'s agree_action, tracked only to count divergence.
+        """
+        msg = copy.deepcopy(self.msgs[i])  # frozen rails: recorded thinking + tool_use verbatim
+        texts = [b for b in msg["content"]
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        cav_prose = " ".join(
+            b.get("text", "") for b in (rep_content or [])
+            if isinstance(b, dict) and b.get("type") == "text").strip()
+        if not texts:
+            pass  # the recording narrated nothing here — no prose to shrink, no drift
+        elif rep_content is not None and cav_prose:
+            texts[0]["text"] = cav_prose          # terse prose replaces the verbose narration
+            for b in texts[1:]:
+                b["text"] = ""
+            # collapsing several recorded text blocks into caveman's one can leave blanked
+            # extras; drop them (an empty text block is rejected). cav_prose in texts[0] is
+            # non-empty here, so at least one text block always survives.
+            msg["content"] = [b for b in msg["content"]
+                              if not (isinstance(b, dict) and b.get("type") == "text"
+                                      and not b.get("text"))]
+            self.native += 1
+            if not matched:
+                self.diverged += 1
+                # Only a turn that HAS a frozen tool_use can be stapled: caveman's narration now
+                # sits beside an action it was not written for. On a prose-only turn the whole
+                # message is caveman's, so a divergence there is clean disagreement, not artifact.
+                if any(isinstance(b, dict) and b.get("type") == "tool_use"
+                       for b in msg["content"]):
+                    self.stapled += 1
+        else:
+            # caveman gave no usable prose — an API error (rep_content is None) OR a reply with
+            # no text block (its no-narration case). Keep the recorded prose: blanking it would
+            # leave {"content": []} on a prose-only turn, which 400s, and because the history is
+            # append-only that one bad message poisons every later step. Keeping recorded prose
+            # is also the conservative direction (it never overstates caveman's saving).
+            self.reverted += 1
+        self.hist.append(msg)
+        self.hist.extend(self._following(i))
 
 
 def extract_action(content):
