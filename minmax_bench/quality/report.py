@@ -70,7 +70,7 @@ AGENT_SESSION_GLOB = {  # only claude-code is wired; others are TODO
 # from generate.py's _arm_wiring — they are readable, not runnable.
 KNOWN_ARMS = ("condense-prod-08-02", "condense-recover",
               "headroom-kompress", "vanilla-proxy", "headroom",
-              "condense", "caveman", "vanilla", "control")
+              "condense", "caveman", "ponytail", "vanilla", "control")
 
 # Arms whose intervention only EXISTS once the harness compacts — the history transforms. ⊘
 # (vanilla's peak context never reached --ctx-gate) means nothing compacted, so for these the
@@ -270,13 +270,14 @@ def _trial_metrics(trial_dir, session_path=None):
     so the old input + cache + output sum double-counted every cache read — which on this suite
     inflated tokens by ~1.8x and halved every $-per-Mtok figure derived from them.
 
-    Harbor records the token counts but leaves `cost_usd` null on a trial killed by the agent
-    wall timeout. Reading the two independently keeps such a trial in BOTH columns — gating
-    tokens on cost used to drop it from tokens too, so a task whose trials all timed out
-    vanished from tokens and $ entirely, which is exactly where the burn is most interesting
-    (it ran until the wall). When cost is missing we price the recorded transcript usage
-    ourselves, so the two columns stay over the same trial set: a tokens mean covering more
-    trials than its $ mean is not comparable down the row.
+    Cost is priced from the transcript, NOT read from harbor's `cost_usd`. Harbor leaves that
+    field null on a trial killed by the agent wall timeout — 7-25% of trials depending on the
+    arm, and unevenly so, since an arm with a longer wall gets killed less often. Mixing
+    harbor's number with our own on the trials it skipped made the $ columns a couple of
+    percent light in an arm-dependent way. One formula over every trial keeps a column
+    comparable across arms, and it agrees with harbor to ~2% in aggregate on the trials where
+    both exist. Tokens still come from harbor's counters, so both columns cover the same
+    trial set: a tokens mean over more trials than its $ mean is not comparable down the row.
     """
     try:
         r = json.load(open(os.path.join(trial_dir, "result.json")))
@@ -287,15 +288,15 @@ def _trial_metrics(trial_dir, session_path=None):
     tok = sum(ar.get(k) or 0 for k in ("n_input_tokens", "n_output_tokens"))
     if tok:
         m["tok"] = tok
-    if ar.get("cost_usd") is not None:
-        m["cost"] = ar["cost_usd"]
-    elif tok and session_path:
+    if session_path:
         model = ((ar.get("model_info") or {}).get("name")
                  or ((r.get("agent_info") or {}).get("model_info") or {}).get("name"))
         try:
             m["cost"] = sum(cost_usd(u, model) for u in recorded_usage(session_path))
         except (OSError, ValueError, KeyError):
             pass
+    if "cost" not in m and ar.get("cost_usd") is not None:
+        m["cost"] = ar["cost_usd"]  # unreadable transcript — harbor's number is all there is
     try:
         from datetime import datetime
         s = datetime.fromisoformat(r["started_at"].replace("Z", "+00:00"))

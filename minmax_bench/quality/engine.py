@@ -43,15 +43,25 @@ SESSION_GLOB = "agent/sessions/projects/-app/*.jsonl"
 
 # USD per Mtok: input / output / cache_write (5-min TTL, 1.25x) / cache_read (0.1x).
 # Matched by model-id prefix, longest match wins; extend when replaying new models.
+# cache_write_1h is the SECOND write tier (2x input): a usage record splits its writes across
+# the two TTLs under `cache_creation`, and pricing the 1h tier at the 5m rate understates it
+# by 60%. On the opus-5 tb suite 57% of all cache writes were 1h, so a flat 5m rate priced the
+# whole suite ~10% light — see cost_usd.
 PRICES = {
-    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
-    "claude-sonnet-5": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
-    "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_write": 1.25, "cache_read": 0.10},
-    "claude-opus-4": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.50},
+    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_write": 3.75,
+                          "cache_write_1h": 6.0, "cache_read": 0.30},
+    "claude-sonnet-5": {"input": 3.0, "output": 15.0, "cache_write": 3.75,
+                        "cache_write_1h": 6.0, "cache_read": 0.30},
+    "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_write": 1.25,
+                         "cache_write_1h": 2.0, "cache_read": 0.10},
+    "claude-opus-4": {"input": 5.0, "output": 25.0, "cache_write": 6.25,
+                      "cache_write_1h": 10.0, "cache_read": 0.50},
     # opus 5 ships at opus 4.8's price; the "claude-opus-4" prefix above does not cover it,
     # so without this entry it silently fell through to the sonnet fallback (-40% on every rate)
-    "claude-opus-5": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.50},
-    "claude-fable-5": {"input": 10.0, "output": 50.0, "cache_write": 12.50, "cache_read": 1.00},
+    "claude-opus-5": {"input": 5.0, "output": 25.0, "cache_write": 6.25,
+                      "cache_write_1h": 10.0, "cache_read": 0.50},
+    "claude-fable-5": {"input": 10.0, "output": 50.0, "cache_write": 12.50,
+                       "cache_write_1h": 20.0, "cache_read": 1.00},
 }
 DEFAULT_PRICE_MODEL = "claude-sonnet-4-6"
 
@@ -1167,10 +1177,28 @@ def peak_ctx(session_path):
 
 
 def cost_usd(usage, model=None):
+    """Price one request's usage, splitting cache writes across their two TTL tiers.
+
+    `cache_creation_input_tokens` is the TOTAL written; `cache_creation` breaks it into
+    ephemeral_5m_input_tokens + ephemeral_1h_input_tokens, and the 1h tier bills at 2x input
+    against the 5m tier's 1.25x. Billing the total at the 5m rate understated this suite by
+    ~10% (57% of its writes were 1h) and made every $-per-Mtok figure read low. When the
+    breakdown is absent (older transcripts, providers that don't report it) the total falls
+    back to the 5m rate, which is the old behaviour and the cheaper of the two.
+    """
     price = rates_for(model or DEFAULT_PRICE_MODEL)
+    total_w = usage.get("cache_creation_input_tokens", 0) or 0
+    tiers = usage.get("cache_creation") or {}
+    w1h = tiers.get("ephemeral_1h_input_tokens", 0) or 0
+    # trust the split only when it accounts for the total; a partial breakdown would
+    # silently drop tokens, so fall back to pricing everything at the 5m rate
+    w5m = tiers.get("ephemeral_5m_input_tokens", 0) or 0
+    if w5m + w1h != total_w:
+        w5m, w1h = total_w, 0
     return (usage.get("input_tokens", 0) * price["input"]
             + usage.get("output_tokens", 0) * price["output"]
-            + usage.get("cache_creation_input_tokens", 0) * price["cache_write"]
+            + w5m * price["cache_write"]
+            + w1h * price.get("cache_write_1h", price["cache_write"] * 1.6)
             + usage.get("cache_read_input_tokens", 0) * price["cache_read"]) / 1e6
 
 
