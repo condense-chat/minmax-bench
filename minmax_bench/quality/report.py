@@ -27,9 +27,11 @@ shorter is what the method is for and is never marked against an arm.
 import argparse
 import glob
 import json
+import math
 import os
 import random
 import re
+import statistics
 
 try:  # rich renders the terminal tables, but analysis must work on a bare python3
     from rich.console import Console
@@ -55,9 +57,20 @@ AGENT_SESSION_GLOB = {  # only claude-code is wired; others are TODO
 }
 
 # longest names first — cell dir names are '<arm>-<task>' and arm names contain hyphens,
-# so splitting is a longest-prefix match against the arms the bench knows about
-KNOWN_ARMS = ("headroom-kompress", "vanilla-proxy", "headroom", "condense", "caveman",
-              "vanilla", "control")
+# so splitting is a longest-prefix match against the arms the bench knows about.
+#
+# EVERY name starting with 'condense-' must appear ABOVE plain 'condense', or the prefix match
+# eats it: 'condense-recover-dna-assembly' read back as arm 'condense', task
+# 'recover-dna-assembly' — 13 real cells filed under the wrong arm as phantom tasks that no
+# --tasks list matches. Add the arm here in the SAME commit that creates the cells.
+#
+# 'condense-prod-08-02' and 'condense-recover' are ARCHIVED arms: past runs renamed off
+# 'condense' so a re-run starts from zero trials instead of resuming into the old cells, and so
+# the generations show up side by side in one report. Archived arms are deliberately absent
+# from generate.py's _arm_wiring — they are readable, not runnable.
+KNOWN_ARMS = ("condense-prod-08-02", "condense-recover",
+              "headroom-kompress", "vanilla-proxy", "headroom",
+              "condense", "caveman", "ponytail", "vanilla", "control")
 
 # Arms whose intervention only EXISTS once the harness compacts — the history transforms. ⊘
 # (vanilla's peak context never reached --ctx-gate) means nothing compacted, so for these the
@@ -72,7 +85,8 @@ KNOWN_ARMS = ("headroom-kompress", "vanilla-proxy", "headroom", "condense", "cav
 # An ALLOWLIST, not a blocklist: an arm nobody classified is un-gated, so a new method shows a
 # real verdict instead of quietly vanishing from the table. The direction of the default matters
 # more than the default being right — a wrong verdict gets argued with, a blank one doesn't.
-COMPACTION_GATED = ("condense", "headroom", "headroom-kompress")
+COMPACTION_GATED = ("condense", "condense-prod-08-02", "condense-recover",
+                    "headroom", "headroom-kompress")
 
 
 def gated(arm, sub_gate):
@@ -249,15 +263,21 @@ def _is_sidechain(path):
 
 def _trial_metrics(trial_dir, session_path=None):
     """cost_usd + total tokens + wall-clock seconds from a trial's result.json ({} if absent).
-    Tokens = input + cache + output (the whole trajectory's spend), matching the cost basis.
+    Tokens = input + output, which IS the whole trajectory's spend: harbor's n_input_tokens
+    already contains the cache tiers (verified against the transcripts — n_input_tokens equals
+    input + cache_read + cache_creation on 342 of 399 opus-5 trials, the rest being transcripts
+    truncated by a kill). n_cache_tokens is a SUBSET of it, reported separately for visibility,
+    so the old input + cache + output sum double-counted every cache read — which on this suite
+    inflated tokens by ~1.8x and halved every $-per-Mtok figure derived from them.
 
-    Harbor records the token counts but leaves `cost_usd` null on a trial killed by the agent
-    wall timeout. Reading the two independently keeps such a trial in BOTH columns — gating
-    tokens on cost used to drop it from tokens too, so a task whose trials all timed out
-    vanished from tokens and $ entirely, which is exactly where the burn is most interesting
-    (it ran until the wall). When cost is missing we price the recorded transcript usage
-    ourselves, so the two columns stay over the same trial set: a tokens mean covering more
-    trials than its $ mean is not comparable down the row.
+    Cost is priced from the transcript, NOT read from harbor's `cost_usd`. Harbor leaves that
+    field null on a trial killed by the agent wall timeout — 7-25% of trials depending on the
+    arm, and unevenly so, since an arm with a longer wall gets killed less often. Mixing
+    harbor's number with our own on the trials it skipped made the $ columns a couple of
+    percent light in an arm-dependent way. One formula over every trial keeps a column
+    comparable across arms, and it agrees with harbor to ~2% in aggregate on the trials where
+    both exist. Tokens still come from harbor's counters, so both columns cover the same
+    trial set: a tokens mean over more trials than its $ mean is not comparable down the row.
     """
     try:
         r = json.load(open(os.path.join(trial_dir, "result.json")))
@@ -265,19 +285,18 @@ def _trial_metrics(trial_dir, session_path=None):
         return {}
     ar = r.get("agent_result") or {}
     m = {}
-    tok = sum(ar.get(k) or 0 for k in
-              ("n_input_tokens", "n_cache_tokens", "n_output_tokens"))
+    tok = sum(ar.get(k) or 0 for k in ("n_input_tokens", "n_output_tokens"))
     if tok:
         m["tok"] = tok
-    if ar.get("cost_usd") is not None:
-        m["cost"] = ar["cost_usd"]
-    elif tok and session_path:
+    if session_path:
         model = ((ar.get("model_info") or {}).get("name")
                  or ((r.get("agent_info") or {}).get("model_info") or {}).get("name"))
         try:
             m["cost"] = sum(cost_usd(u, model) for u in recorded_usage(session_path))
         except (OSError, ValueError, KeyError):
             pass
+    if "cost" not in m and ar.get("cost_usd") is not None:
+        m["cost"] = ar["cost_usd"]  # unreadable transcript — harbor's number is all there is
     try:
         from datetime import datetime
         s = datetime.fromisoformat(r["started_at"].replace("Z", "+00:00"))
@@ -286,6 +305,45 @@ def _trial_metrics(trial_dir, session_path=None):
     except (KeyError, ValueError, TypeError):
         pass
     return m
+
+
+# A compaction is a billed turn whose context came back SMALLER than the turn before it.
+# Context only grows when nothing removes from it, so a drop is the removal itself — measured
+# on the outcome rather than inferred from cache traffic. The earlier cache-side heuristic
+# (a large cache_creation without matching context growth) also fires on ordinary prefix
+# rewrites and over-counts by ~1.6x. The floor is jitter insurance only: at a 0 threshold
+# vanilla and caveman still measure exactly 0.00 across 72 and 56 trials, so nothing real
+# is being filtered here.
+_COMP_DROP = 1_000
+
+
+def _econ(path):
+    """Per-trial economics, one pass over the transcript, keyed by BILLED TURN.
+
+    recorded_usage() dedupes by requestId, so a response split across several records counts
+    once — the unit the bill is actually computed on. Steps (tool_use blocks) are a different
+    unit and are counted separately by actions(); the two are ~1:1 here but must not be
+    conflated in a $-per-unit column.
+
+    Returns None for a transcript too short to have a before/after (nothing to compare).
+    """
+    try:
+        us = recorded_usage(path)
+    except OSError:
+        return None
+    ctx = [ctx_tokens(u) for u in us]
+    if len(ctx) < 2:
+        return None
+    return {
+        "turns": len(us),
+        "peak": max(ctx),
+        "cache_w": sum(u.get("cache_creation_input_tokens", 0) or 0 for u in us),
+        "cache_r": sum(u.get("cache_read_input_tokens", 0) or 0 for u in us),
+        "comps": sum(1 for i in range(1, len(ctx)) if ctx[i - 1] - ctx[i] > _COMP_DROP),
+        # billed tokens straight from the transcript, so tokens / cache share / turns all come
+        # from one pass and cannot disagree on a trial harbor recorded oddly
+        "tok": sum(c + (u.get("output_tokens", 0) or 0) for c, u in zip(ctx, us, strict=True)),
+    }
 
 
 def index_runs(root, agent):
@@ -364,17 +422,26 @@ def _cell_stats(cell):
     runs = cell["runs"] if cell else []
     lens, rws, peaks = [], [], []
     costs, toks, lats = [], [], []
-    for p, _, m in runs:
+    trials = []
+    for p, rw, m in runs:
         acts = actions(p)
         lens.append(len(acts))
         rws.append(rework_count(acts))
-        peaks.append(peak_ctx(p))
+        e = _econ(p)
+        # _econ's peak IS peak_ctx (both are max ctx_tokens over recorded_usage); reuse it
+        # rather than re-walking the transcript, and fall back when the trial was too short
+        peaks.append(e["peak"] if e else peak_ctx(p))
         if m.get("cost") is not None:
             costs.append(m["cost"])
         if m.get("tok") is not None:
             toks.append(m["tok"])
         if m.get("lat") is not None:
             lats.append(m["lat"])
+        # one record per trial, fields aligned — the economics summary resamples TRIALS, so
+        # it needs cost/tokens/turns to travel together rather than as separate filtered lists
+        if e:
+            trials.append({**e, "solve": 1.0 if rw == "1" else 0.0, "steps": len(acts),
+                           "cost": m.get("cost"), "tok": e["tok"] or m.get("tok")})
     n = len(runs)
     attempted = cell["attempted"] if cell and cell["attempted"] else n
     started = n  # trial dirs that actually opened (reward or not); >n means some crashed
@@ -393,6 +460,7 @@ def _cell_stats(cell):
         "peak_ctx": max(peaks, default=0),
         # cost/token/latency for the $ and tokens columns; lists so a band can be shown
         "_costs": costs, "_toks": toks, "_lats": lats,
+        "_trials": trials,
     }
 
 
@@ -626,6 +694,212 @@ def _solve_rate(c):
     return (c["solve"] / n) if n else None
 
 
+# ------------------------------------------------- full-run economics (geometric, vs vanilla)
+# The pooled numbers this replaced were dollar-weighted in disguise. A ratio of macro-means
+# (Σ arm / Σ vanilla) lets the costliest tasks carry the result — on the opus-5 suite three of
+# fourteen tasks carried 41% of the spend, so "cost +81%" was really "cost +81% on the three
+# tasks that happen to be expensive". Each task gets ONE vote here instead:
+#
+#     delta = exp( mean over tasks of log( arm_task / vanilla_task ) ) - 1
+#
+# and the interval is a TWO-level bootstrap — resample tasks, then resample trials within each
+# resampled cell. Resampling tasks alone treats a 4-trial cell mean as if it were exact and
+# produces intervals far too narrow; two levels is what makes vanilla's own spread visible.
+# Tasks are shared across arms (the comparison is paired), trial draws are independent per arm.
+#
+# Three metrics cannot be ratios and say so in their own units:
+#   solve rate     percentage POINTS — a ratio is undefined when vanilla is 0% and meaningless
+#                  when it is 100%, which is 8 of 14 tasks on this suite.
+#   compactions    ABSOLUTE per-trial count — vanilla is exactly 0, so every ratio is infinite.
+#   cache write    a share already; its ratio is still meaningful, so it stays a ratio.
+def _mean(xs):
+    xs = [x for x in xs if x is not None]
+    return statistics.fmean(xs) if xs else None
+
+
+def _ratio(num, den):
+    n, d = sum(x for x in num if x is not None), sum(x for x in den if x is not None)
+    return (n / d) if d else None
+
+
+_FULL_METRICS = (
+    ("solve",  "solve",   "rate, pts",  "pts",
+     lambda c: _mean([t["solve"] for t in c]) and _mean([t["solve"] for t in c]) * 100,
+     lambda v: f"{v:.0f}%"),
+    ("turns",  "turns",   "per trial",  "ratio",
+     lambda c: _mean([t["turns"] for t in c]), lambda v: f"{v:.1f}"),
+    ("peak",   "peak ctx", "tokens",    "ratio",
+     lambda c: _mean([t["peak"] for t in c]), lambda v: f"{v:,.0f}"),
+    ("tok",    "tokens",  "per trial",  "ratio",
+     lambda c: _mean([t["tok"] for t in c]), lambda v: f"{v:,.0f}"),
+    ("cost",   "$",       "per trial",  "ratio",
+     lambda c: _mean([t["cost"] for t in c]), lambda v: f"${v:.2f}"),
+    ("cstep",  "$",       "per step",   "ratio",
+     lambda c: _ratio([t["cost"] for t in c], [t["steps"] for t in c]),
+     lambda v: f"${v:.4f}"),
+    ("rate",   "$",       "per Mtok",   "ratio",
+     lambda c: (lambda r: r and r * 1e6)(_ratio([t["cost"] for t in c], [t["tok"] for t in c])),
+     lambda v: f"${v:.2f}"),
+    ("cwsh",   "cache wr", "share",     "ratio",
+     lambda c: (lambda r: r and r * 100)(_ratio([t["cache_w"] for t in c],
+                                                [t["cache_w"] + t["cache_r"] for t in c])),
+     lambda v: f"{v:.1f}%"),
+    ("comp",   "compact", "per trial",  "abs",
+     lambda c: _mean([t["comps"] for t in c]), lambda v: f"{v:.2f}"),
+)
+
+
+def _agg(trials, fn):
+    """A cell's value for one metric, or None when the trials can't support it."""
+    if not trials:
+        return None
+    try:
+        v = fn(trials)
+    except (ZeroDivisionError, TypeError, statistics.StatisticsError):
+        return None
+    return v if isinstance(v, (int, float)) else None
+
+
+def _full_effect(arm_cells, van_cells, tasks, fn, mode, rng=None):
+    """One task-equal effect estimate. With `rng`, trials inside each cell are resampled too.
+
+    ratio -> geometric mean of per-task ratios, as a percentage change.
+    pts   -> arithmetic mean of per-task differences, in the metric's own units.
+    abs   -> arithmetic mean of the arm's own per-task values (no vanilla reference).
+    """
+    acc = []
+    for t in tasks:
+        a, v = arm_cells.get(t), van_cells.get(t)
+        if not a:
+            continue
+        if rng is not None:
+            a = [a[rng.randrange(len(a))] for _ in a]
+            if v:
+                v = [v[rng.randrange(len(v))] for _ in v]
+        av = _agg(a, fn)
+        if av is None:
+            continue
+        if mode == "abs":
+            acc.append(av)
+            continue
+        vv = _agg(v, fn)
+        if vv is None:
+            continue
+        if mode == "pts":
+            acc.append(av - vv)
+        elif av > 0 and vv > 0:            # a log needs both legs strictly positive
+            acc.append(math.log(av / vv))
+    if not acc:
+        return None
+    if mode == "ratio":
+        return 100 * (math.exp(statistics.fmean(acc)) - 1)
+    return statistics.fmean(acc)
+
+
+def _full_ci(arm_cells, van_cells, tasks, fn, mode):
+    """(point, lo, hi) at 95% from the two-level bootstrap. Seeded: same artifacts, same bars."""
+    point = _full_effect(arm_cells, van_cells, tasks, fn, mode)
+    if point is None or not tasks:
+        return None
+    rng = random.Random(_BOOT_SEED)
+    draws = []
+    for _ in range(_BOOT_N):
+        ts = [tasks[rng.randrange(len(tasks))] for _ in tasks]
+        v = _full_effect(arm_cells, van_cells, ts, fn, mode, rng)
+        if v is not None:
+            draws.append(v)
+    return _ci(draws, point)
+
+
+def _ground(van_cells, tasks, fn, mode):
+    """Vanilla's own level for a metric — the number the percentages are percentages OF.
+
+    Geometric over tasks for ratio metrics so that ground x (1 + delta) lands on the arm's
+    own geometric mean; arithmetic for the others, where that identity doesn't apply.
+    """
+    vals = [x for x in (_agg(van_cells.get(t), fn) for t in tasks) if x is not None]
+    if not vals:
+        return None
+    if mode == "ratio":
+        pos = [v for v in vals if v > 0]
+        return math.exp(statistics.fmean([math.log(v) for v in pos])) if pos else None
+    return statistics.fmean(vals)
+
+
+def summarize_full(d):
+    """Per-arm economics of the FULL runs, every metric as a task-equal effect vs vanilla.
+
+    Only tasks where BOTH the arm and vanilla produced a usable trial are counted, so every
+    number down a column rests on the same task set. Arms may cover different tasks; each is
+    reported over its own, and the caller is told when they diverge.
+    """
+    van = {r["task"]: r["vanilla"].get("_trials") or [] for r in d["rows"]}
+    van = {t: v for t, v in van.items() if v}
+    out = {"arms": [], "tasks": {}, "metrics": {}, "ground": {}, "ntrials": {}}
+    for arm in d["arms"]:
+        cells = {r["task"]: r["arms"][arm].get("_trials") or [] for r in d["rows"]}
+        cells = {t: v for t, v in cells.items() if v and t in van}
+        tasks = sorted(cells)
+        if not tasks:
+            continue
+        out["arms"].append(arm)
+        out["tasks"][arm] = tasks
+        out["ntrials"][arm] = (sum(len(cells[t]) for t in tasks),
+                               sum(len(van[t]) for t in tasks))
+        out["metrics"][arm] = {k: _full_ci(cells, van, tasks, fn, mode)
+                               for k, _h, _s, mode, fn, _f in _FULL_METRICS}
+        out["ground"][arm] = {k: _ground(van, tasks, fn, mode)
+                              for k, _h, _s, mode, fn, _f in _FULL_METRICS}
+    return out
+
+
+def _ntask(n):
+    return f"{n} task{'s' * (n != 1)}"
+
+
+def full_summary_rows(d):
+    """The economics summary as renderer-agnostic rows — console, md and HTML share it."""
+    s = summarize_full(d)
+    if not s["arms"]:
+        return None
+    ref = max(s["arms"], key=lambda a: len(s["tasks"][a]))
+    shared = all(s["tasks"][a] == s["tasks"][ref] for a in s["arms"])
+
+    def gcell(arm, k, mode, fmt):
+        g = s["ground"][arm][k]
+        return {"txt": fmt(g) if g is not None else "—", "sub": ""}
+
+    def acell(arm, k, mode):
+        tri = s["metrics"][arm][k]
+        if not tri:
+            return {"txt": "—", "sub": "", "sig": False}
+        m, lo, hi = tri
+        sig = mode != "abs" and (lo > 0 or hi < 0)
+        if mode == "abs":
+            return {"txt": f"{m:.2f}", "sub": f"[{lo:.2f}, {hi:.2f}]", "sig": False}
+        unit = "%" if mode == "ratio" else " pts"
+        return {"txt": f"{m:+.1f}{unit}", "sub": f"[{lo:+.0f}, {hi:+.0f}]", "sig": sig}
+
+    rows = []
+    if shared:
+        rows.append({"arm": "vanilla", "note": f"{_ntask(len(s['tasks'][ref]))} · ground",
+                     "control": True,
+                     "cells": [gcell(ref, k, mode, fmt)
+                               for k, _h, _sb, mode, _fn, fmt in _FULL_METRICS]})
+    for arm in s["arms"]:
+        na, nv = s["ntrials"][arm]
+        if not shared:
+            rows.append({"arm": "vanilla", "note": f"{_ntask(len(s['tasks'][arm]))} · ground",
+                         "control": True,
+                         "cells": [gcell(arm, k, mode, fmt)
+                                   for k, _h, _sb, mode, _fn, fmt in _FULL_METRICS]})
+        rows.append({"arm": arm, "note": f"{_ntask(len(s['tasks'][arm]))} · {na}v{nv} trials",
+                     "control": False,
+                     "cells": [acell(arm, k, mode)
+                               for k, _h, _sb, mode, _fn, _f in _FULL_METRICS]})
+    return {"rows": rows, "shared": shared, "summary": s}
+
+
 def summarize(d):
     """Pool every task/session into ONE row per arm + a baseline row, each number with a CI.
 
@@ -714,7 +988,11 @@ def _delta(delta, scale=100.0, dec=1):
     return f"Δ{m * scale:+.{dec}f} ±{max(hi - m, m - lo) * scale:.{dec}f}"
 
 
-SUMMARY_COLS = (("quality", "full runs"), ("quality", "incremental"),
+# Full-run solve rate used to head this table as a pooled rate. It now lives in the economics
+# table above, as a task-equal percentage-POINT delta with a two-level interval — the pooled
+# version answered a different (dollar-weighted) question and the two disagreed on screen.
+# What stays here is the incremental replay, which measures something else entirely.
+SUMMARY_COLS = (("quality", "incremental"),
                 ("redundant", "/100 steps"), ("context", "removed"))
 
 
@@ -781,17 +1059,16 @@ def summary_rows(d):
     """
     s = summarize(d)
     ref = _ref_arm(s)
-    if not ref or not any(s[a]["full"] or s[a]["good"] for a in s["arms"]):
+    # incremental-only now: a full-mode run has nothing to say here and renders no table
+    if not ref or not any(s[a]["good"] for a in s["arms"]):
         return None
     shared = _refs_agree(s, ref)
 
     def control(a):
-        nt = f"{len(a['full_tasks'])} task{'s' * (len(a['full_tasks']) != 1)}" \
-            if a["full_tasks"] else ""
         ns = f"{a['steps']} steps/{len(a['sessions'])}s" if a["sessions"] else ""
         nr = f"{a['red_steps']} steps" if a["red_steps"] and a["red_steps"] != a["steps"] else ""
         return {"arm": "control", "note": "", "control": True, "cells": [
-            _cell(a["full_ctrl"], sub=nt), _cell(a["good_ctrl"], sub=ns),
+            _cell(a["good_ctrl"], sub=ns),
             _cell(a["red_ctrl"], sub=nr), {"txt": "—", "sub": ""}]}
 
     def arm(name):
@@ -802,7 +1079,7 @@ def summary_rows(d):
         ccell = {"txt": "—", "sub": ""} if comp is None else {
             "txt": f"{comp * 100:+.1f}%", "sub": "⊘ barely fired" if abs(comp) < 0.02 else ""}
         return {"arm": name, "note": _arm_note(a), "control": False, "cells": [
-            _cell(a["full"], a["full_d"]), _cell(a["good"], a["good_d"]),
+            _cell(a["good"], a["good_d"]),
             _cell(a["red"], a["red_d"]), ccell]}
 
     rows = []
@@ -916,13 +1193,34 @@ def _plain(text):
     return re.sub(r"\[/(?:[a-z][a-z ]*)?\]|\[[a-z][a-z ]*\]", "", text)
 
 
+def _full_summary_md(d):
+    """The full-run economics as a markdown table — the same rows the console renders."""
+    sr = full_summary_rows(d)
+    if not sr:
+        return []
+    head = ["arm"] + [f"{h} ({s})" for _k, h, s, _m, _fn, _f in _FULL_METRICS]
+    o = ["## Full runs — vs vanilla\n", _plain(_FULL_LEGEND) + "\n",
+         "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for row in sr["rows"]:
+        label = row["arm"] + (f" ({row['note']})" if row["note"] else "")
+        cells = []
+        for c in row["cells"]:
+            txt = f"**{c['txt']}**" if c.get("sig") else c["txt"]
+            cells.append(txt + (f" {c['sub']}" if c["sub"] else ""))
+        o.append("| " + " | ".join([label] + cells) + " |")
+    if not sr["shared"]:
+        o.append("\nArms covered different tasks, so each carries its own vanilla ground row — "
+                 "read down an arm's pair, not across the table.")
+    return o + [""]
+
+
 def _summary_md(d):
-    """The overall summary as a markdown table — the same rows the console renders."""
+    """The incremental summary as a markdown table — the same rows the console renders."""
     sr = summary_rows(d)
     if not sr:
         return []
     head = ["arm"] + [f"{h} ({s})" for h, s in SUMMARY_COLS]
-    o = ["## Overall\n", _plain(_SUMMARY_LEGEND) + "\n",
+    o = ["## Incremental replay\n", _plain(_SUMMARY_LEGEND) + "\n",
          "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for row in sr["rows"]:
         label = row["arm"] + (f" ({row['note']})" if row["note"] else "")
@@ -936,7 +1234,7 @@ def _summary_md(d):
 
 def render_md(d):
     head, rows = table(d)
-    o = ["# Trajectory preservation\n", SUB + "\n"] + _summary_md(d)
+    o = ["# Trajectory preservation\n", SUB + "\n"] + _full_summary_md(d) + _summary_md(d)
     o += ["## Per task\n", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     o += ["| " + " | ".join(c for c, _ in row) + " |" for row in rows]
     return "\n".join(o) + "\n"
@@ -1056,8 +1354,38 @@ def _html_report_body(d):
     return "".join(secs)
 
 
+def _html_full_summary(d):
+    """The full-run economics section — first thing in the page, same rows as the console."""
+    import html as H
+    sr = full_summary_rows(d)
+    if not sr:
+        return ""
+    ths = "".join(f'<th>{H.escape(h)}<span class="d">{H.escape(s)}</span></th>'
+                  for _k, h, s, _m, _fn, _f in _FULL_METRICS)
+    trs = []
+    for row in sr["rows"]:
+        note = f'<span class="s">{H.escape(row["note"])}</span>' if row["note"] else ""
+        tds = []
+        for c in row["cells"]:
+            v = H.escape(c["txt"])
+            if c.get("sig"):
+                v = f"<b>{v}</b>"
+            sub = f'<span class="d">{H.escape(c["sub"])}</span>' if c["sub"] else ""
+            tds.append(f"<td>{v}{sub}</td>")
+        cls = " v" if row["control"] else ""
+        trs.append(f'<tr><td class="l task{cls}"><b>{H.escape(row["arm"])}</b>{note}</td>'
+                   + "".join(tds) + "</tr>")
+    foot = "" if sr["shared"] else (
+        '<div class="foot">Arms covered different tasks, so each carries its own vanilla ground '
+        "row — read down an arm's pair, not across the table.</div>")
+    return ('<h2>full runs — vs vanilla</h2>'
+            f'<div class="sub">{H.escape(_plain(_FULL_LEGEND))}</div>'
+            f'<table><thead><tr><th class="l">arm</th>{ths}</tr></thead><tbody>'
+            + "".join(trs) + f'</tbody></table>{foot}')
+
+
 def _html_summary(d):
-    """The overall summary section — first thing in the page, same rows as the console."""
+    """The incremental summary section — same rows as the console."""
     import html as H
     sr = summary_rows(d)
     if not sr:
@@ -1077,7 +1405,7 @@ def _html_summary(d):
     foot = "" if sr["shared"] else (
         '<div class="foot">Arms ran over different tasks/sessions, so each is shown against its '
         'own control — read down an arm\'s pair, not across the table.</div>')
-    return ('<h2>overall</h2>'
+    return ('<h2>incremental replay</h2>'
             f'<div class="sub">{H.escape(_plain(_SUMMARY_LEGEND))}</div>'
             f'<table><thead><tr><th class="l">arm</th>{ths}</tr></thead><tbody>'
             + "".join(trs) + f'</tbody></table>{foot}')
@@ -1092,6 +1420,7 @@ def render_html(d):
             f'<style>{_HTML_STYLE}</style></head><body><div class="wrap">'
             f'<h1>trajectory preservation <span class="dim">{H.escape("· " + model) if model else ""}</span></h1>'
             f'<div class="sub">{H.escape(SUB)}</div>'
+            + _html_full_summary(d)
             + _html_summary(d)
             + _html_report_body(d)
             + '<div class="foot">length/tokens/$ show vanilla→arm with the SAVING below '
@@ -1182,12 +1511,29 @@ _INCR_LEGEND = (
     "red <85% when the arm engaged (compressed or CCR-retrieved); else dim (≈100% by "
     "construction — no verdict). — = no incremental data. speed up is wall-clock — read it as a "
     "trend, not exact.")
+_FULL_LEGEND = (
+    "the vanilla row is the absolute ground; every arm row is that arm against it. % figures "
+    "are GEOMETRIC means of per-task ratios — exp(mean(log(arm/vanilla))) − 1 — so each task "
+    "votes once. The pooled ratio-of-sums this replaced was dollar-weighted in disguise: the "
+    "costliest few tasks carried the answer. Under each value is a 95% TWO-LEVEL bootstrap "
+    "interval (seeded): tasks are resampled, then trials within each resampled cell. Tasks are "
+    "shared across arms so the comparison is paired; trial draws are independent per arm. "
+    "[bold]Bold[/] marks an interval clear of zero — everything else is indistinguishable from "
+    "vanilla at this n, which is the common case and not a pass. Three columns are not ratios: "
+    "solve is percentage POINTS (a ratio is undefined at vanilla 0% and meaningless at 100%), "
+    "compact is the arm's ABSOLUTE count (vanilla is exactly 0, so every ratio is infinite) and "
+    "carries no significance mark. compact counts billed turns whose context came back smaller "
+    "than the turn before — measured on the outcome, not inferred from cache traffic. cache wr "
+    "= cache-write share of cached tokens; writes bill at 12.5x reads, so it is the cache number "
+    "that moves $/Mtok. turns are billed requests (deduped by requestId); steps are tool_use "
+    "blocks — near 1:1 here but not the same unit. Lost trials count as solve failures. Only "
+    "tasks where BOTH the arm and vanilla produced a usable trial are counted. No model was "
+    "called.")
 _SUMMARY_LEGEND = (
-    "everything in this run, pooled into one row per arm. ± is a 95% bootstrap CI (seeded, so "
-    "the same artifacts always render the same bars): full-run quality resamples TASKS, the two "
-    "incremental columns resample the paired STEPS. quality (full runs) = verifier pass rate, "
-    "macro-averaged per task so a task with many trials can't outvote one with few; lost trials "
-    "count as failures. quality (incremental) = the share of replayed steps whose action the "
+    "the incremental replay, pooled into one row per arm. ± is a 95% bootstrap CI (seeded, so "
+    "the same artifacts always render the same bars), resampling the paired STEPS. Full-run "
+    "solve rate is NOT here — it moved to the economics table above, as a task-equal points "
+    "delta. quality (incremental) = the share of replayed steps whose action the "
     "goal judge rated good (or, unjudged, that structurally matched the recording — a much "
     "noisier floor). redundant = steps that re-fetched information the agent already had. Under "
     "each arm value, Δ is its PAIRED difference vs control with its own CI — the ± on the values "
@@ -1439,6 +1785,41 @@ def _summary_cell(c):
     return _under(txt, c["sub"])
 
 
+def _full_summary_table(console, d, model):
+    """The full-run economics: one row per arm, every metric task-equal against vanilla.
+
+    Sits first because it answers the question a reader arrives with — what did this arm cost,
+    and is the difference bigger than the noise. Percentages are geometric means of per-task
+    ratios, so each task votes once; the interval under each is a two-level bootstrap over
+    tasks AND trials. A bar clear of zero is marked; everything else is left as a number,
+    because at bench-scale k most differences genuinely aren't distinguishable.
+    """
+    sr = full_summary_rows(d)
+    if not sr:
+        return
+    title = "[bold]quality — full runs · vs vanilla" + (f" · {model}" if model else "") + "[/]"
+    t = Table(title=title, caption=_FULL_LEGEND, caption_justify="left", caption_style="dim",
+              pad_edge=False)
+    t.add_column("arm", no_wrap=True)
+    for _k, head, sub, _m, _fn, _f in _FULL_METRICS:
+        t.add_column(f"{head}\n[dim]{sub}[/]", justify="right", min_width=9)
+    for i, row in enumerate(sr["rows"]):
+        if i and row["control"]:
+            t.add_section()
+        label = row["arm"] + (f"\n[dim]{row['note']}[/]" if row["note"] else "")
+        cells = []
+        for c in row["cells"]:
+            txt = f"[bold]{c['txt']}[/]" if c.get("sig") else c["txt"]
+            cells.append(_under(txt, c["sub"]))
+        t.add_row(label, *cells)
+        if i == 0 and sr["shared"]:
+            t.add_section()
+    console.print(t)
+    if not sr["shared"]:
+        console.print("[dim]  arms covered different tasks, so each carries its own vanilla "
+                      "ground row — read down an arm's pair, not across the table.[/]")
+
+
 def _summary_table(console, d, model):
     """The overall read: one row per arm, pooled across every task and session, with error bars.
 
@@ -1450,7 +1831,7 @@ def _summary_table(console, d, model):
     sr = summary_rows(d)
     if not sr:
         return
-    title = "[bold]quality — overall" + (f" · {model}" if model else "") + "[/]"
+    title = "[bold]quality — incremental replay" + (f" · {model}" if model else "") + "[/]"
     t = Table(title=title, caption=_SUMMARY_LEGEND, caption_justify="left", caption_style="dim",
               pad_edge=False)
     t.add_column("arm", no_wrap=True)
@@ -1559,6 +1940,7 @@ def render_console(d):
         return
     console = Console()
     model = d.get("model")
+    _full_summary_table(console, d, model)
     _summary_table(console, d, model)
     _full_table(console, d, model)
     _incremental_table(console, d, model)

@@ -1773,3 +1773,15 @@ def test_caveman_readout_states_its_denominator():
     assert "2 of 3 successful steps had prose" in line
     assert "cannot drift" in line and "vs original" in line
 
+
+def test_every_condense_arm_sorts_before_plain_condense():
+    """split_cell is a longest-prefix match, so a 'condense-<x>' arm listed AFTER 'condense'
+    is read back as arm 'condense' with a phantom task 'x-<task>' — which is how 13
+    condense-recover cells were filed under the wrong arm."""
+    from minmax_bench.quality.report import KNOWN_ARMS, split_cell
+    plain = KNOWN_ARMS.index("condense")
+    for i, arm in enumerate(KNOWN_ARMS):
+        if arm.startswith("condense-"):
+            assert i < plain, f"{arm} must precede 'condense' in KNOWN_ARMS"
+    for arm in ("condense-recover", "condense-prod-08-02", "condense"):
+        assert split_cell(f"{arm}-dna-assembly") == (arm, "dna-assembly")
