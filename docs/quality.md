@@ -102,7 +102,11 @@ un-gated, so a new method shows a real verdict rather than quietly vanishing fro
 
 ## Arms — naming, carefully
 
-- `condense` — the condense proxy (whole-conversation compaction).
+- `condense` — the condense proxy (whole-conversation compaction), against whichever
+  deployment `CONDENSE_PROFILE` / `dense target` selects (prod by default).
+  Nothing in a trial's artifacts records which deployment served it, so the arm name is the
+  only durable provenance — give each deployment its own arm, never separate runs of the same
+  one.
 - `headroom` — the token-mode proxy **plus** the MCP retrieve loop: the full
   Compress-Cache-Retrieve (CCR) product.
 - `headroom-kompress` — token-mode compression *without* retrieval, kept only as an
@@ -309,28 +313,76 @@ solve**, each vs the vanilla noise floor: ✓ overlap / ✗ disjoint, ≥2 finis
 (rendered as **fid** next to the control floor, plus **comp** and **$Δ** over the common
 step set). Deterministic, no network.
 
-### the overall table — one row per arm, with error bars
+### the full-run table — one row per arm, every metric against vanilla
 
 The per-task tables answer *"what happened on this task"*; every cell there is one or a few
 trials, so nothing in them carries an error bar and reading them means holding a column of
-small numbers in your head. The **overall** table, printed first, answers the other question
-— *"across everything that was run, does this arm cost quality, and is the difference bigger
-than the noise?"*
+small numbers in your head. The **full runs** table, printed first, answers the other question
+— *"across everything that was run, what did this arm cost, and is the difference bigger than
+the noise?"*
 
 ```
-┏━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
-┃arm          ┃     quality ┃     quality ┃   redundant ┃     context┃
-┃             ┃   full runs ┃ incremental ┃  /100 steps ┃     removed┃
-┡━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
-│control      │  52.8 ±25.0 │  78.1 ± 4.7 │   5.0 ± 2.5 │           —│
-│             │    12 tasks │ 317 steps/4s│             │            │
-│condense     │  75.0 ±25.0 │  73.5 ± 4.7 │  11.0 ± 3.5 │      +39.1%│
-│⊘2 too short │ Δ+22.2 ±30.6│  Δ-4.6 ± 5.9│  Δ+6.0 ± 3.2│            │
-└─────────────┴─────────────┴─────────────┴─────────────┴────────────┘
+┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┓
+┃                        ┃      solve ┃      turns ┃   peak ctx ┃     tokens ┃          $ ┃         $ ┃    cache wr ┃      compact┃
+┃arm                     ┃  rate, pts ┃  per trial ┃     tokens ┃  per trial ┃  per trial ┃  per Mtok ┃       share ┃    per trial┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━┩
+│vanilla                 │        80% │       21.9 │     59,308 │    989,160 │      $1.44 │     $1.45 │        4.0% │         0.00│
+│14 tasks · ground       │            │            │            │            │            │           │             │             │
+├────────────────────────┼────────────┼────────────┼────────────┼────────────┼────────────┼───────────┼─────────────┼─────────────┤
+│condense                │   -1.4 pts │     +12.7% │      -3.8% │     +13.7% │     +27.9% │    +12.4% │     +103.3% │         2.14│
+│14 tasks · 56v70 trials │ [-17, +14] │  [-6, +35] │  [-16, +9] │ [-12, +48] │  [+8, +53] │ [-7, +33] │ [+37, +183] │ [1.39, 2.89]│
+└────────────────────────┴────────────┴────────────┴────────────┴────────────┴────────────┴───────────┴─────────────┴─────────────┘
 ```
 
-- **quality (full runs)** — verifier pass rate, macro-averaged per task so a task with many
-  trials can't outvote one with few. Lost trials count as failures.
+The `vanilla` row is the absolute **ground**; every arm row is that arm against it. (The real
+table also carries a `$ per step` column, dropped here for width.)
+
+- **solve** — verifier pass rate, in percentage **points**. Not a ratio: a ratio is undefined
+  when vanilla is 0% and meaningless when it is 100%, which is 8 of 14 tasks on this suite.
+  Lost trials count as failures.
+- **turns** — billed requests, deduped by `requestId`. **Steps** (`$ per step`) are `tool_use`
+  blocks — near 1:1 in practice but not the same unit, so a $-per-unit column must say which.
+- **cache wr** — cache-write share of cached tokens. Writes bill at **12.5×** reads, so this
+  is the one cache number that explains a `$/Mtok` move.
+- **compact** — billed turns whose context came back *smaller* than the turn before. Measured
+  on the outcome, not inferred from cache traffic: the old cache-side heuristic (a large
+  `cache_creation` without matching context growth) also fires on ordinary prefix rewrites and
+  over-counts by ~1.6×. Shown **absolute**, because vanilla is exactly 0 and every ratio would
+  be infinite — and validated by exactly that: vanilla and caveman measure `0.00` across 72 and
+  56 trials.
+
+Three rules keep it from over-claiming:
+
+1. **Every % is a geometric mean of per-task ratios** — `exp(mean(log(arm/vanilla))) − 1` — so
+   each task votes once. The pooled ratio-of-sums this replaced was *dollar-weighted in
+   disguise*: on the opus-5 suite three of fourteen tasks carried 41% of the spend, so "cost
+   +81%" was really "+81% on the three tasks that happen to be expensive".
+2. **The interval is a two-level bootstrap**, seeded, so the same artifacts always render the
+   same bars: resample *tasks*, then resample *trials* within each resampled cell. Resampling
+   tasks alone treats a 4-trial cell mean as exact and produces intervals far too narrow —
+   two levels is what makes vanilla's own spread visible. Tasks are shared across arms (the
+   comparison is paired); trial draws are independent per arm.
+3. **Bold marks an interval clear of zero.** Everything else is indistinguishable from vanilla
+   at this n — the common case, and not a pass. Only tasks where *both* the arm and vanilla
+   produced a usable trial are counted, so every number down a column rests on the same tasks.
+
+### the incremental table
+
+Printed below it, and about something else entirely — the teacher-forced replay, whose control
+is a no-compression ceiling rather than a competitor.
+
+```
+┏━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
+┃arm          ┃     quality ┃   redundant ┃     context┃
+┃             ┃ incremental ┃  /100 steps ┃     removed┃
+┡━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
+│control      │  78.1 ± 4.7 │   5.0 ± 2.5 │           —│
+│             │ 317 steps/4s│             │            │
+│condense     │  73.5 ± 4.7 │  11.0 ± 3.5 │      +39.1%│
+│⊘6 passthru  │  Δ-4.6 ± 5.9│  Δ+6.0 ± 3.2│            │
+└─────────────┴─────────────┴─────────────┴────────────┘
+```
+
 - **quality (incremental)** — the share of replayed steps whose action the goal judge rated
   *good*; without `--judge goal` it falls back to structural agreement with the recording,
   a much noisier floor.
@@ -339,19 +391,12 @@ than the noise?"*
   of*, and the number without which they can't be read: an arm at `+3%` next to one at
   `+39%` isn't gentler, it barely fired. `⊘` marks <2%.
 
-Three rules keep it from over-claiming:
-
-1. **Each column is pooled over material where the method could act.** Incremental drops
-   sessions the arm passed through; full drops ⊘ tasks whose peak context never reached the
-   compaction gate. Both counts are printed on the arm row (`⊘2 too short`, `⊘6
-   passthrough`) — nothing is dropped quietly.
-2. **± is a 95% bootstrap CI**, seeded, so the same artifacts always render the same bars.
-   Full-run quality resamples *tasks*; the incremental columns resample the paired *steps*.
-   Steps within a session are correlated and are resampled as independent, so those bars are
-   if anything optimistic.
-3. **Δ under an arm value is its *paired* difference vs control**, with its own CI. The ± on
-   the values themselves are marginal — arm and control move together step-for-step, so they
-   can't be eyeballed against each other, and only the Δ answers "is this a real difference?"
+Here `±` resamples the paired *steps*, and `Δ` under an arm value is its **paired** difference
+vs control with its own CI — the ± on the values themselves are marginal, since arm and control
+move together step-for-step, so only the Δ answers "is this a real difference?". Steps within a
+session are correlated and are resampled as independent, so those bars are if anything
+optimistic. Sessions the arm passed through are dropped and counted (`⊘6 passthrough`) —
+nothing is dropped quietly.
    A Δ bar straddling zero means *indistinguishable from control at this n*, which is the
    common outcome and not a pass. Nothing is coloured or marked better/worse: the table
    prints the numbers and you draw the line.
