@@ -381,11 +381,15 @@ def test_dense_agent_rewrites_harbors_launch_line(monkeypatch):
     launch = ('export PATH="$HOME/.local/bin:$PATH"; '
               "claude --verbose --output-format=stream-json --effort high "
               "--print -- 'fix the bug' 2>&1 </dev/null | tee /logs/agent/claude-code.txt")
-    out = dcc._LAUNCH.sub("dense claude ", launch, count=1)
-    assert out.count("dense claude --verbose --output-format=stream-json") == 1
+    out = dcc._LAUNCH.sub(dcc._DENSE_LAUNCH, launch, count=1)
+    assert out.count("dense claude -- --verbose --output-format=stream-json") == 1
+    # the `--` is not cosmetic: without it dense's own clap parser consumes harbor's leading
+    # --verbose as `dense -v`, and Claude Code refuses to start ("--output-format=stream-json
+    # requires --verbose"). Pin the separator so a future tidy-up can't drop it.
+    assert dcc._DENSE_LAUNCH.split()[-1] == "--"
     # a path-y or prose mention of claude is not a launch; the rewrite must not touch it
     setup = "cp -r ~/.claude/skills/. $CLAUDE_CONFIG_DIR/skills/ && ~/.local/bin/claude --version"
-    assert dcc._LAUNCH.sub("dense claude ", setup, count=1) == setup
+    assert dcc._LAUNCH.sub(dcc._DENSE_LAUNCH, setup, count=1) == setup
 
 
 # ---------------------------------------------------------------- offline demo end-to-end
