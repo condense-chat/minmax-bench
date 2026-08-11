@@ -11,7 +11,7 @@ within ~200 of the api.anthropic.com baseline.
 
 Rather than carbon-copying that list (and re-copying it every time the CLI grows a
 feature), this agent installs the REAL pinned `dense` binary in the container and rewrites
-harbor's launch line `claude …` -> `dense claude …` — the exact process tree a real user
+harbor's launch line `claude …` -> `dense claude -- …` — the exact process tree a real user
 runs. Whatever the pinned dense does to its child, the arm does too, by construction.
 
 What deliberately does NOT change vs the plain condense arm:
@@ -58,6 +58,14 @@ DENSE_BIN = f"{DENSE_BIN_DIR}/dense"
 # lookahead pins us to the launch line, never a setup command that mentions claude.
 _LAUNCH = re.compile(r"(?<![\w/.-])claude (?=--verbose --output-format=stream-json)")
 
+# The `--` is load-bearing. `dense claude` passes ARGS through, but it carries dense's own
+# global flags too — including `-v/--verbose` — and clap matches those before the
+# passthrough starts. Without the separator dense EATS harbor's leading `--verbose`, the
+# child sees `--output-format=stream-json --print` without it, and Claude Code exits
+# immediately with "When using --print, --output-format=stream-json requires --verbose" —
+# every trial of the arm dies at launch. Verified against the pinned dense v0.6.0.
+_DENSE_LAUNCH = "dense claude -- "
+
 
 class DenseClaudeCode(ClaudeCode):
     @staticmethod
@@ -76,7 +84,7 @@ class DenseClaudeCode(ClaudeCode):
         headers-only wiring while the results carry a dense-launched arm's name.
         """
         if command and "--output-format=stream-json" in command:
-            rewritten = _LAUNCH.sub("dense claude ", command, count=1)
+            rewritten = _LAUNCH.sub(_DENSE_LAUNCH, command, count=1)
             if rewritten == command:
                 raise RuntimeError(
                     "dense-claude-code: harbor's launch command no longer matches "
@@ -199,7 +207,7 @@ class DenseClaudeCode(ClaudeCode):
         return "{ " + "; ".join(parts) + "; }"
 
     def _verify_command(self) -> str:
-        """Smoke test: `dense claude --version` — the full harness, on a throwaway child.
+        """Smoke test: `dense claude -- --version` — the full harness, on a throwaway child.
 
         Exercises everything the trial's launch will: profile resolution off `target`,
         ensure_auth's token probe, the session open/end round-trip, and the resolve of the
@@ -215,7 +223,7 @@ class DenseClaudeCode(ClaudeCode):
         return (
             "{ "
             "if command -v timeout >/dev/null 2>&1; then t='timeout 90'; else t=''; fi; "
-            f"out=$($t dense claude --version 2>&1 </dev/null || true); "
+            f"out=$($t {_DENSE_LAUNCH}--version 2>&1 </dev/null || true); "
             'case "$out" in '
             # the pass: dense resolved and ran the real claude, which printed its version
             '*"(Claude Code)"*) ;; '
