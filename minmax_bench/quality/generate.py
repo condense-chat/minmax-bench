@@ -206,16 +206,16 @@ def _arm_wiring(arm, env):
         return (f"http://host.docker.internal:{PTPORT}", "host.docker.internal",
                 "claude-code", [])
     if arm == "condense":
-        # creds come from the user's local `dense` CLI profile (~/.config/dense), exactly like
-        # a real dense run — no condense key in .env. CONDENSE_API_KEY is only a headless
-        # fallback. Pass BOTH headers dense sends (auth token + user id) into the container.
+        # Launched THROUGH the pinned `dense` CLI (harbor_agents/dense_claude_code.py), the
+        # way a real user runs it — not a hand-copied ANTHROPIC_BASE_URL + headers rewiring.
+        # `dense claude` also sets the env vars that keep Claude Code from composing its
+        # ~8-11k-token-larger non-first-party request (and dropping to a 200k window), and
+        # mints the per-launch session id — all of which the headers-only wiring missed.
+        # Creds reach the container through _arm_proc_env -> files dense reads, never --ae.
         creds = eng.condense_creds(env) or {}
-        hdr = f"X-Condense-Auth-Token: {creds.get('token', '')}"
-        if creds.get("user"):
-            hdr += f"\nX-Condense-User-Id: {creds['user']}"
         base = creds.get("url", "https://api.condense.chat/anthropic")
         host = base.split("://", 1)[-1].split("/", 1)[0]
-        return (base, host, "claude-code", ["--ae", f"ANTHROPIC_CUSTOM_HEADERS={hdr}"])
+        return (base, host, "harbor_agents.dense_claude_code:DenseClaudeCode", [])
     if arm == "headroom":
         # regular headroom = the full product: token-mode proxy + the MCP retrieve
         # loop (Compress-Cache-Retrieve), via the CCR agent
@@ -244,6 +244,27 @@ def _arm_wiring(arm, env):
                 "harbor_agents.caveman_claude_code:CavemanClaudeCode",
                 ["--ae", f"TMB_CAVEMAN_MODE={env.get('TMB_CAVEMAN_MODE', 'full')}"])
     sys.exit(f"unknown arm: {arm}")
+
+
+def _arm_proc_env(arm, env):
+    """Extra variables for the HARBOR PROCESS environment (not the container's).
+
+    Kept separate from ``_arm_wiring``'s ``--ae`` flags on purpose. ``--ae`` lands a value
+    in the container's environment, where the agent's own Bash calls can read it; these are
+    read by the agent MODULE, which runs host-side inside harbor, and end up only in the
+    files dense reads (~/.config/dense/…) inside the container.
+    """
+    if arm != "condense":
+        return {}
+    from minmax_bench.dense import load_profile
+    p = load_profile(env.get("CONDENSE_PROFILE") or None)
+    creds = eng.condense_creds(env) or {}
+    return {"TMB_DENSE_PROFILE": p.name,
+            # the BARE api url — condense_creds appends /anthropic for the proxy leg, but
+            # dense's profile.toml wants the root it hangs /anthropic and /v1/* off itself
+            "TMB_DENSE_URL": p.api_url.rstrip("/"),
+            "TMB_DENSE_TOKEN": creds.get("token", ""),
+            "TMB_DENSE_USER": creds.get("user", "")}
 
 
 def _proxy_up(port=HRPORT):
@@ -554,7 +575,8 @@ def full(args, env):
                         cmd += ["--agent-timeout-multiplier", str(mult)]
                     renv = {**os.environ, "ANTHROPIC_BASE_URL": base,
                             "PYTHONPATH": os.getcwd() + os.pathsep
-                            + os.environ.get("PYTHONPATH", "")}
+                            + os.environ.get("PYTHONPATH", ""),
+                            **_arm_proc_env(arm, env)}
                     if args.dry_run:
                         print(f"### {arm} / {task} (k={k}, base={base}) ###")
                         shown = " ".join(cmd)

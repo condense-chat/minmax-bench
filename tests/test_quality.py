@@ -312,6 +312,82 @@ def test_condense_creds_falls_back_to_key_when_no_profile(monkeypatch, tmp_path)
     assert eng.condense_creds({}) is None  # nothing configured at all
 
 
+def test_condense_arm_launches_through_dense_cli(monkeypatch, tmp_path):
+    """The condense arm runs the REAL `dense claude`, not hand-copied wiring: the agent is
+    the dense launcher, the token never rides an --ae flag (it reaches the files dense
+    reads via the harbor-process env), and the proc env carries the profile to provision."""
+    from minmax_bench.quality import generate as gen
+    (tmp_path / "token").write_text("tok-abc\n")
+    (tmp_path / "user").write_text("u-1\n")
+    _pin_dense_home(monkeypatch, tmp_path)
+    base, allow, agent, extra = gen._arm_wiring("condense", {})
+    assert agent == "harbor_agents.dense_claude_code:DenseClaudeCode"
+    assert extra == []  # no header/token --ae: creds go through _arm_proc_env only
+    assert base.endswith("/anthropic")
+    penv = gen._arm_proc_env("condense", {})
+    assert penv["TMB_DENSE_PROFILE"] == "prod" and penv["TMB_DENSE_TOKEN"] == "tok-abc"
+    assert penv["TMB_DENSE_USER"] == "u-1"
+    assert penv["TMB_DENSE_URL"] + "/anthropic" == base  # bare root, proxy leg agrees
+    assert gen._arm_proc_env("vanilla", {}) == {}  # non-condense arms get nothing
+
+
+def test_list_profiles_only_shows_profiles_with_creds(tmp_path):
+    from minmax_bench import dense as dm
+    (tmp_path / "token").write_text("t\n")  # bare top-level creds = prod
+    sd = tmp_path / "dev"
+    sd.mkdir()
+    (sd / "token").write_text("t2\n")
+    (sd / "profile.toml").write_text(
+        'name = "dev"\napi_url = "https://api.dev.example.test"\n')
+    (tmp_path / "local").mkdir()  # registered but never logged in -> not offered
+    profiles = dm.list_profiles(home=tmp_path)
+    assert [p.name for p in profiles] == ["prod", "dev"]
+    assert profiles[1].api_url == "https://api.dev.example.test"
+
+
+def test_condense_profile_picker_asks_only_with_a_real_choice(monkeypatch):
+    """No question unless the condense arm is selected AND ≥2 profiles have creds —
+    a single profile is not a choice."""
+    from minmax_bench import dense as dm
+    from minmax_bench import interactive as it
+    monkeypatch.setattr(dm, "list_profiles",
+                        lambda: [dm.DenseProfile("prod", "u", "t", "u1"),
+                                 dm.DenseProfile("dev", "u2", "t2", "u3")])
+    # no condense arm selected: nothing to configure
+    assert it._pick_condense_profile(None, ["vanilla", "headroom"]) is None
+    # condense arm but a single profile on disk: nothing to ask
+    monkeypatch.setattr(dm, "list_profiles",
+                        lambda: [dm.DenseProfile("prod", "u", "t", "u1")])
+    assert it._pick_condense_profile(None, ["condense"]) is None
+
+
+def test_dense_agent_rewrites_harbors_launch_line(monkeypatch):
+    """The dense agent's rewrite must hit harbor's launch exec exactly once, leave setup
+    commands alone, and refuse loudly when the launch line changes shape (running
+    unwrapped would silently measure the headers-only wiring under a dense arm's name)."""
+    import sys
+    import types
+    # harbor lives in a separate uv tool env; stub the import chain so the agent module
+    # (whose logic under test is pure) can be imported here.
+    for name in ("harbor", "harbor.agents", "harbor.agents.installed",
+                 "harbor.agents.installed.claude_code"):
+        mod = types.ModuleType(name)
+        if name.endswith("claude_code"):
+            mod.ClaudeCode = type("ClaudeCode", (), {})
+        monkeypatch.setitem(sys.modules, name, mod)
+    sys.modules.pop("harbor_agents.dense_claude_code", None)
+    import importlib
+    dcc = importlib.import_module("harbor_agents.dense_claude_code")
+    launch = ('export PATH="$HOME/.local/bin:$PATH"; '
+              "claude --verbose --output-format=stream-json --effort high "
+              "--print -- 'fix the bug' 2>&1 </dev/null | tee /logs/agent/claude-code.txt")
+    out = dcc._LAUNCH.sub("dense claude ", launch, count=1)
+    assert out.count("dense claude --verbose --output-format=stream-json") == 1
+    # a path-y or prose mention of claude is not a launch; the rewrite must not touch it
+    setup = "cp -r ~/.claude/skills/. $CLAUDE_CONFIG_DIR/skills/ && ~/.local/bin/claude --version"
+    assert dcc._LAUNCH.sub("dense claude ", setup, count=1) == setup
+
+
 # ---------------------------------------------------------------- offline demo end-to-end
 def test_bundled_sample_still_reports(tmp_path):
     root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
