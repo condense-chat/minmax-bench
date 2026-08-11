@@ -406,6 +406,36 @@ class QualityWizardResult:
     independent_budgets: bool = False  # True = each arm to own budget; False = cap to control
     resume: bool = True        # skip arms already finished (.done sentinel) on re-run to same out
     caveman_mode: str = "full"  # caveman arm intensity: lite | full | ultra
+    condense_profile: str | None = None  # dense profile for the condense arm; None = target
+
+
+def _pick_condense_profile(console: Console, arms: list[str]) -> str | None:
+    """Which dense profile the condense arm should use — asked only when the machine
+    actually has a choice (≥2 profiles with creds) and the condense arm is selected.
+
+    The answer lands in CONDENSE_PROFILE for the run (wizard > exported env > .env), which
+    decides both the proxy leg's endpoint and the profile provisioned into the container
+    for `dense claude`.
+    """
+    if "condense" not in arms:
+        return None
+    from .dense import active_profile_name, list_profiles
+    profiles = list_profiles()
+    if len(profiles) < 2:
+        return None  # nothing to choose — load_profile's own resolution is fine
+    active = active_profile_name()
+    opts = [(p.name, f"{p.name} — {p.api_url}"
+             + (" [green](active dense target)[/]" if p.name == active else ""), True)
+            for p in profiles]
+    default_idx = next((i for i, p in enumerate(profiles, 1) if p.name == active), 1)
+    choice = _select_one(console, "dense profile for the condense arm", opts,
+                         default_idx=default_idx)
+    # export immediately, not just via the returned result: the wizard's own preflight runs
+    # BEFORE cli.py sees the answer, and it resolves the condense endpoint off this var —
+    # otherwise it would print (and gate on) the profile the user just declined.
+    import os
+    os.environ["CONDENSE_PROFILE"] = choice
+    return choice
 
 
 def _ask_int(console: Console, prompt: str, default: int, lo: int = 0) -> int:
@@ -604,6 +634,7 @@ def _full_wizard(console: Console) -> QualityWizardResult:
             ("lite", "lite — no filler/hedging, keep grammar (conservative)", True),
             ("ultra", "ultra — maximum terseness", True),
         ])
+    condense_profile = _pick_condense_profile(console, arms)
     # Group shortcuts, biased toward sessions long enough that condense/headroom actually
     # compact. The default 5 are SHORT tasks — an agent solves them without ever crossing
     # the compaction threshold, so a compressing arm just passes through (nothing to measure).
@@ -724,7 +755,8 @@ def _full_wizard(console: Console) -> QualityWizardResult:
                                effort=effort, k=k, concurrency=concurrency, budget_usd=budget,
                                milestones=milestones, out=out, force=force, retries=retries,
                                auth=auth, caveman_mode=caveman_mode,
-                               agent_timeout_mult=agent_timeout_mult)
+                               agent_timeout_mult=agent_timeout_mult,
+                               condense_profile=condense_profile)
 
 
 def _incremental_wizard(console: Console) -> QualityWizardResult:
@@ -787,6 +819,7 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
             ("lite", "lite — no filler/hedging, keep grammar (conservative)", True),
             ("ultra", "ultra — maximum terseness", True),
         ])
+    condense_profile = _pick_condense_profile(console, arms)
     # inherit the session's OWN model by default — running it faithfully is the point;
     # an arm that can't serve it auto-falls-back at run time (only override deliberately)
     mt = Table(title="[bold]incremental model", show_header=False, box=None)
@@ -870,7 +903,8 @@ def _incremental_wizard(console: Console) -> QualityWizardResult:
                                effort=effort, limit=limit, budget_usd=budget, out=out,
                                judge=judge, capture=capture, ctx_gate=ctx_gate,
                                independent_budgets=independent_budgets, resume=resume, auth=auth,
-                               caveman_mode=caveman_mode)
+                               caveman_mode=caveman_mode,
+                               condense_profile=condense_profile)
 
 
 # --------------------------------------------------------------------- auth + setup

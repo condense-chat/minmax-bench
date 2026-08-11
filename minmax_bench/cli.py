@@ -105,6 +105,13 @@ def quality_run(
             from minmax_bench.quality.report import main as report_main
             report_main(["--from", w.out, "--arms", w.arms, "--tasks", w.tasks])
             return
+        # dense profile for the condense arm — the wizard's explicit answer wins over an
+        # exported CONDENSE_PROFILE / .env (generate.main only setdefaults .env). Decides
+        # both the proxy leg's endpoint and the profile provisioned into the container
+        # for `dense claude`.
+        if w.condense_profile:
+            import os
+            os.environ["CONDENSE_PROFILE"] = w.condense_profile
         if w.mode == "incremental":
             _run_incremental(session=w.session, arms=w.arms, model=w.model, effort=w.effort,
                              limit=w.limit, budget_usd=w.budget_usd, max_tokens=6000,

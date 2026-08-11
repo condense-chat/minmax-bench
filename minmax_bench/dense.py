@@ -48,6 +48,22 @@ def active_profile_name(home: Path = DENSE_HOME) -> str:
     return _read(home / "target") or "prod"
 
 
+def list_profiles(home: Path = DENSE_HOME) -> list[DenseProfile]:
+    """Every dense profile with credentials on disk, resolved like `load_profile`.
+
+    `prod` appears when the bare top-level token exists; a named profile when its
+    subdir holds a token. Profiles without a token are skipped — offering one to a
+    picker would only move the failure from selection time to auth time.
+    """
+    names = ["prod"] if _read(home / "token") else []
+    try:
+        names += sorted(d.name for d in home.iterdir()
+                        if d.is_dir() and _read(d / "token"))
+    except OSError:
+        pass
+    return [load_profile(n, home=home) for n in names]
+
+
 def load_profile(name: str | None = None, home: Path = DENSE_HOME) -> DenseProfile:
     """Resolve a dense profile's api_url + creds. ``None`` follows ``target``."""
     name = name or active_profile_name(home)
