@@ -651,8 +651,13 @@ def _full_wizard(console: Console) -> QualityWizardResult:
     # compact. The default 5 are SHORT tasks — an agent solves them without ever crossing
     # the compaction threshold, so a compressing arm just passes through (nothing to measure).
     # caveman has no threshold, but its ~750-token/turn ruleset tax only pays for itself once
-    # its own terse messages have accumulated — so short tasks under-serve it too.
-    compacts = any(a.startswith(("condense", "headroom", "caveman")) for a in arms)
+    # its own terse messages have accumulated — so short tasks under-serve it too. Same for
+    # rtk: it filters tool OUTPUT, so its saving scales with how much the agent reads back,
+    # while its cost (per-trial binary install + awareness file) is paid up front on turn one.
+    #
+    # This is an arm-name prefix list, so a NEW arm defaults to the short set silently. Add it
+    # here in the same commit that adds it to the multiselect above.
+    compacts = any(a.startswith(("condense", "headroom", "caveman", "rtk")) for a in arms)
     long_group = _resolve_tasks_safe("long")[0] or []
     n_long, n_hard = len(long_group), len(_resolve_tasks_safe("hard")[0] or [])
     n_all = len(_resolve_tasks_safe("all")[0] or [])
