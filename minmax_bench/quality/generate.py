@@ -33,6 +33,7 @@ import contextlib
 import glob
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -165,6 +166,12 @@ CAVEMAN_TARBALL_PROBE = (
 # the harbor child currently running (for cleanup on interrupt) — a 1-slot box so
 # the signal handler / atexit reaper can terminate it before removing its network
 _HARBOR = [None]
+
+# (cell_dir, task) for every cell THIS process has launched harbor into. The exit reaper
+# globs these for harbor's trial directories to learn which docker resources are ours, so a
+# run that finishes cannot tear down a CONCURRENT run's live trials. Appended as cells start
+# rather than computed up front, so it stays correct if the run is interrupted part-way.
+_OWNED_CELLS: list[tuple[str, str]] = []
 
 # ------------------------------------------------------------------ FULL: drive Harbor per arm/task
 def _k_for(args, arm):
@@ -324,13 +331,52 @@ def _stop_proxy(p):
             log.close()
 
 
+def _compose_project(name):
+    """Mirror harbor's _sanitize_docker_compose_project_name (environments/docker/docker.py).
+
+    Docker Compose project names must be lowercase and drawn from [a-z0-9_-], so harbor
+    rewrites the trial name before it reaches docker. The on-disk trial directory keeps the
+    ORIGINAL spelling, which means the two differ whenever an id has a capital or a task has
+    a dot:  install-windows-3.11__Uqfdbb5  ->  install-windows-3-11__uqfdbb5.
+    Matching directory names verbatim silently reaps nothing for those trials."""
+    name = name.lower()
+    if not re.match(r"^[a-z0-9]", name):
+        name = "0" + name
+    return re.sub(r"[^a-z0-9_-]", "-", name)
+
+
+def _owned_trial_names():
+    """Docker resource prefixes belonging to THIS run, e.g. {'regex-chess__4jcxe5e', ...}.
+
+    Harbor lays a cell out as `<cell>/<timestamp>/<task>__<id>/` and names that trial's
+    docker resources after `<task>__<id>__env` (trial.py: session_id=f"{trial_name}__env"),
+    so the directory names identify the resources we own — once put through the same
+    compose-project sanitising docker itself applies."""
+    names = set()
+    for cell, task in _OWNED_CELLS:
+        for d in glob.glob(os.path.join(cell, "*", f"{task}__*")):
+            if os.path.isdir(d):
+                names.add(_compose_project(os.path.basename(d)))
+    return names
+
+
 def _reap_docker():
-    """Remove leftover harbor trial containers/networks. Harbor cleans up after a
-    NORMAL trial, but a killed/aborted/crashed run leaks its `<task>__<id>__env*`
-    containers and networks — which exhaust Docker's address pools over time. Harbor
-    names EVERY trial resource with the `__env` marker, so that pattern targets only
-    harbor's leftovers (k3d clusters, user projects, and defaults don't match).
-    Best-effort: silent if Docker is absent."""
+    """Remove leftover harbor trial containers/networks belonging to THIS run.
+
+    Harbor cleans up after a NORMAL trial, but a killed/aborted/crashed one leaks its
+    `<task>__<id>__env*` containers and networks — which exhaust Docker's address pools
+    over time.
+
+    SCOPED ON PURPOSE. Harbor marks every trial resource with `__env` regardless of which
+    run spawned it, so reaping on that marker alone is a global kill switch: with two
+    `quality run` processes going at once (different arms, or the same arm from another
+    checkout), the first to exit force-removes the other's IN-FLIGHT trials and destroys
+    live work. Instead we reap only resources whose name starts with a trial directory
+    this process created — see _owned_trial_names(). Anything else is somebody else's.
+
+    The cost of that scoping is a genuinely orphaned container (one whose trial dir never
+    got written) surviving until the next run; that is the right trade against deleting a
+    concurrent run's work. Best-effort: silent if Docker is absent."""
     if not shutil.which("docker"):
         return
     # if a harbor child is still tearing down its trial, terminate + wait for it first
@@ -342,16 +388,34 @@ def _reap_docker():
             proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
             proc.kill()
+    owned = _owned_trial_names()
+    if not owned:
+        return
     reaped = 0
-    kinds = ((["ps", "-aq"], ["rm", "-f"]), (["network", "ls", "-q"], ["network", "rm"]))
-    for lister, remover in kinds:
-        ids = subprocess.run(["docker", *lister, "--filter", "name=__env"],
-                             capture_output=True, text=True).stdout.split()
+    # `docker ps` calls the field .Names, `docker network ls` calls it .Name — not the same
+    # template, so each kind carries its own
+    kinds = ((["ps", "-a"], "{{.ID}}\t{{.Names}}", ["rm", "-f"]),
+             (["network", "ls"], "{{.ID}}\t{{.Name}}", ["network", "rm"]))
+    for lister, fmt, remover in kinds:
+        # list names alongside ids and match here: docker's --filter name= is a substring
+        # match with no way to express "any of these prefixes"
+        rows = subprocess.run(["docker", *lister, "--format", fmt],
+                              capture_output=True, text=True).stdout
+        ids = [line.split("\t", 1)[0] for line in rows.splitlines()
+               if "\t" in line and _owns(line.split("\t", 1)[1], owned)]
         if ids:
             subprocess.run(["docker", *remover, *ids], capture_output=True)
             reaped += len(ids)
     if reaped:
-        _console.print(f"[dim][cleanup] removed {reaped} leftover harbor container(s)/net(s)[/]")
+        _console.print(f"[dim][cleanup] removed {reaped} leftover harbor container(s)/net(s) "
+                       f"from this run[/]")
+
+
+def _owns(name, owned):
+    """True iff a docker resource name is one of `owned`'s trial resources. Harbor suffixes
+    the trial name with `__env` and then compose adds its own (`-main-1`, `_default`), so
+    anchor on the `<trial>__env` prefix rather than matching `__env` anywhere."""
+    return any(name.startswith(f"{t}__env") for t in owned)
 
 
 def _agent_auth_env(env):
@@ -551,6 +615,10 @@ def full(args, env):
                 base, allow, agent, extra = _arm_wiring(arm, env)
                 for task in tasks:
                     cell = f"{out}/{arm}-{task}"
+                    # claim this cell for the exit reaper BEFORE harbor can create anything in
+                    # it, so a crash mid-cell still leaves its containers reapable by us — and
+                    # only by us (see _reap_docker)
+                    _OWNED_CELLS.append((cell, task))
                     # trial-level resume: run only the trials this cell is still missing, so an
                     # interrupt picks up where it left off instead of re-spending finished trials
                     done = len(glob.glob(f"{cell}/*/*/verifier/reward.txt"))

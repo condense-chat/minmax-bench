@@ -247,6 +247,13 @@ before spending anything.
 Every cell writes `attempted.json` first, so killed trials show up as `⚠ lost` in the
 report (counted as unsolved) instead of vanishing.
 
+**Two runs at once is safe.** On exit — normal, crash, Ctrl-C or SIGTERM — a run reaps the
+docker containers and networks its own trials leaked, identified by the trial directories it
+created under its own cells. It will not touch another run's resources, so you can run two
+arms side by side (different arms, or the same arm from another checkout) without the first
+to finish tearing down the other's live containers. The trade is that a container whose trial
+directory never got written survives until you clean it up by hand.
+
 On a Claude Code subscription (no API key), every upstream call — replay and judges alike —
 carries the CLI's identity system block. Subscription traffic is classified by whether it
 looks like Claude Code, and a request with no system prompt is throttled far harder: without
