@@ -1499,11 +1499,11 @@ def test_caveman_inactive_warning_reaches_every_renderer(tmp_path):
                                             milestone=None, milestone_ok=None, incr=None)}}]}
     _head, rows = report.table(d)
     assert any("inactive" in c[0] for row in rows for c in row), "missing from markdown"
-    assert "ran without the skill" in report._html_report_body(d), "missing from html"
+    assert "ran without the intervention" in report._html_report_body(d), "missing from html"
     from rich.console import Console as _C
     con = _C(file=__import__("io").StringIO(), width=200, force_terminal=False)
     report._full_table(con, d, "m")
-    assert "without the skill" in con.file.getvalue(), "missing from console"
+    assert "without the intervention" in con.file.getvalue(), "missing from console"
 
 
 _STAT = {"n": 2, "attempted": 2, "lost": 0, "started": 2, "solve": 2, "rework": (0, 0, 0),
@@ -2392,7 +2392,7 @@ def test_rtk_inactive_guard_is_structural(tmp_path):
 def test_rtk_active_trial_is_not_flagged_when_cc_records_the_original_command(tmp_path):
     """Claude Code 2.1.228 keeps the ORIGINAL command in the tool_use and records the rewrite
     beside it, as a hook_success attachment. A guard that only knows the old shape calls a run
-    where rtk filtered every observation 'ran without the skill' — backwards, and on the
+    where rtk filtered every observation 'ran without the intervention' — backwards, and on the
     DEFAULT html renderer. The container installs Claude Code unpinned, so both shapes are
     live artifacts and both must read as active."""
     _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-00", ["ls -la /app", "git status"],
@@ -2431,11 +2431,11 @@ def test_rtk_inactive_warning_reaches_every_renderer():
                                         milestone=None, milestone_ok=None, incr=None)}}]}
     _head, rows = report.table(d)
     assert any("inactive" in c[0] for row in rows for c in row), "missing from markdown"
-    assert "ran without the skill" in report._html_report_body(d), "missing from html"
+    assert "ran without the intervention" in report._html_report_body(d), "missing from html"
     from rich.console import Console as _C
     con = _C(file=__import__("io").StringIO(), width=200, force_terminal=False)
     report._full_table(con, d, "m")
-    assert "without the skill" in con.file.getvalue(), "missing from console"
+    assert "without the intervention" in con.file.getvalue(), "missing from console"
 
 
 def test_rtk_filter_handles_compound_commands():

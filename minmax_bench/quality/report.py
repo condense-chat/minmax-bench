@@ -1294,7 +1294,11 @@ SUB = ("vanilla = the noise floor; ✓ = the arm's band overlaps vanilla's, ✗ 
        "⚠ n inactive = n trials that ran WITHOUT their intervention — vanilla in disguise, so "
        "read their ✓ as 'not measured', not 'preserved'. For caveman that means no activation "
        "marker in the transcript (the skill never loaded); for rtk it means the trial issued "
-       "Bash commands and none carried the rtk prefix, so the hook never fired. "
+       "Bash and rtk ran none of it — EITHER a wiring failure (hook never fired) OR simply no "
+       "command rtk knows (it has an equivalent for ~15%, so a trial whose shell work is all "
+       "`python -c …` is untouched by a perfectly healthy rtk). Both are 'not measured' for "
+       "reading the verdict, but only the first is a bug: check agent/rtk-gain.json, which "
+       "reports what rtk actually executed. "
        "rtk, like caveman, is not a proxy and should be read against vanilla, NOT vanilla-proxy. "
        "It is the only arm that transforms OBSERVATIONS rather than history or output: it "
        "shrinks what the agent reads back from Bash, so unlike caveman its comp is expected to "
@@ -1471,7 +1475,7 @@ def _html_report_body(d):
                 + f'<tr class="det" style="display:none"><td class="l" colspan="{span}">{detail(v, a)}</td></tr>')
         dead = inactive_total(arm_rows, arm)
         warn = (f' <span class="pill bad">⚠ {dead} trial{"s" if dead > 1 else ""} ran without '
-                f'the skill — read those verdicts as "not measured"</span>') if dead else ""
+                f'the intervention — read those verdicts as "not measured"</span>') if dead else ""
         secs.append(f'<h2>{H.escape(arm)} <span class="dim">vs vanilla</span>{warn}</h2>'
                     f'<table><thead><tr><th class="l">task ▸</th><th>length</th><th>tokens</th>'
                     f'<th>$</th><th class="l">verdict</th>{msh}</tr></thead><tbody>'
@@ -1987,7 +1991,7 @@ def _full_table(console, d, model):
             continue
         dead = inactive_total(arm_rows, arm)
         title = (f"[bold]{arm} vs vanilla" + (f" · {model}" if model else "") + "[/]"
-                 + (f" [red]⚠ {dead} trial(s) ran without the skill — "
+                 + (f" [red]⚠ {dead} trial(s) ran without the intervention — "
                     f"those verdicts measure nothing[/]" if dead else ""))
         t = Table(title=title, caption=_FULL_LEGEND if ai == len(d["arms"]) - 1 else None,
                   caption_justify="left", caption_style="dim", pad_edge=False)
