@@ -60,7 +60,7 @@ def _flag(argv: list[str], name: str, value, default=None) -> None:
 @quality_app.command("run")
 def quality_run(
     tasks: str | None = typer.Option(None, "--tasks", help="N recommended | random:N (with --seed) | group (all|long|short|hard|medium) | a,b,c | omitted = 5. `long`=author timeout ≥30m, biasing toward sessions long enough to compact. See --list-tasks."),
-    arms: str = typer.Option("condense,headroom", "--arms", help="Methods to run; vanilla baseline always included. Also: headroom-kompress (ablation), vanilla-proxy (passthrough control — isolates the proxy-wiring confound), caveman (terse-output skill; not a proxy, reads against plain vanilla)."),
+    arms: str = typer.Option("condense,headroom", "--arms", help="Methods to run; vanilla baseline always included. Also: headroom-kompress (ablation), vanilla-proxy (passthrough control — isolates the proxy-wiring confound), caveman (terse-output skill; not a proxy, reads against plain vanilla), rtk (tool-output filter; not a proxy either, also reads against plain vanilla)."),
     model: str | None = typer.Option(None, "--model", "-m", help="Model id (default claude-sonnet-4-6)."),
     effort: str | None = typer.Option(None, "--effort", help="Thinking effort for the container's Claude Code: low | medium | high | xhigh | max (default: unset — Claude Code's own default, high)."),
     dataset: str = typer.Option(_Q_DATASET, "--dataset", "-d", help="Harbor dataset (only the default is validated)."),
