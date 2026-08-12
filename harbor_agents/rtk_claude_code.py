@@ -12,11 +12,19 @@ Two consequences the rest of the bench has to know about:
 
   - Like caveman it is NOT a proxy: ANTHROPIC_BASE_URL stays default, so it reads against
     plain `vanilla` rather than `vanilla-proxy` (no ~8-9k wiring confound to subtract).
-  - Unlike every other arm it rewrites the RECORDED ACTIONS. `rtk hook claude` returns
-    `updatedInput.command`, so the transcript stores `rtk git status`, not `git status`.
-    Every command-shaped metric therefore normalizes through `engine.unrtk` — without it
-    `report.rework_count` scores the arm a flawless ZERO rework on identical behaviour,
-    because its read-only pattern is ^-anchored and rtk renames cat/head/tail to `rtk read`.
+  - WHERE the rewrite is recorded depends on the Claude Code build, which this agent does not
+    pin (the base class installs latest). Through 2.0.x `updatedInput.command` replaced the
+    tool_use input, so the transcript stored `rtk git status` and every command-shaped metric
+    had to normalize through `engine.unrtk` — without it `report.rework_count` scored the arm
+    a flawless ZERO rework on identical behaviour, its read-only pattern being ^-anchored
+    while rtk renames cat/head/tail to `rtk read`. By 2.1.228 the tool_use keeps the ORIGINAL
+    command and the rewrite is recorded beside it as a `hook_success` attachment; unrtk then
+    no-ops, harmlessly, and the arm's commands are recorded exactly like vanilla's.
+
+Because that shape is not under our control, the arm does not rely on it to prove it ran:
+`run()` dumps `rtk gain` into the trial artifacts. rtk counts the commands it actually
+EXECUTED, so the number distinguishes "the hook emitted a rewrite" from "the rewrite is what
+ran" — the difference between a measured arm and vanilla in disguise scoring a clean pass.
 
 This agent installs RTK the reproducible way — a PINNED release binary, no `install.sh` piped
 from the network at run time, no mutation of the user's machine:
@@ -116,6 +124,42 @@ class RtkClaudeCode(ClaudeCode):
                 f'echo "rtk {RTK_REF} installed ($v)"'
             ),
         )
+
+    async def run(self, instruction, environment, context) -> None:
+        """The agent run, then rtk's own stats — dumped whether or not the run succeeded.
+
+        A crashed or timed-out trial is exactly when "did the intervention actually apply?"
+        is hardest to answer from the transcript, so the dump is in a `finally` rather than
+        after a clean return.
+        """
+        try:
+            await super().run(instruction, environment, context)
+        finally:
+            await self._dump_gain(environment)
+
+    async def _dump_gain(self, environment) -> None:
+        """Write rtk's execution stats into the trial's artifacts (agent/rtk-gain.json).
+
+        `rtk gain` reports what rtk RAN — commands, tokens in/out, tokens saved — from state
+        rtk itself writes as it executes. The container is fresh per trial, so the counts are
+        this trial's alone with nothing to reset.
+
+        Read back by report._rtk_inactive as the proof-of-activity signal, and worth keeping
+        for its own sake: it is the method's self-reported saving, next to the bench's
+        independent measurement of the same run.
+
+        Never fatal. This runs after the agent has finished and the trajectory is already on
+        disk; failing the trial here would throw away a completed, paid-for run over a stats
+        file, and a missing file is itself the signal the guard needs.
+        """
+        try:
+            await self.exec_as_agent(
+                environment,
+                command=(f"{RTK_BIN} gain -f json > /logs/agent/rtk-gain.json 2>/dev/null; "
+                         f"{RTK_BIN} gain > /logs/agent/rtk-gain.txt 2>/dev/null; true"),
+            )
+        except Exception as e:  # noqa: BLE001 — see docstring: a dump must not fail a trial
+            print(f"rtk: could not dump `rtk gain` stats: {e}")
 
     def _build_register_skills_command(self) -> str | None:
         """Wire the PreToolUse hook, then smoke-test that rtk actually rewrites.

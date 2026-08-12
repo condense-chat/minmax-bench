@@ -2341,12 +2341,17 @@ def test_setup_wizard_reports_rtk_pin_alignment(monkeypatch):
     assert "matches the benchmark pin" in console2.file.getvalue()
 
 
-def _rtk_trial(tmp_path, cell, name, cmds):
+def _rtk_trial(tmp_path, cell, name, cmds, hook_rewrites=(), gain=None):
+    """One rtk trial on disk. `cmds` are the commands as RECORDED in the tool_use;
+    `hook_rewrites` are the commands the PreToolUse hook returned (the Claude Code ≥2.1.x
+    shape, where the tool_use keeps the original); `gain` is rtk's own stats dump."""
     inst = tmp_path / cell / name / "inst"
     (inst / "verifier").mkdir(parents=True)
     (inst / "verifier" / "reward.txt").write_text("1")
     sess = inst / "agent" / "sessions" / "projects" / "-app"
     sess.mkdir(parents=True)
+    if gain is not None:
+        (inst / "agent" / "rtk-gain.json").write_text(json.dumps({"summary": gain}))
     lines = [{"type": "user", "timestamp": "2026-01-01T00:00:00Z",
               "message": {"role": "user", "content": "go"}}]
     for k, c in enumerate(cmds):
@@ -2357,13 +2362,21 @@ def _rtk_trial(tmp_path, cell, name, cmds):
                                                "input": {"command": c}}]}})
         lines.append({"type": "user", "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": f"t{k}", "content": "out"}]}})
+    for k, rewritten in enumerate(hook_rewrites):   # verbatim CC 2.1.228 attachment shape
+        lines.append({"type": "attachment", "attachment": {
+            "type": "hook_success", "hookName": "PreToolUse:Bash", "hookEvent": "PreToolUse",
+            "toolUseID": f"t{k}", "exitCode": 0, "stderr": "",
+            "command": "/root/.local/bin/rtk hook claude",
+            "stdout": json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecisionReason": "RTK auto-rewrite",
+                "updatedInput": {"command": rewritten}}}) + "\n"}})
     (sess / "s.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n")
 
 
 def test_rtk_inactive_guard_is_structural(tmp_path):
-    """rtk's hook returns updatedInput.command, so an ACTIVE trial stores `rtk git status` in
-    the recorded tool_use itself — a stronger signal than caveman's text marker. A trial that
-    ran Bash without any rtk prefix means the hook never fired: vanilla in disguise."""
+    """The Claude Code ≤2.0.x shape: the hook's updatedInput REPLACED the tool_use input, so an
+    active trial stores `rtk git status` in the recorded action itself. A trial that ran Bash
+    with no rtk prefix anywhere means the hook never fired: vanilla in disguise."""
     _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-00", ["rtk git status", "rtk pytest -q"])
     _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-01", ["git status", "pytest -q"])
     # ran no Bash at all — nothing for rtk to rewrite; that's the TASK's shape, not a failure
@@ -2374,6 +2387,37 @@ def test_rtk_inactive_guard_is_structural(tmp_path):
     assert report._rtk_inactive(runs) == 1, "exactly the un-prefixed trial is inactive"
     assert report._inactive_for("rtk", runs) == 1
     assert report._inactive_for("condense", runs) is None   # notion doesn't apply to a proxy
+
+
+def test_rtk_active_trial_is_not_flagged_when_cc_records_the_original_command(tmp_path):
+    """Claude Code 2.1.228 keeps the ORIGINAL command in the tool_use and records the rewrite
+    beside it, as a hook_success attachment. A guard that only knows the old shape calls a run
+    where rtk filtered every observation 'ran without the skill' — backwards, and on the
+    DEFAULT html renderer. The container installs Claude Code unpinned, so both shapes are
+    live artifacts and both must read as active."""
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-00", ["ls -la /app", "git status"],
+               hook_rewrites=["rtk ls -la /app", "rtk git status"])
+    # the hook fired but rewrote nothing it knows (rtk covers ~7% of commands) AND no rewrite
+    # landed anywhere: no evidence the intervention applied
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-01", ["python3 interp.py x.scm"])
+    runs = report.index_runs(str(tmp_path), "claude-code")["rtk-taskA"]["runs"]
+    assert report._rtk_inactive(runs) == 1, "the attachment-shaped trial is ACTIVE"
+
+
+def test_rtk_gain_outranks_the_transcript_and_catches_an_ignored_rewrite(tmp_path):
+    """`rtk gain` counts what rtk actually RAN, so it is the only artifact that separates 'the
+    hook emitted a rewrite' from 'the rewrite is what executed'. A Claude Code that stopped
+    honouring updatedInput would leave a transcript full of perfect rewrites and an rtk that
+    never ran a command — the arm would be vanilla in disguise while every transcript signal
+    said otherwise. So when the dump exists it is the ONLY signal consulted."""
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-00", ["ls -la /app"],
+               hook_rewrites=["rtk ls -la /app"], gain={"total_commands": 12, "total_saved": 9001})
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-01", ["ls -la /app"],
+               hook_rewrites=["rtk ls -la /app"], gain={"total_commands": 0, "total_saved": 0})
+    # rtk ran nothing, but neither did the agent — nothing to rewrite is the task's shape
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-02", [], gain={"total_commands": 0})
+    runs = report.index_runs(str(tmp_path), "claude-code")["rtk-taskA"]["runs"]
+    assert report._rtk_inactive(runs) == 1, "only the rewritten-but-never-executed trial"
 
 
 def test_rtk_inactive_warning_reaches_every_renderer():

@@ -414,29 +414,96 @@ def _caveman_inactive(runs):
     return n
 
 
+def _bash_cmds(path):
+    """Recorded Bash commands of one trial. Raises OSError/ValueError on an unreadable
+    transcript — the caller treats that as inactive rather than as evidence of activity."""
+    return [(a.get("input") or {}).get("command", "") for a in actions(path)
+            if a.get("type") == "tool_use" and a.get("name") == "Bash"]
+
+
+def _rtk_gain(path):
+    """rtk's OWN execution stats for this trial, or None when the run predates them.
+
+    `agent/rtk-gain.json` is dumped by harbor_agents/rtk_claude_code.py after the agent exits
+    (`rtk gain -f json`), and it counts commands rtk ACTUALLY RAN. That is the only artifact
+    that proves the intervention was HONORED rather than merely wired: the hook can emit a
+    perfect rewrite that Claude Code then ignores, and every transcript-side signal below
+    would still look active.
+    """
+    agent_dir = os.path.normpath(os.path.join(os.path.dirname(path), "..", "..", ".."))
+    try:
+        with open(os.path.join(agent_dir, "rtk-gain.json")) as fh:
+            return json.load(fh).get("summary") or {}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+
+
+def _rtk_hook_rewrote(path):
+    """Did rtk's PreToolUse hook return an rtk-prefixed command anywhere in this transcript?
+
+    Claude Code MOVED the rewrite out of the recorded action. Through 2.0.x the hook's
+    `updatedInput.command` replaced the tool_use input, so an active trial literally stored
+    `rtk git status`; by 2.1.228 the tool_use keeps the ORIGINAL command and the rewrite is
+    recorded next to it, in a `hook_success` attachment carrying the hook's stdout. Since the
+    container installs Claude Code unpinned, which shape a run has depends on the day it ran.
+
+    Weaker than _rtk_gain: this proves the hook fired and produced a rewrite, not that the
+    rewritten command is what executed. Used only for runs with no gain artifact.
+    """
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if '"hook_success"' not in line or "updatedInput" not in line:
+                    continue     # cheap reject: hook attachments are a fraction of a transcript
+                try:
+                    att = (json.loads(line).get("attachment") or {})
+                    out = json.loads(att.get("stdout") or "{}")
+                except json.JSONDecodeError:
+                    continue
+                cmd = (((out.get("hookSpecificOutput") or {}).get("updatedInput")
+                        or {}).get("command") or "")
+                if re.match(r"\s*rtk\s", cmd):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def _rtk_inactive(runs):
     """How many of these trials ran WITHOUT rtk actually rewriting anything.
 
-    The guard here is STRUCTURAL rather than a text-marker scan, and so stronger than
-    caveman's: rtk's PreToolUse hook returns `updatedInput.command`, so an active trial stores
-    `rtk git status` in the recorded tool_use ITSELF. A trial that issued Bash commands but
-    none carrying the rtk prefix means the hook never fired (missing binary, hook not wired,
-    Claude Code skipping hooks under --print) — vanilla in disguise, which would otherwise
-    score a clean ✓ "trajectory preserved" while measuring nothing at all.
+    The guard is STRUCTURAL rather than a text-marker scan, and so stronger than caveman's —
+    but WHERE the structure lives has moved, so it reads three signals, strongest first:
+
+      1. `rtk gain` stats dumped from the container: rtk counts what it RAN. >0 commands is
+         proof the rewrite was honored end to end. Present, it is the only signal consulted —
+         a transcript full of rewrites that rtk never executed is exactly the failure the
+         other two cannot see.
+      2. a `hook_success` attachment whose stdout carries an rtk-prefixed `updatedInput`
+         (Claude Code ≥2.1.x records the rewrite beside the unchanged tool_use).
+      3. the `rtk ` prefix in the recorded tool_use itself (Claude Code ≤2.0.x).
+
+    None of the three, on a trial that issued Bash, means the hook never fired (missing
+    binary, hook not wired, Claude Code skipping hooks under --print) — vanilla in disguise,
+    which would otherwise score a clean ✓ "trajectory preserved" while measuring nothing.
 
     A trial that ran NO Bash commands is not counted: rtk only wraps shell commands, so having
     nothing to rewrite is a property of the task, not a failed intervention.
     """
     n = 0
     for path, _reward, _m in runs:
+        gain = _rtk_gain(path)
         try:
-            acts = actions(path)
+            cmds = _bash_cmds(path)
         except (OSError, ValueError):
             n += 1
             continue
-        cmds = [(a.get("input") or {}).get("command", "") for a in acts
-                if a.get("type") == "tool_use" and a.get("name") == "Bash"]
-        if cmds and not any(re.match(r"\s*rtk\s", c or "") for c in cmds):
+        if not cmds:
+            continue
+        if gain is not None:
+            n += 0 if (gain.get("total_commands") or 0) > 0 else 1
+            continue
+        if not (any(re.match(r"\s*rtk\s", c or "") for c in cmds) or _rtk_hook_rewrote(path)):
             n += 1
     return n
 

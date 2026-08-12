@@ -142,13 +142,18 @@ RTK is a single Rust binary and is **deterministic** — rule-based filters, no 
 sampled. A `PreToolUse` hook rewrites a Bash command to its rtk equivalent (`git status` →
 `rtk git status`), rtk runs it, and only the filtered output reaches the model. Consequences:
 
-- **It rewrites the recorded actions.** `rtk hook claude` returns `updatedInput.command`, so
-  the transcript stores `rtk git status`, not `git status`. This is unique among the arms and
-  it is load-bearing: every command-shaped metric un-wraps first (`engine.unrtk`). Without
-  that, `rework_count` scores the arm a flawless **zero** on identical behaviour — its
-  read-only pattern is `^`-anchored so `rtk grep …` never matches, and it looks for
-  `cat`/`head`/`tail` by name while rtk renames all three to `rtk read`. That would be a
-  strawman *in RTK's favour*, the mirror image of the `headroom-kompress` warning above.
+- **Where the rewrite is recorded depends on the Claude Code build**, which the container does
+  not pin. Through **2.0.x** `updatedInput.command` replaced the tool_use input, so the
+  transcript stored `rtk git status`, not `git status` — unique among the arms and
+  load-bearing: every command-shaped metric un-wraps first (`engine.unrtk`). Without that,
+  `rework_count` scores the arm a flawless **zero** on identical behaviour — its read-only
+  pattern is `^`-anchored so `rtk grep …` never matches, and it looks for `cat`/`head`/`tail`
+  by name while rtk renames all three to `rtk read`. That would be a strawman *in RTK's
+  favour*, the mirror image of the `headroom-kompress` warning above. By **2.1.228** the
+  tool_use keeps the original command and the rewrite is recorded next to it, in a
+  `hook_success` attachment carrying the hook's stdout; `unrtk` then no-ops and the arm's
+  commands are recorded exactly like vanilla's. Old runs still hold the old shape, so both
+  are live artifacts — anything reading commands back must handle both.
 - **In full mode `comp` should be substantial**, unlike caveman's ~0 — it is attacking the
   part of the prefix that is actually large. Incremental is a different story; see the
   coverage numbers below.
@@ -195,10 +200,22 @@ commands rewritten. So rtk's numbers can be entirely correct while the whole-ses
 stays small — translating the former into the latter is precisely this bench's job, and full
 mode is what settles it.
 
-**Silent-inactivity guard.** Structurally stronger than caveman's marker scan: an *active*
-trial stores the `rtk` prefix in the recorded `tool_use` itself, so the report flags any trial
-that issued Bash commands with none carrying it (`⚠ n inactive`). A trial that ran no Bash at
-all is not counted — having nothing to rewrite is a property of the task. Container-side, the
+**Silent-inactivity guard.** Structurally stronger than caveman's marker scan, and read from
+three signals, strongest first:
+
+1. **`agent/rtk-gain.json`** — `rtk gain` dumped from the container after the agent exits. rtk
+   counts the commands it actually **ran**, so a non-zero count proves the rewrite was
+   *honoured*, not merely emitted. Present, it is the only signal consulted: a Claude Code
+   that stopped applying `updatedInput` would leave a transcript full of perfect rewrites and
+   an rtk that never executed one, and only this artifact can tell those apart.
+2. a **`hook_success` attachment** whose stdout carries an `rtk`-prefixed `updatedInput`
+   (Claude Code ≥2.1.x).
+3. the **`rtk` prefix in the recorded `tool_use`** itself (Claude Code ≤2.0.x).
+
+None of the three, on a trial that issued Bash, is flagged `⚠ n inactive`. A trial that ran no
+Bash at all is not counted — having nothing to rewrite is a property of the task. The guard
+keyed on signal 3 alone until a run under Claude Code 2.1.228 reported every trial inactive
+while rtk was demonstrably filtering every observation. Container-side, the
 agent smoke-tests both `rtk rewrite` and `rtk hook claude` and refuses to run if either stops
 rewriting. It deliberately wires the **native** `rtk hook claude` rather than upstream's
 `hooks/claude/rtk-rewrite.sh`, which shells out to `jq` and degrades to a silent no-op when jq
