@@ -1865,3 +1865,123 @@ def test_every_condense_arm_sorts_before_plain_condense():
             assert i < plain, f"{arm} must precede 'condense' in KNOWN_ARMS"
     for arm in ("condense-recover", "condense-prod-08-02", "condense"):
         assert split_cell(f"{arm}-dna-assembly") == (arm, "dna-assembly")
+
+
+def _mk_trial(cell, task, trial_id):
+    """Lay out a cell the way harbor does: <cell>/<timestamp>/<task>__<id>/."""
+    d = os.path.join(cell, "2026-08-12__17-50-57", f"{task}__{trial_id}")
+    os.makedirs(d, exist_ok=True)
+    return f"{task}__{trial_id}"
+
+
+def test_owned_trial_names_ignores_cells_this_run_did_not_launch(tmp_path):
+    """The reaper's scope comes from the cells THIS process launched, not from the output
+    directory — two concurrent runs share one output directory (different arms), so globbing
+    the directory would hand each run the other's trials."""
+    from minmax_bench.quality import generate as gen
+
+    out = str(tmp_path)
+    mine, theirs = f"{out}/condense-regex-chess", f"{out}/rtk-regex-chess"
+    a = _mk_trial(mine, "regex-chess", "aaaaaaa")
+    b = _mk_trial(theirs, "regex-chess", "bbbbbbb")
+    gen._OWNED_CELLS[:] = [(mine, "regex-chess")]
+    try:
+        assert gen._owned_trial_names() == {a}
+        assert b not in gen._owned_trial_names()
+    finally:
+        gen._OWNED_CELLS[:] = []
+
+
+def test_owns_anchors_on_the_trial_prefix_not_a_bare_env_marker():
+    """Harbor marks EVERY run's trial resources with `__env`, so matching that marker alone
+    is a global kill switch. Ownership must anchor on this run's own trial name."""
+    from minmax_bench.quality import generate as gen
+
+    owned = {"regex-chess__aaaaaaa"}
+    assert gen._owns("regex-chess__aaaaaaa__env-main-1", owned)
+    assert gen._owns("regex-chess__aaaaaaa__env_default", owned)
+    # another run's trial of the SAME task carries the same marker and must not match
+    assert not gen._owns("regex-chess__bbbbbbb__env-main-1", owned)
+    assert not gen._owns("schemelike-metacircular-eval__ccccccc__env-main-1", owned)
+
+
+def test_reap_docker_leaves_a_concurrent_runs_containers_alone(tmp_path, monkeypatch):
+    """The regression this guards: condense finishing used to `docker rm -f` every container
+    matching `name=__env`, which killed the rtk run's live trials mid-flight."""
+    import subprocess as sp
+    from minmax_bench.quality import generate as gen
+
+    out = str(tmp_path)
+    mine, theirs = f"{out}/condense-regex-chess", f"{out}/rtk-regex-chess"
+    _mk_trial(mine, "regex-chess", "aaaaaaa")
+    _mk_trial(theirs, "regex-chess", "bbbbbbb")
+
+    removed = []
+    ps = ("c1\tregex-chess__aaaaaaa__env-main-1\n"      # ours, leaked
+          "c2\tregex-chess__bbbbbbb__env-main-1\n"      # the other run's, LIVE
+          "c3\tsome-unrelated-project\n")
+    nets = ("n1\tregex-chess__aaaaaaa__env_default\n"
+            "n2\tregex-chess__bbbbbbb__env_default\n")
+
+    def fake_run(cmd, *a, **kw):
+        if cmd[:2] == ["docker", "ps"]:
+            return SimpleNamespace(stdout=ps, returncode=0)
+        if cmd[:3] == ["docker", "network", "ls"]:
+            return SimpleNamespace(stdout=nets, returncode=0)
+        removed.extend(x for x in cmd
+                       if not x.startswith("-") and x not in ("docker", "rm", "network"))
+        return SimpleNamespace(stdout="", returncode=0)
+
+    monkeypatch.setattr(gen.shutil, "which", lambda _x: "/usr/bin/docker")
+    monkeypatch.setattr(sp, "run", fake_run)
+    monkeypatch.setattr(gen.subprocess, "run", fake_run)
+    gen._HARBOR[0] = None
+    gen._OWNED_CELLS[:] = [(mine, "regex-chess")]
+    try:
+        gen._reap_docker()
+    finally:
+        gen._OWNED_CELLS[:] = []
+    assert removed == ["c1", "n1"], removed
+    assert "c2" not in removed and "n2" not in removed
+
+
+def test_reap_docker_is_a_noop_when_this_run_owns_nothing(tmp_path, monkeypatch):
+    """A dry run, or a run that dies before launching a cell, must not touch docker at all —
+    otherwise it reaps on an empty scope and the listing itself is wasted work."""
+    from minmax_bench.quality import generate as gen
+
+    called = []
+    monkeypatch.setattr(gen.shutil, "which", lambda _x: "/usr/bin/docker")
+    monkeypatch.setattr(gen.subprocess, "run", lambda cmd, *a, **kw: called.append(cmd))
+    gen._HARBOR[0] = None
+    gen._OWNED_CELLS[:] = []
+    gen._reap_docker()
+    assert called == []
+
+
+def test_owned_trial_names_match_dockers_rewritten_project_name(tmp_path):
+    """Compose project names must be lowercase [a-z0-9_-], so harbor rewrites the trial name
+    on the way to docker while the trial DIRECTORY keeps the original spelling. Matching the
+    directory verbatim reaped nothing for any trial whose id had a capital or whose task had
+    a dot — which is most of them."""
+    from minmax_bench.quality import generate as gen
+
+    cell = f"{tmp_path}/condense-install-windows-3.11"
+    _mk_trial(cell, "install-windows-3.11", "Uqfdbb5")
+    gen._OWNED_CELLS[:] = [(cell, "install-windows-3.11")]
+    try:
+        names = gen._owned_trial_names()
+        assert names == {"install-windows-3-11__uqfdbb5"}      # dot -> dash, id lowercased
+        assert gen._owns("install-windows-3-11__uqfdbb5__env-main-1", names)
+        assert gen._owns("install-windows-3-11__uqfdbb5__env_default", names)
+    finally:
+        gen._OWNED_CELLS[:] = []
+
+
+def test_compose_project_matches_harbors_own_sanitiser():
+    """Kept deliberately in lockstep with harbor's _sanitize_docker_compose_project_name; if
+    harbor's rule changes, ownership silently stops matching and the reaper goes quiet."""
+    from minmax_bench.quality.generate import _compose_project
+    assert _compose_project("regex-chess__4jcXe5e") == "regex-chess__4jcxe5e"
+    assert _compose_project("install-windows-3.11__aB") == "install-windows-3-11__ab"
+    assert _compose_project("_leading-underscore") == "0_leading-underscore"
