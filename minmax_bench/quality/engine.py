@@ -23,6 +23,7 @@ Template = a real CC request captured via a local recording server (has the
 version-matched system prompt, tools, beta headers, thinking/context_management
 config). mcp__* tools are dropped by default (container runs had plain CC tools).
 """
+import contextlib
 import copy
 import difflib
 import json
@@ -274,18 +275,19 @@ def check_arms(arms, env):
     """
     problems = []
     for arm in arms:
-        # caveman is a client-side generation policy, not an endpoint: it reaches the model
-        # through control's transport (see caveman_api_arm) and applies its ruleset + free-run
-        # correction in-process. So it needs control's auth, checked below, but no ARMS entry.
-        if arm == "caveman" or arm in ARMS:
+        # caveman and rtk are client-side methods, not endpoints: both reach the model through
+        # control's transport (see api_arm_for) and do their work in-process — caveman rewrites
+        # the prose it generates, rtk filters the observations it reads back. So they need
+        # control's auth, checked below, but no ARMS entry of their own.
+        if arm in CLIENT_SIDE_ARMS or arm in ARMS:
             continue
         problems.append(f"arm {arm!r} has no replay endpoint "
-                        f"(known: {', '.join(sorted(ARMS))}, caveman)")
+                        f"(known: {', '.join(sorted(ARMS))}, {', '.join(CLIENT_SIDE_ARMS)})")
     # Credentials are a property of the ENDPOINT, and caveman has none of its own — it rides
     # control's. Checking the literal arm name here would ask a bedrock-only user for an
     # Anthropic key that `--arms caveman` never uses (control is the bedrock entry, caveman
     # resolves to it), aborting the run on auth it does not need.
-    arms = [caveman_api_arm(a) for a in arms]
+    arms = [api_arm_for(a) for a in arms]
     needs_anthropic_auth = any(not ARMS.get(a, {}).get("bedrock") for a in arms)
     if needs_anthropic_auth and not auth_mode(env):
         problems.append(
@@ -781,10 +783,20 @@ _CAVEMAN_MARKER = "CAVEMAN MODE ACTIVE"
 _caveman_ruleset_cache: dict = {}
 
 
-def caveman_api_arm(arm):
-    """The endpoint an arm's requests go to. caveman is not a proxy — it rides control's
-    transport (api.anthropic.com / the bedrock upstream) and does its work client-side."""
-    return "control" if arm == "caveman" else arm
+# Arms that are not proxies: they ride control's transport (api.anthropic.com / the bedrock
+# upstream) and do their work client-side. caveman rewrites the prose it generates; rtk
+# filters the observations it reads back. Neither has an endpoint of its own, so neither has
+# credentials of its own — api_arm_for is what keeps check_arms from demanding an Anthropic
+# key for them when control is on bedrock.
+CLIENT_SIDE_ARMS = ("caveman", "rtk")
+
+
+def api_arm_for(arm):
+    """The endpoint an arm's requests actually go to."""
+    return "control" if arm in CLIENT_SIDE_ARMS else arm
+
+
+caveman_api_arm = api_arm_for  # back-compat: the name predates rtk joining the same class
 
 
 def caveman_ruleset(mode="full"):
@@ -941,6 +953,400 @@ def norm_ws(s):
 _CD_PREFIX = re.compile(r"(?:^|(?<=&&)|(?<=;))\s*cd\s+\S+\s*&&\s*")
 _SEG_SPLIT = re.compile(r"&&|\|\||;|\n|\|")
 
+# ------------------------------------------------------------------ rtk (observation transform)
+# RTK rewrites Bash commands IN PLACE via a PreToolUse hook (`git status` -> `rtk git status`),
+# so a trial run under the rtk arm records WRAPPED commands. Every command-shaped metric has to
+# see through the wrapper, or the arm is scored on spelling instead of behaviour:
+#   - report.rework_count matches read-only programs with a ^-anchored regex and looks for
+#     cat/head/tail by name, so `rtk grep …` / `rtk read …` score ZERO rework — flattering the
+#     arm on one of the three headline full-mode verdicts (a strawman in its favour);
+#   - score() compares the program sequence, so replaying a session recorded by someone who runs
+#     rtk globally (the incremental picker reads ~/.claude/projects) would read every Bash step
+#     as divergence.
+# Derived from the PINNED binary, not guessed — `rtk rewrite <cmd>` at v0.44.0 emits
+# `rtk <same-program> <rest>` for every supported command EXCEPT cat/head/tail, which all
+# collapse to `rtk read`. tests/test_quality.py re-derives this from the real binary when it is
+# on PATH, so a pin bump that adds a rename trips there instead of silently skewing a metric.
+RTK_ALIASES = {"read": "cat"}  # `rtk read` <- cat | head | tail
+# `rtk` only counts at the start of a shell segment, so `cargo install rtk` and `grep rtk f`
+# are left alone. Optional global flags (-u/--ultra-compact/-v) are peeled with it.
+_RTK_CALL = re.compile(
+    r"(^|[|&;\n]\s*)rtk\s+(?:-{1,2}[a-zA-Z][\w-]*\s+)*([a-zA-Z][\w.-]*)")
+
+
+def unrtk(cmd):
+    """Unwrap RTK's command rewriting: `rtk git status` -> `git status`, `rtk read a.py` ->
+    `cat a.py`. Commands RTK never touched pass through unchanged.
+
+    Recovery is exact for the wrapper case and for the cat rename. It is NOT exact where RTK
+    RESTRUCTURES arguments (`head -20 a.py` -> `rtk read a.py --max-lines 20` normalizes to
+    `cat a.py --max-lines 20`, not back to `head`): the program and the target file are
+    recovered — which is what every metric here keys on — but the flag spelling is not.
+    """
+    return _RTK_CALL.sub(
+        lambda m: f"{m.group(1)}{RTK_ALIASES.get(m.group(2), m.group(2))}", str(cmd))
+
+
+# ------------------------------------------------------- rtk incremental (observation replay)
+# Incremental applies RTK the way `rtk pipe` does: post-filter the RECORDED tool_result text.
+# That is a first-class rtk mode (`pytest | rtk pipe --filter pytest`), not an improvisation —
+# which is what makes this arm's replay honest. Two properties make it far simpler than
+# caveman's:
+#   - the transform is DETERMINISTIC and independent of anything the model says, so the whole
+#     session is transformed ONCE up front and then teacher-forced exactly like control. No
+#     per-step state machine, no free-running, and none of caveman's prose/action stapling.
+#   - it touches only tool_result CONTENT. Actions, prose, thinking and the step set are
+#     untouched, so the arm is paired with control step-for-step by construction.
+#
+# The approximation to be honest about: the real hook makes rtk RUN the command (it may pass
+# different flags upstream, e.g. --porcelain), whereas here rtk filters output produced by the
+# unwrapped command. Same filter, slightly different input. Documented in docs/quality.md.
+RTK_BIN = os.environ.get("RTK_BIN", "rtk")
+_rtk_filters_cache: list = []
+# a single `|` (a real pipe), not the `||` operator
+_PIPE_INTO = re.compile(r"(?<!\|)\|(?!\|)")
+
+
+def rtk_version():
+    """The local rtk's version string ('0.44.0'), or None if the binary is missing/unusable."""
+    try:
+        p = subprocess.run([RTK_BIN, "--version"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    parts = (p.stdout or "").split()          # "rtk 0.44.0"
+    return parts[1] if len(parts) > 1 else (p.stdout or "").strip() or None
+
+
+def rtk_available():
+    """Is the rtk binary usable? Incremental needs it locally (the transform runs on the host,
+    like condense's `dense` CLI); full mode does not — the container installs its own pin."""
+    return rtk_version() is not None
+
+
+def rtk_filters():
+    """The pipe filters this rtk build ships, asked of the BINARY rather than hardcoded.
+
+    rtk lists them in the error for an unknown filter. Querying keeps the mapping correct
+    across a pin bump instead of rotting against a table we'd have to remember to update.
+    """
+    if not _rtk_filters_cache:
+        # a name no real filter can collide with (rtk names are lowercase words/hyphens)
+        p = subprocess.run([RTK_BIN, "pipe", "--filter", "__minmax_probe__"],
+                           input="", capture_output=True, text=True, timeout=15)
+        blob = (p.stderr or "") + (p.stdout or "")
+        _, _, tail = blob.partition("Available:")
+        names = [n.strip().rstrip(".") for n in tail.split(",")]
+        _rtk_filters_cache.extend(sorted({n for n in names if n and " " not in n}))
+    return _rtk_filters_cache
+
+
+def rtk_filter_for(command):
+    """The pipe filter rtk would apply to ``command``, or None if rtk has no equivalent.
+
+    Derived through `rtk rewrite` — the registry the PreToolUse hook itself delegates to, so
+    incremental and full agree on WHICH commands rtk touches. The rewrite is
+    `rtk <subcommand path> <rest>`, and a filter is that path joined with '-' (git status ->
+    git-status, cargo test -> cargo-test, pytest -> pytest); try longest first so `git log`
+    picks git-log rather than a bare git. Not every rewritable command has a PIPE filter (rtk
+    ls has none), and those go untransformed rather than being faked.
+
+    Compound commands matter here, because agents write `cd <dir> && pytest -q` constantly:
+    rtk rewrites the INNER segment (`cd /tmp && rtk pytest -q`), so the rtk call is looked for
+    per segment rather than only at the start. When SEVERAL segments are rewritten
+    (`ls && grep x` -> `rtk ls && rtk grep x`) the recorded output is two commands' output
+    concatenated, and no single pipe filter can express that — so that returns None and the
+    observation is left alone. Skipping is the honest failure: a wrong filter would mangle a
+    real observation while reporting it as a saving.
+    """
+    rew = rtk_rewrite(command)
+    return _rtk_pipe_filter(rew) if rew else None
+
+
+def _rtk_pipe_filter(rewritten):
+    """The pipe filter for an already-rewritten command (see rtk_filter_for for the rules)."""
+    # A real pipe means the recorded output was post-processed by ANOTHER program
+    # (`pytest -q | head -20`), so it is not what the filter expects. rtk v0.44 declines to
+    # rewrite these itself; v0.43 rewrites them — refuse here so the arm behaves the same
+    # whichever binary is on the host.
+    if _PIPE_INTO.search(rewritten):
+        return None
+    avail, hits = set(rtk_filters()), []
+    for seg in _SEG_SPLIT.split(rewritten):
+        toks = [t for t in seg.split() if not t.startswith("-")]
+        if not toks or toks[0] != "rtk":
+            continue
+        path = toks[1:]
+        hits.append(next((c for c in ("-".join(path[:n]) for n in range(len(path), 0, -1))
+                          if c in avail), None))
+    real = [h for h in hits if h]
+    # exactly one filterable rtk call in the pipeline, or nothing we can express
+    return real[0] if len(real) == 1 and len(hits) == 1 else None
+
+
+def rtk_rewrite(command):
+    """What rtk's PreToolUse hook would rewrite ``command`` to, or None if it has no
+    equivalent. This is the registry the hook itself delegates to, so it is the ground truth
+    for WHICH commands rtk touches — full and incremental agree by construction."""
+    try:
+        p = subprocess.run([RTK_BIN, "rewrite", str(command)],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # 0 = rewrite (auto-allow), 3 = rewrite (ask); 1 = no rtk equivalent, 2 = denied
+    if p.returncode not in (0, 3) or not p.stdout.strip():
+        return None
+    return p.stdout.strip()
+
+
+def _rtk_read_call(rewritten):
+    """Parse `rtk read <path> [flags]` out of a rewritten command -> (path, flags), else None.
+
+    This is the branch that lets replay run the REAL rtk command instead of approximating it:
+    for a file read the recorded output IS the file's content, so it can be materialized and
+    handed to rtk verbatim. Only a single-path read qualifies — `rtk read a.py b.py` produces
+    output for two files that the recording concatenated, and splitting that back apart would
+    be guesswork.
+    """
+    import shlex
+    if _PIPE_INTO.search(rewritten):
+        return None                    # output was post-processed by another program
+    # scan SEGMENTS, not just the head: agents write `cd <dir> && cat x` constantly and rtk
+    # rewrites the inner segment. More than one rtk call means several commands' output was
+    # concatenated into this observation — not reconstructable, so decline.
+    segs = [s for s in _SEG_SPLIT.split(rewritten) if s.split()[:1] == ["rtk"]]
+    if len(segs) != 1:
+        return None
+    try:
+        toks = shlex.split(segs[0])
+    except ValueError:
+        return None
+    if len(toks) < 3 or toks[1] != "read":
+        return None
+    rest = toks[2:]
+    paths = [t for t in rest if not t.startswith("-")]
+    # `rtk read a.py --max-lines 20`: the path leads, flag VALUES follow their flag
+    if not paths or rest[0].startswith("-"):
+        return None
+    path, flags = rest[0], rest[1:]
+    if any(not t.startswith("-") and t != path and rest[rest.index(t) - 1][:1] != "-"
+           for t in paths if t != path):
+        return None          # a second bare path — two files, can't reconstruct
+    return path, flags
+
+
+def rtk_read_file(content, path, flags, timeout=30):
+    """Run the REAL `rtk read` against recorded file content.
+
+    The content is materialized under the ORIGINAL file's extension, because rtk's read
+    filters are type-aware — handing it a suffix-less temp file would measure a different
+    code path than the one a real run takes.
+
+    Note what is deliberately NOT done: no `--level` is added. The hook rewrites `cat a.py`
+    to a bare `rtk read a.py`, whose default level is "none" (full content) — so this usually
+    returns the content unchanged, and that IS the faithful answer. Passing `--level
+    aggressive` would cut ~94%, but it would be measuring a method rtk's hook does not
+    implement.
+    """
+    import tempfile
+    suffix = os.path.splitext(path)[1] or ".txt"
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False,
+                                         encoding="utf-8") as fh:
+            fh.write(str(content))
+            tmp = fh.name
+        p = subprocess.run([RTK_BIN, "read", tmp, *flags],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return str(content)
+    finally:
+        if tmp:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+    if p.returncode != 0 or not p.stdout.strip():
+        return str(content)
+    # rtk prints the temp path in its header; put the real one back so the observation reads
+    # exactly as it would have in the container
+    return p.stdout.replace(os.path.basename(tmp), os.path.basename(path)).replace(tmp, path)
+
+
+def rtk_apply(command, recorded_output):
+    """Apply rtk to one recorded observation -> (output, mode).
+
+    Prefers running the REAL rtk command over approximating it:
+
+      'read' — a file read (`cat`/`head`/`tail` -> `rtk read`). The recorded output is the
+               file's content, so it is materialized and the actual rtk command runs on it.
+               Exact, and covers commands no pipe filter reaches.
+      'pipe' — rtk post-processes the command's stdout (`pytest`, `grep`, …). Exact where
+               that is genuinely rtk's mechanism; approximate for the few commands where rtk
+               re-invokes the tool with its own format (`git log`, `git status`).
+      None   — rtk has no equivalent, or its input cannot be reconstructed from a transcript
+               (`rtk ls`, `rtk wc` need a real filesystem). The observation is left verbatim.
+
+    Returning the recorded text unchanged on every failure path is deliberate: dropping an
+    observation would read as a spectacular saving while destroying the trajectory.
+    """
+    rew = rtk_rewrite(unrtk(command))
+    if not rew:
+        return str(recorded_output), None
+    spec = _rtk_read_call(rew)
+    if spec:
+        path, flags = spec
+        return rtk_read_file(recorded_output, path, flags), "read"
+    filt = _rtk_pipe_filter(rew)
+    if filt:
+        return rtk_pipe(recorded_output, filt), "pipe"
+    return str(recorded_output), None
+
+
+def rtk_pipe(text, filt, timeout=30):
+    """Filter recorded output through `rtk pipe --filter <filt>`. Returns the original text
+    unchanged if rtk fails — a broken filter must not silently DELETE an observation, which
+    would look like a spectacular saving while destroying the trajectory."""
+    try:
+        p = subprocess.run([RTK_BIN, "pipe", "--filter", filt], input=str(text),
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return str(text)
+    return p.stdout if p.returncode == 0 and p.stdout.strip() else str(text)
+
+
+_enc = []
+
+
+def _tokens(text):
+    """Token count for a string. cl100k is not Claude's tokenizer, so absolute counts are
+    approximate — but every number below is a RATIO of two counts under the same encoder,
+    and that is robust to the encoder choice."""
+    if not _enc:
+        import tiktoken
+        _enc.append(tiktoken.get_encoding("cl100k_base"))
+    return len(_enc[0].encode(str(text), disallowed_special=()))
+
+
+def transcript_tokens(msgs):
+    """Tokens in a whole message list — 'how big is this conversation', each token once."""
+    return sum(_tokens(json.dumps(m)) for m in msgs)
+
+
+def billed_tokens(msgs, points):
+    """Tokens you would actually SEND across a session: the sum of every decision point's
+    prefix. Each step resends everything before it, so an early saving is re-banked on every
+    later turn — which is exactly why this, not the flat transcript size, is the number that
+    matches a bill. Returns (total, per_step_prefix_sizes).
+    """
+    sizes, running, j = [], 0, 0
+    for i in points:
+        while j < i:
+            running += _tokens(json.dumps(msgs[j]))
+            j += 1
+        sizes.append(running)
+    return sum(sizes), sizes
+
+
+def rtk_savings(orig_msgs, new_msgs, points):
+    """End-to-end token saving of a transform, computed OFFLINE — no API calls, no spend.
+
+    rtk's transform is deterministic and independent of anything the model says, so the token
+    saving is fully knowable before replaying a single step. That decouples the two questions
+    the arm actually asks:
+
+      - "how much smaller is the context?"  -> exactly this, free, over the WHOLE session;
+      - "does the smaller context change the next decision?" -> the replay, which spends.
+
+    The replay's own `comp` measures the first from real API usage, but only over the steps
+    that fit in the budget; this covers everything. Reported together they cross-check.
+
+    Returns {'transcript': (before, after), 'billed': (before, after)} — `transcript` counts
+    each token once, `billed` weights by how many turns re-send it.
+    """
+    tb, ta = transcript_tokens(orig_msgs), transcript_tokens(new_msgs)
+    bb, _ = billed_tokens(orig_msgs, points)
+    ba, _ = billed_tokens(new_msgs, points)
+    return {"transcript": (tb, ta), "billed": (bb, ba)}
+
+
+def _result_text(block):
+    """A tool_result's text, whichever shape it is stored in (str, or a content-block list)."""
+    c = block.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "".join(b.get("text", "") for b in c
+                       if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _set_result_text(block, text):
+    """Write text back in the shape it came in, so nothing downstream has to special-case."""
+    if isinstance(block.get("content"), list):
+        out, done = [], False
+        for b in block["content"]:
+            if isinstance(b, dict) and b.get("type") == "text":
+                if done:
+                    continue          # several text blocks collapse into the filtered one
+                b, done = {**b, "text": text}, True
+            out.append(b)
+        block["content"] = out
+    else:
+        block["content"] = text
+
+
+def rtk_transform_session(msgs, points=None):
+    """Apply RTK to a recorded session: shrink Bash tool_result content, touch nothing else.
+
+    Returns ``(new_msgs, stats)`` — a NEW message list (the input is not mutated) plus
+    {'filtered', 'skipped', 'bytes_before', 'bytes_after', 'modes'}. ``filtered`` counts
+    observations rtk actually shrank; ``skipped`` counts Bash results whose rtk input could
+    not be reconstructed from a transcript (`rtk ls` needs a real filesystem) — those pass
+    through verbatim rather than being faked. ``modes`` splits the applied ones by HOW rtk was
+    run: 'read' ran the real command against materialized content, 'pipe' post-filtered.
+
+    Only Bash tool_use results are candidates: rtk wraps shell commands, so a Read/Edit result
+    is none of its business. The action, its arguments, the prose and the step set are all
+    left exactly as recorded, which is what pairs this arm with control step-for-step.
+    """
+    out = copy.deepcopy(list(msgs))
+    cmd_by_id, stats = {}, {"filtered": 0, "skipped": 0, "bytes_before": 0, "bytes_after": 0,
+                            "modes": {}}
+    for m in out:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        if m.get("role") == "assistant":
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Bash":
+                    cmd = (b.get("input") or {}).get("command")
+                    if cmd:
+                        cmd_by_id[b.get("id")] = cmd
+            continue
+        for b in content:
+            if not (isinstance(b, dict) and b.get("type") == "tool_result"):
+                continue
+            cmd = cmd_by_id.get(b.get("tool_use_id"))
+            if not cmd:
+                continue                       # not a Bash result — rtk does not touch it
+            before = _result_text(b)
+            if not before.strip():
+                continue
+            # rtk_apply runs the REAL rtk command wherever its input can be reconstructed
+            # (file reads, via the recorded content) and falls back to pipe-filtering only
+            # where post-processing stdout is genuinely rtk's mechanism.
+            after, mode = rtk_apply(cmd, before)
+            if mode is None:
+                stats["skipped"] += 1
+                continue
+            stats["bytes_before"] += len(before)
+            stats["bytes_after"] += len(after)
+            stats["modes"][mode] = stats["modes"].get(mode, 0) + 1
+            if after != before:
+                stats["filtered"] += 1
+                _set_result_text(b, after)
+    return out, stats
+
 
 def _norm_cmd(cmd, cwd="/app"):
     """Strip replay cwd artifacts: `cd <dir> && ` prefixes and absolute-cwd paths.
@@ -948,8 +1354,11 @@ def _norm_cmd(cmd, cwd="/app"):
     A replayed model that is unsure of its cwd defensively writes `cd /app && python x`
     or `-I/app` where the original wrote `python x` / `-I.` — same action, different
     phrasing. Normalizing both sides keeps the comparison about the decision.
+
+    RTK's wrapper is the same kind of artifact — `rtk git status` IS `git status`, decided
+    identically — so it is peeled here too (see unrtk).
     """
-    c = _CD_PREFIX.sub("", str(cmd))
+    c = unrtk(_CD_PREFIX.sub("", str(cmd)))
     base = (cwd or "").rstrip("/")
     if base:  # a root cwd ("/") would strip every slash — skip the path rewrite then
         c = c.replace(base + "/", "").replace(base, ".")

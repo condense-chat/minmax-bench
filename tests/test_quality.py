@@ -3,6 +3,7 @@
 These metrics produce the repo's public findings — they deserve the same test
 surface as the cost bench.
 """
+import copy
 import io
 import json
 import os
@@ -1498,11 +1499,11 @@ def test_caveman_inactive_warning_reaches_every_renderer(tmp_path):
                                             milestone=None, milestone_ok=None, incr=None)}}]}
     _head, rows = report.table(d)
     assert any("inactive" in c[0] for row in rows for c in row), "missing from markdown"
-    assert "ran without the skill" in report._html_report_body(d), "missing from html"
+    assert "ran without the intervention" in report._html_report_body(d), "missing from html"
     from rich.console import Console as _C
     con = _C(file=__import__("io").StringIO(), width=200, force_terminal=False)
     report._full_table(con, d, "m")
-    assert "without the skill" in con.file.getvalue(), "missing from console"
+    assert "without the intervention" in con.file.getvalue(), "missing from console"
 
 
 _STAT = {"n": 2, "attempted": 2, "lost": 0, "started": 2, "solve": 2, "rework": (0, 0, 0),
@@ -1985,3 +1986,523 @@ def test_compose_project_matches_harbors_own_sanitiser():
     assert _compose_project("regex-chess__4jcXe5e") == "regex-chess__4jcxe5e"
     assert _compose_project("install-windows-3.11__aB") == "install-windows-3-11__ab"
     assert _compose_project("_leading-underscore") == "0_leading-underscore"
+
+
+def test_unrtk_unwraps_the_rewrite_without_false_positives():
+    """RTK rewrites Bash commands in place (`git status` -> `rtk git status`), so every
+    command-shaped metric must see through the wrapper. Recovery must not fire on a command
+    that merely mentions rtk."""
+    assert eng.unrtk("rtk git status") == "git status"
+    assert eng.unrtk("rtk -u pytest -q") == "pytest -q"          # global flags peeled too
+    assert eng.unrtk("cd /app && rtk git log") == "cd /app && git log"   # mid-pipeline segment
+    assert eng.unrtk("rtk read a.py") == "cat a.py"              # the one rename rtk performs
+    # NOT rewrites — rtk appears, but never as the program of a segment
+    for untouched in ("cargo install rtk", "grep rtk file.py", 'echo "rtk git status"'):
+        assert eng.unrtk(untouched) == untouched, untouched
+    # restructuring is recovered only as far as program + target (documented in unrtk)
+    assert eng.unrtk("rtk read a.py --max-lines 20") == "cat a.py --max-lines 20"
+
+
+def test_rtk_wrapped_commands_are_not_flattered_on_rework():
+    """Regression, and the reason this normalization exists. rework_count's RO pattern is
+    ^-anchored (so `rtk grep …` never matched) and CAT looks for cat/head/tail by name (so
+    `rtk read …` never matched) — identical redundant behaviour scored 2 for vanilla and 0
+    for rtk, handing the arm a flawless score on a headline verdict by pure spelling."""
+    def bash(c):
+        return {"type": "tool_use", "name": "Bash", "input": {"command": c}}
+    behaviour = ["grep -rn foo .", "grep -rn foo .", "cat a.py", "cat a.py"]
+    as_rtk = ["rtk grep -rn foo .", "rtk grep -rn foo .", "rtk read a.py", "rtk read a.py"]
+    plain = report.rework_count([bash(c) for c in behaviour])
+    wrapped = report.rework_count([bash(c) for c in as_rtk])
+    assert plain == 2, "fixture no longer exercises rework"
+    assert wrapped == plain, "rtk-wrapped rework must score the same as the plain spelling"
+
+
+def test_rtk_wrapper_is_not_scored_as_trajectory_divergence():
+    """Replaying a session recorded by someone who runs rtk globally (the incremental picker
+    reads ~/.claude/projects) must not read every Bash step as a different decision."""
+    def bash(c):
+        return {"type": "tool_use", "name": "Bash", "input": {"command": c}}
+    for plain, wrapped in [("git status", "rtk git status"), ("pytest -q", "rtk pytest -q"),
+                           ("cargo test", "rtk cargo test"), ("cat a.py", "rtk read a.py")]:
+        _exact, action, _sim = eng.score(bash(plain), bash(wrapped), cwd="/app")
+        assert action, f"{plain!r} vs {wrapped!r} scored as divergence"
+    # a genuinely different decision still diverges — the unwrap must not collapse everything
+    _e, action, _s = eng.score(bash("git status"), bash("rtk pytest -q"), cwd="/app")
+    assert not action
+
+
+def test_rtk_alias_table_still_matches_the_pinned_binary():
+    """Tripwire on a pin bump. RTK_ALIASES says cat/head/tail are the ONLY commands whose
+    program name changes under rewrite; every other supported command keeps it. That was
+    derived from the pinned binary, so re-derive it whenever rtk is on PATH — a new rename
+    upstream would otherwise silently skew rework and fidelity for the arm."""
+    import shutil
+    import subprocess
+    rtk = shutil.which("rtk")
+    if not rtk:
+        pytest.skip("rtk not installed — the alias table is checked when the binary is present")
+    probes = ["cat a.py", "head -20 a.py", "tail -20 a.py", "grep -rn x .", "rg x",
+              "find . -name x", "ls -la", "wc -l a.py", "tree src", "diff a b",
+              "git status", "pytest -q", "cargo test", "npm run build"]
+    renames = {}
+    for cmd in probes:
+        p = subprocess.run([rtk, "rewrite", cmd], capture_output=True, text=True, timeout=30)
+        if p.returncode not in (0, 3) or not p.stdout.strip():
+            continue  # rtk has no equivalent for this one — nothing to unwrap
+        parts = p.stdout.split()
+        assert parts[0] == "rtk", f"unexpected rewrite shape: {p.stdout!r}"
+        src, dst = cmd.split()[0], parts[1]
+        if src != dst:
+            renames[dst] = "cat" if dst == "read" else src
+    assert renames == eng.RTK_ALIASES, (
+        f"pinned rtk renames {renames}, RTK_ALIASES says {eng.RTK_ALIASES} — a rewrite rule "
+        "changed upstream; update RTK_ALIASES (and re-run every rtk cell, it changes the method)")
+
+
+def test_rtk_arm_is_not_a_proxy():
+    """rtk must reach api.anthropic.com directly. Routing it through a proxy would silently
+    hand it the ~8-9k non-default-base-URL wiring cost that vanilla-proxy exists to isolate,
+    making every token/cost number incomparable to vanilla."""
+    from minmax_bench.quality import generate as gen
+    base, allow, agent, extra = gen._arm_wiring("rtk", {})
+    assert base == "https://api.anthropic.com" and allow == "api.anthropic.com"
+    assert agent == "harbor_agents.rtk_claude_code:RtkClaudeCode"
+    assert extra == []           # no knob: rtk's hook path has no intensity level
+    assert gen._validate_full(SimpleNamespace(arms="rtk", dry_run=True),
+                              {"ANTHROPIC_API_KEY": "k"}) == ["vanilla", "rtk"]
+
+
+def test_rtk_pin_agrees_across_both_sources():
+    """The pin lives in two places that can't import each other: the harbor agent (what
+    installs) and generate.py (the preflight probe). A bump in one alone fails silently — the
+    binary would install at one version while the preflight green-lights another."""
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    agent_src = open(os.path.join(root, "harbor_agents", "rtk_claude_code.py")).read()
+    agent_ref = re.search(r'RTK_REF\s*=\s*"([^"]+)"', agent_src).group(1)
+    agent_sha = re.search(r'RTK_SHA\s*=\s*"([0-9a-f]{40})"', agent_src).group(1)
+    from minmax_bench.quality import generate as gen
+    assert agent_ref == gen.RTK_PIN, "pin TAG disagrees between the agent and the preflight"
+    assert agent_ref in gen.RTK_RELEASE_PROBE, "preflight probes a different release than installs"
+    assert len(agent_sha) == 40
+    # the asset the preflight probes must be one the agent actually knows how to install
+    assets = re.findall(r'"(rtk-[a-z0-9_.-]+\.tar\.gz)"', agent_src)
+    assert any(a in gen.RTK_RELEASE_PROBE for a in assets), "probe asset is not in RTK_ASSETS"
+
+
+def _rtk_or_skip():
+    if not eng.rtk_available():
+        pytest.skip("rtk binary not installed — the incremental transform needs it locally")
+
+
+def test_rtk_filter_derivation_comes_from_the_binarys_own_registry():
+    """Which commands rtk touches must be decided by `rtk rewrite` — the same registry the
+    PreToolUse hook delegates to — so incremental and full agree. A command with no rtk pipe
+    filter (rtk ls has none) must return None and be left alone, never faked."""
+    _rtk_or_skip()
+    assert "pytest" in eng.rtk_filters() and "git-status" in eng.rtk_filters()
+    assert eng.rtk_filter_for("git status") == "git-status"
+    assert eng.rtk_filter_for("git log -5") == "git-log"   # longest match wins over bare git
+    assert eng.rtk_filter_for("pytest -q") == "pytest"
+    assert eng.rtk_filter_for("cargo test") == "cargo-test"
+    assert eng.rtk_filter_for("echo hi") is None           # rtk has no equivalent at all
+    assert eng.rtk_filter_for("ls -la") is None            # rewritable, but no PIPE filter
+    # a session already recorded under rtk stores the WRAPPED command — unwrap before asking
+    assert eng.rtk_filter_for(eng.unrtk("rtk git status")) == "git-status"
+
+
+_PYTEST_OUT = (
+    "============================= test session starts ==============================\n"
+    "platform linux -- Python 3.11.0, pytest-8.3.0\nrootdir: /app\ncollected 3 items\n\n"
+    "tests/test_a.py ..F                                                      [100%]\n\n"
+    "=================================== FAILURES ===================================\n"
+    "assert 1 == 2\n"
+    "=========================== short test summary info ============================\n"
+    "FAILED tests/test_a.py::test_c - assert 1 == 2\n"
+    "========================= 1 failed, 2 passed in 0.05s ==========================\n")
+
+
+def _rtk_session():
+    return [
+        {"role": "user", "content": [{"type": "text", "text": "fix it"}]},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Running the tests."},
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pytest -q"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": _PYTEST_OUT}]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "a.py"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t2", "content": "def f(): return 1/0"}]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t3", "name": "Bash", "input": {"command": "echo hi"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t3", "content": "hi"}]},
+    ]
+
+
+def test_rtk_transform_shrinks_observations_and_touches_nothing_else():
+    """rtk is an OBSERVATION transform: only Bash tool_result content may change. If it moved
+    an action, a prose block or the step count, the arm would stop being paired with control
+    step-for-step and every per-step delta would be comparing different decisions."""
+    _rtk_or_skip()
+    msgs = _rtk_session()
+    before = copy.deepcopy(msgs)
+    new, stats = eng.rtk_transform_session(msgs)
+
+    assert msgs == before, "the source session must not be mutated"
+    assert len(new) == len(msgs), "step count changed"
+    assert stats["filtered"] == 1 and stats["bytes_after"] < stats["bytes_before"]
+    assert stats["modes"] == {"pipe": 1}
+    # the pytest observation shrank...
+    assert len(new[2]["content"][0]["content"]) < len(_PYTEST_OUT)
+    assert "failed" in new[2]["content"][0]["content"].lower(), "the failure must survive"
+    # ...and nothing else moved
+    assert new[1]["content"][0] == msgs[1]["content"][0], "prose changed"
+    assert new[1]["content"][1] == msgs[1]["content"][1], "action changed"
+    assert new[4]["content"][0]["content"] == "def f(): return 1/0", "Read result changed"
+    assert new[6]["content"][0]["content"] == "hi", "unfilterable Bash result changed"
+
+
+def test_rtk_transform_handles_block_list_results_and_keeps_pairing_valid():
+    """tool_result content is stored either as a string or as a content-block list depending
+    on the recorder; both must round-trip, and the tool_use/tool_result pairing must survive
+    (the API 400s if it doesn't)."""
+    _rtk_or_skip()
+    msgs = _rtk_session()
+    msgs[2]["content"][0]["content"] = [{"type": "text", "text": _PYTEST_OUT}]
+    new, stats = eng.rtk_transform_session(msgs)
+    assert stats["filtered"] == 1
+    body = new[2]["content"][0]["content"]
+    assert isinstance(body, list) and body[0]["type"] == "text"
+    assert len(body[0]["text"]) < len(_PYTEST_OUT)
+    assert _tool_pairing_valid(new)
+
+
+def test_rtk_pipe_never_deletes_an_observation_on_failure():
+    """A broken/unknown filter must return the text UNCHANGED. Dropping it would read as a
+    spectacular saving while destroying the trajectory — the worst possible failure mode for
+    a method whose whole claim is 'smaller context, same information'."""
+    _rtk_or_skip()
+    assert eng.rtk_pipe("some output", "no-such-filter-at-all") == "some output"
+    assert eng.rtk_pipe("", "pytest") == ""
+
+
+def test_rtk_rides_controls_transport_and_needs_no_credentials_of_its_own(monkeypatch):
+    """Same contract as caveman: a client-side method with no endpoint has no auth of its own,
+    so `--arms rtk` under UPSTREAM_VIA=bedrock must not demand an ANTHROPIC_API_KEY."""
+    assert eng.api_arm_for("rtk") == "control"
+    assert eng.api_arm_for("condense") == "condense"
+    assert eng.check_arms(["control", "rtk"], {"ANTHROPIC_API_KEY": "k"}) == []
+    monkeypatch.setitem(eng.ARMS, "control", {"base": "https://bedrock/anthropic",
+                                              "bedrock": True})
+    monkeypatch.setattr(eng, "auth_mode", lambda env: None)
+    monkeypatch.setattr("minmax_bench.bedrock.bearer_token", lambda region: "tok")
+    assert not any("no auth found" in p for p in eng.check_arms(["control", "rtk"], {}))
+    # and an unknown arm still fails, now naming rtk as known
+    prob = "\n".join(eng.check_arms(["control", "bogus"], {"ANTHROPIC_API_KEY": "k"}))
+    assert "bogus" in prob and "rtk" in prob
+
+
+def test_rtk_version_drift_between_the_two_legs_is_surfaced(monkeypatch, tmp_path, capsys):
+    """Incremental filters with the HOST rtk; full mode installs the pin in the container. If
+    they differ, the two legs ran different versions of the METHOD under test — the exact
+    confound the pin exists to prevent — so it must never be silent."""
+    from rich.console import Console
+
+    from minmax_bench import counterfactual as cf
+    from minmax_bench.quality import generate as gen
+
+    console = Console(file=__import__("io").StringIO(), width=200)
+    monkeypatch.setattr(cf.eng, "rtk_version", lambda: "0.1.0-ancient")
+    # stop replay() right after the preflight — the drift warning is all we're asserting
+    monkeypatch.setattr(cf.eng, "parse_session", lambda p: (_ for _ in ()).throw(SystemExit(7)))
+    with pytest.raises(SystemExit):
+        cf.replay(tmp_path / "s.jsonl", ["rtk"], budget_usd=1.0, limit=0, max_tokens=16,
+                  out_dir=tmp_path, console=console, assume_yes=True, model=None,
+                  auth="api-key", task="t", judge="off", ctx_gate=0)
+    out = console.file.getvalue()
+    assert "local rtk is 0.1.0-ancient" in out
+    assert gen.RTK_PIN in out and "NOT directly comparable" in out
+
+
+def test_rtk_missing_binary_aborts_rather_than_scoring_a_free_passthrough():
+    """No local rtk means no transform — the arm would replay the UNFILTERED session and score
+    a flawless passthrough while measuring nothing. Abort with an install hint instead."""
+    import io
+
+    from rich.console import Console
+
+    from minmax_bench import counterfactual as cf
+
+    console = Console(file=io.StringIO(), width=200)
+    import pathlib
+    orig = cf.eng.rtk_version
+    cf.eng.rtk_version = lambda: None
+    try:
+        with pytest.raises(SystemExit):
+            cf.replay(pathlib.Path("/nope/s.jsonl"), ["rtk"], budget_usd=1.0, limit=0,
+                      max_tokens=16, out_dir=pathlib.Path("/tmp"), console=console,
+                      assume_yes=True, model=None, auth="api-key", task="t", judge="off",
+                      ctx_gate=0)
+    finally:
+        cf.eng.rtk_version = orig
+    out = console.file.getvalue()
+    assert "needs the `rtk` binary locally" in out and "brew install rtk" in out
+
+
+def test_report_treats_rtk_as_engaged_only_when_it_filtered_something(tmp_path):
+    """rtk's engagement is a session fact, not a per-step one. A run where NO recorded command
+    had an rtk pipe filter is a genuine passthrough and must be labelled ⊘; one that filtered
+    real observations must keep its fidelity verdict even if the net context barely moved."""
+    d = tmp_path / "incremental"
+    d.mkdir()
+
+    def write(arm, recs):
+        (d / f"sess-{arm}.jsonl").write_text("\n".join(json.dumps(r) for r in recs))
+
+    def rec(step, ctx, filtered=None):
+        r = {"step": step, "agree_action": True, "cost_usd": 1.0,
+             "usage": {"input_tokens": ctx, "output_tokens": 50}}
+        if filtered is not None:
+            r["rtk_filtered"] = filtered
+        return r
+
+    write("control", [rec(s, 30_100) for s in range(3)])
+    # filtered real observations, but net context barely moved -> still ENGAGED
+    write("rtk", [rec(s, 30_000, filtered=7) for s in range(3)])
+    inc = report._load_incremental(str(tmp_path), ["rtk"])[("sess", "rtk")]
+    assert inc["rtk_filtered"] == 7
+    assert abs(inc["comp"]) < 0.02 and report._engaged(inc) is True
+
+    # nothing had a filter -> a real passthrough, and ⊘ is correct
+    write("rtk", [rec(s, 30_000, filtered=0) for s in range(3)])
+    dead = report._load_incremental(str(tmp_path), ["rtk"])[("sess", "rtk")]
+    assert dead["rtk_filtered"] == 0 and report._engaged(dead) is False
+
+
+def test_rtk_cells_split_correctly():
+    assert report.split_cell("rtk-kv-store") == ("rtk", "kv-store")
+    assert report.split_cell("caveman-kv-store") == ("caveman", "kv-store")
+
+
+def test_rtk_install_command_is_configured_and_provisionable():
+    """The wizard installs rtk like it installs dense/headroom — via a settings-held command,
+    not a hardcoded string buried in the wizard."""
+    from minmax_bench import provision
+    from minmax_bench.config import get_settings
+    cmd = get_settings().rtk_install_cmd
+    assert "rtk" in cmd and ("brew" in cmd or "install.sh" in cmd)
+    assert callable(provision.ensure_rtk)
+
+
+def test_incremental_preflight_treats_a_missing_rtk_as_fatal(monkeypatch):
+    """Incremental filters the recorded output locally, so a missing binary must surface in the
+    preflight — before the session picker and cost preview, not after."""
+    import io
+
+    from rich.console import Console
+
+    from minmax_bench import interactive as itv
+
+    monkeypatch.setattr("minmax_bench.quality.engine.rtk_version", lambda: None)
+    monkeypatch.setattr("minmax_bench.quality.engine.auth_mode", lambda env: "api-key")
+    monkeypatch.setattr(itv.Confirm, "ask", lambda *a, **k: False)
+    console = Console(file=io.StringIO(), width=200)
+    with pytest.raises(KeyboardInterrupt):   # declining the "continue anyway?" prompt
+        itv._quality_preflight(console, ["rtk"], need_docker=False)
+    out = console.file.getvalue()
+    assert "rtk CLI" in out and "brew install rtk" in out
+    assert "can't run without" in out and "rtk CLI" in out
+
+
+def test_setup_wizard_reports_rtk_pin_alignment(monkeypatch):
+    """`minmax-bench setup` must say whether the local rtk matches the pin — a mismatch makes
+    the incremental and full legs non-comparable, and silence there is how that gets missed."""
+    import io
+
+    from rich.console import Console
+
+    from minmax_bench import provision
+    from minmax_bench.quality.generate import RTK_PIN
+
+    monkeypatch.setattr(provision.shutil, "which", lambda t: "/usr/local/bin/rtk")
+    monkeypatch.setattr("minmax_bench.quality.engine.rtk_version", lambda: "0.1.0-old")
+    console = Console(file=io.StringIO(), width=200)
+    provision.ensure_rtk(console)
+    out = console.file.getvalue()
+    assert "0.1.0-old" in out and RTK_PIN in out and "not directly comparable" in out
+
+    monkeypatch.setattr("minmax_bench.quality.engine.rtk_version",
+                        lambda: RTK_PIN.lstrip("v"))
+    console2 = Console(file=io.StringIO(), width=200)
+    provision.ensure_rtk(console2)
+    assert "matches the benchmark pin" in console2.file.getvalue()
+
+
+def _rtk_trial(tmp_path, cell, name, cmds, hook_rewrites=(), gain=None):
+    """One rtk trial on disk. `cmds` are the commands as RECORDED in the tool_use;
+    `hook_rewrites` are the commands the PreToolUse hook returned (the Claude Code ≥2.1.x
+    shape, where the tool_use keeps the original); `gain` is rtk's own stats dump."""
+    inst = tmp_path / cell / name / "inst"
+    (inst / "verifier").mkdir(parents=True)
+    (inst / "verifier" / "reward.txt").write_text("1")
+    sess = inst / "agent" / "sessions" / "projects" / "-app"
+    sess.mkdir(parents=True)
+    if gain is not None:
+        (inst / "agent" / "rtk-gain.json").write_text(json.dumps({"summary": gain}))
+    lines = [{"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+              "message": {"role": "user", "content": "go"}}]
+    for k, c in enumerate(cmds):
+        lines.append({"type": "assistant", "requestId": f"r{k}",
+                      "timestamp": "2026-01-01T00:00:01Z",
+                      "message": {"role": "assistant", "model": "m", "usage": {},
+                                  "content": [{"type": "tool_use", "id": f"t{k}", "name": "Bash",
+                                               "input": {"command": c}}]}})
+        lines.append({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": f"t{k}", "content": "out"}]}})
+    for k, rewritten in enumerate(hook_rewrites):   # verbatim CC 2.1.228 attachment shape
+        lines.append({"type": "attachment", "attachment": {
+            "type": "hook_success", "hookName": "PreToolUse:Bash", "hookEvent": "PreToolUse",
+            "toolUseID": f"t{k}", "exitCode": 0, "stderr": "",
+            "command": "/root/.local/bin/rtk hook claude",
+            "stdout": json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecisionReason": "RTK auto-rewrite",
+                "updatedInput": {"command": rewritten}}}) + "\n"}})
+    (sess / "s.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+
+
+def test_rtk_inactive_guard_is_structural(tmp_path):
+    """The Claude Code ≤2.0.x shape: the hook's updatedInput REPLACED the tool_use input, so an
+    active trial stores `rtk git status` in the recorded action itself. A trial that ran Bash
+    with no rtk prefix anywhere means the hook never fired: vanilla in disguise."""
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-00", ["rtk git status", "rtk pytest -q"])
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-01", ["git status", "pytest -q"])
+    # ran no Bash at all — nothing for rtk to rewrite; that's the TASK's shape, not a failure
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-02", [])
+    idx = report.index_runs(str(tmp_path), "claude-code")
+    runs = idx["rtk-taskA"]["runs"]
+    assert len(runs) == 3
+    assert report._rtk_inactive(runs) == 1, "exactly the un-prefixed trial is inactive"
+    assert report._inactive_for("rtk", runs) == 1
+    assert report._inactive_for("condense", runs) is None   # notion doesn't apply to a proxy
+
+
+def test_rtk_active_trial_is_not_flagged_when_cc_records_the_original_command(tmp_path):
+    """Claude Code 2.1.228 keeps the ORIGINAL command in the tool_use and records the rewrite
+    beside it, as a hook_success attachment. A guard that only knows the old shape calls a run
+    where rtk filtered every observation 'ran without the intervention' — backwards, and on the
+    DEFAULT html renderer. The container installs Claude Code unpinned, so both shapes are
+    live artifacts and both must read as active."""
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-00", ["ls -la /app", "git status"],
+               hook_rewrites=["rtk ls -la /app", "rtk git status"])
+    # the hook fired but rewrote nothing it knows (rtk covers ~7% of commands) AND no rewrite
+    # landed anywhere: no evidence the intervention applied
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-01", ["python3 interp.py x.scm"])
+    runs = report.index_runs(str(tmp_path), "claude-code")["rtk-taskA"]["runs"]
+    assert report._rtk_inactive(runs) == 1, "the attachment-shaped trial is ACTIVE"
+
+
+def test_rtk_gain_outranks_the_transcript_and_catches_an_ignored_rewrite(tmp_path):
+    """`rtk gain` counts what rtk actually RAN, so it is the only artifact that separates 'the
+    hook emitted a rewrite' from 'the rewrite is what executed'. A Claude Code that stopped
+    honouring updatedInput would leave a transcript full of perfect rewrites and an rtk that
+    never ran a command — the arm would be vanilla in disguise while every transcript signal
+    said otherwise. So when the dump exists it is the ONLY signal consulted."""
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-00", ["ls -la /app"],
+               hook_rewrites=["rtk ls -la /app"], gain={"total_commands": 12, "total_saved": 9001})
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-01", ["ls -la /app"],
+               hook_rewrites=["rtk ls -la /app"], gain={"total_commands": 0, "total_saved": 0})
+    # rtk ran nothing, but neither did the agent — nothing to rewrite is the task's shape
+    _rtk_trial(tmp_path, "rtk-taskA", "2026-01-01__00-00-02", [], gain={"total_commands": 0})
+    runs = report.index_runs(str(tmp_path), "claude-code")["rtk-taskA"]["runs"]
+    assert report._rtk_inactive(runs) == 1, "only the rewritten-but-never-executed trial"
+
+
+def test_rtk_inactive_warning_reaches_every_renderer():
+    """md, html and console each build their own tables — html is the DEFAULT, so a warning
+    that lands in only one of them lets a reader see a clean ✓ with no hint rtk never ran."""
+    d = {"arms": ["rtk"], "model": "m", "has_milestone": False, "has_incr": False,
+         "rows": [{"task": "t", "sub_gate": False,
+                   "vanilla": dict(_STAT, _lens=[5, 5], length=(5, 5, 5)),
+                   "arms": {"rtk": dict(_STAT, _lens=[5, 5], length=(5, 5, 5),
+                                        inactive=2, length_ok=True, rework_ok=True,
+                                        milestone=None, milestone_ok=None, incr=None)}}]}
+    _head, rows = report.table(d)
+    assert any("inactive" in c[0] for row in rows for c in row), "missing from markdown"
+    assert "ran without the intervention" in report._html_report_body(d), "missing from html"
+    from rich.console import Console as _C
+    con = _C(file=__import__("io").StringIO(), width=200, force_terminal=False)
+    report._full_table(con, d, "m")
+    assert "without the intervention" in con.file.getvalue(), "missing from console"
+
+
+def test_rtk_filter_handles_compound_commands():
+    """Agents write `cd <dir> && pytest -q` constantly, and rtk rewrites the INNER segment.
+    Requiring the rewrite to START with rtk missed all of them — on real sessions that was the
+    difference between 1% and 7% of Bash commands being transformable."""
+    _rtk_or_skip()
+    assert eng.rtk_filter_for("cd /tmp && pytest -q") == "pytest"
+    assert eng.rtk_filter_for("cd /a && cd /b && git status") == "git-status"
+    # several rtk calls in one pipeline: the recorded output is two commands' output
+    # concatenated and no single filter expresses that — skip rather than mangle it
+    assert eng.rtk_filter_for("ls && grep -rn x .") is None
+    assert eng.rtk_filter_for("pytest -q | head -20") is None
+    assert eng.rtk_filter_for("echo hi") is None
+
+
+def test_rtk_apply_runs_the_real_command_for_file_reads():
+    """The proper swap-out: for a file read the recorded output IS the file's content, so it
+    is materialized and the ACTUAL rtk command runs on it — exact, and reaching commands no
+    pipe filter covers. Falls back to pipe only where post-processing stdout is genuinely
+    rtk's mechanism, and leaves the observation verbatim when neither applies."""
+    _rtk_or_skip()
+    src = "\n".join(f"line {i}" for i in range(200))
+
+    out, mode = eng.rtk_apply("head -40 a.py", src)
+    assert mode == "read" and len(out) < len(src), "real `rtk read --max-lines` did not apply"
+    out2, mode2 = eng.rtk_apply("cd /proj && head -40 a.py", src)
+    assert mode2 == "read" and out2 == out, "compound command took a different path"
+
+    # `cat x` rewrites to a BARE `rtk read x`, whose default level is full content. Returning
+    # it unchanged is the faithful answer — passing --level aggressive would cut ~94% but
+    # would be measuring a method rtk's hook does not implement.
+    out3, mode3 = eng.rtk_apply("cat a.py", src)
+    assert mode3 == "read" and out3 == src
+
+    # inputs that cannot be reconstructed from a transcript are left alone, not faked
+    for cmd in ("ls -la", "cat a.py b.py", "ls && cat a.py", "echo hi"):
+        outn, moden = eng.rtk_apply(cmd, src)
+        assert moden is None and outn == src, cmd
+    # stdout post-processing still routes to pipe
+    assert eng.rtk_apply("pytest -q", "1 failed, 2 passed in 0.05s")[1] == "pipe"
+
+
+def test_rtk_apply_never_loses_an_observation():
+    """Every failure path returns the recorded text unchanged. Dropping an observation would
+    read as a spectacular saving while destroying the trajectory."""
+    _rtk_or_skip()
+    assert eng.rtk_apply("definitely-not-a-command --x", "payload") == ("payload", None)
+    assert eng.rtk_read_file("payload", "a.py", ["--not-a-real-flag"]) == "payload"
+
+
+def test_rtk_awareness_file_is_frozen_at_the_same_pin():
+    """`rtk init -g` embeds hooks/claude/rtk-awareness.md into CLAUDE.md, so a faithful
+    install includes it — omitting it would measure a lighter rtk than a user actually runs.
+    The agent installs a release BINARY (not the repo), so the file is frozen on the host and
+    must not drift from the pin."""
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    txt = open(os.path.join(root, "data", "rtk", "awareness.md"), encoding="utf-8").read()
+    assert txt.strip() and "rtk" in txt.lower()
+    # it advertises analytics commands and delegates everything else to the hook — it does NOT
+    # redirect the model off the native Read tool, which is why it cannot lift rtk's ceiling
+    assert "rtk gain" in txt and "automatically rewritten" in txt.lower()
+    assert "Read tool" not in txt
+
+    pin = open(os.path.join(root, "data", "rtk", "PIN"), encoding="utf-8").read().strip()
+    ref, sha = re.match(r"(\S+)\s*\(([0-9a-f]{40})\)", pin).groups()
+    agent = open(os.path.join(root, "harbor_agents", "rtk_claude_code.py")).read()
+    assert re.search(r'RTK_REF\s*=\s*"([^"]+)"', agent).group(1) == ref
+    assert re.search(r'RTK_SHA\s*=\s*"([0-9a-f]{40})"', agent).group(1) == sha

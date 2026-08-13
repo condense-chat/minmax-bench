@@ -62,8 +62,16 @@ class Settings(BaseSettings):
     # Each is the command that project's own README documents; override if needed.
     #   headroom -> PyPI package   (README: pip install "headroom-ai[proxy]")
     #   dense    -> curl | sh       (dense README: https://cli.condense.chat/unix)
+    #   rtk      -> brew, else curl | sh (rtk README documents both)
     headroom_install_cmd: str = 'uv tool install "headroom-ai[proxy]"'
     dense_install_cmd: str = "curl -fsSL https://cli.condense.chat/unix | sh"
+    # Only the QUALITY bench's incremental rtk arm needs a local rtk: it filters the RECORDED
+    # tool output through `rtk pipe` on this machine. Full mode never uses it — the container
+    # installs its own pinned build (harbor_agents/rtk_claude_code.py), which is also why the
+    # incremental path warns when this binary's version differs from that pin.
+    rtk_install_cmd: str = (
+        "brew install rtk || curl -fsSL "
+        "https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh")
 
     # Anthropic 1M-context beta header, sent on Anthropic proxy requests so
     # chains up to 1M tokens are accepted. Blank to disable.
