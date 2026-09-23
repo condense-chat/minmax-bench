@@ -1026,6 +1026,7 @@ def test_k_for_vanilla_defaults_to_k_plus_one():
     args = SimpleNamespace(k=4, k_vanilla=None)
     assert _k_for(args, "vanilla") == 5 and _k_for(args, "condense") == 4
     assert _k_for(SimpleNamespace(k=4, k_vanilla=2), "vanilla") == 2
+    assert _k_for(SimpleNamespace(k=4, k_vanilla=0), "vanilla") == 0
 
 
 def test_named_tasks_are_validated_with_a_did_you_mean(monkeypatch, capsys):

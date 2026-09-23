@@ -177,7 +177,9 @@ _OWNED_CELLS: list[tuple[str, str]] = []
 def _k_for(args, arm):
     """Trials for an arm: vanilla defaults to k+1 — the noise floor is shared by every
     comparison, so one extra vanilla run sharpens every verdict."""
-    return (args.k_vanilla or args.k + 1) if arm == "vanilla" else args.k
+    if arm != "vanilla":
+        return args.k
+    return args.k_vanilla if args.k_vanilla is not None else args.k + 1
 
 
 # container build + agent-setup + verify slack to add on top of a task's EXECUTION budget,
@@ -1069,7 +1071,7 @@ def main(argv=None):
                          "fragile below 4 (a low-k verdict can flip as bands widen)")
     ap.add_argument("--k-vanilla", type=int, default=None,
                     help="trials for the vanilla baseline (default k+1: the noise floor "
-                         "is shared by every comparison)")
+                         "is shared by every comparison); 0 skips the baseline arm")
     ap.add_argument("--budget-usd", type=float, default=5.0)
     ap.add_argument("--retries", type=int, default=0,
                     help="extra re-attempts for a cell that CRASHED or TIMED OUT (no reward.txt) "
