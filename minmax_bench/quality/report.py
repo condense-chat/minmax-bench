@@ -441,7 +441,8 @@ def _cell_stats(cell):
         # it needs cost/tokens/turns to travel together rather than as separate filtered lists
         if e:
             trials.append({**e, "solve": 1.0 if rw == "1" else 0.0, "steps": len(acts),
-                           "cost": m.get("cost"), "tok": e["tok"] or m.get("tok")})
+                           "cost": m.get("cost"), "tok": e["tok"] or m.get("tok"),
+                           "lat": m.get("lat")})
     n = len(runs)
     attempted = cell["attempted"] if cell and cell["attempted"] else n
     started = n  # trial dirs that actually opened (reward or not); >n means some crashed
