@@ -29,6 +29,8 @@
 
 ## How it works
 
+For the long form, see the [Explainer](docs/explainer.md).
+
 Every context-compression tool advertises token savings. Tokens are not dollars, and
 dollars are not the whole story: a strategy that breaks the prompt cache trades cheap
 cache-reads for expensive cache-writes, and one that degrades the agent pays back its
@@ -155,6 +157,7 @@ uv run minmax-bench replay <any of the above>                      # animated
 
 ## Docs
 
+- [docs/explainer.md](docs/explainer.md) — why and how to evaluate a cost optimization: benchmark design, assumptions, and the three eval types.
 - [docs/cost.md](docs/cost.md) — cost-bench methodology: harness simulation, bucketing, cache modeling, run store.
 - [docs/quality.md](docs/quality.md) — quality-bench methodology: noise floor, axes, compaction gate, full + incremental.
 - [docs/architecture.md](docs/architecture.md) — how strategies, mode, and transport come together; module map.
