@@ -11,6 +11,7 @@
 </p>
 
 <p align="center">
+  <a href="#first-run"><strong>First run</strong></a> ·
   <a href="#how-it-works"><strong>How it works</strong></a> ·
   <a href="#strategies"><strong>Strategies</strong></a> ·
   <a href="#quick-start"><strong>Quick start</strong></a> ·
@@ -27,9 +28,48 @@
 
 ---
 
-## How it works
+## First Run
 
-For the long form, see the [Explainer](docs/explainer.md).
+minmax-bench checks whether a cost optimizer (like condense) saves money without making
+the agent worse. A quality run has Claude Code solve real Terminal-Bench tasks in Docker,
+once with the optimizer and once without it ("vanilla"). It then compares cost and solve
+rate.
+
+Setup, once (needs [uv](https://docs.astral.sh/uv/) and Docker running):
+
+```bash
+git clone git@github.com:condense-chat/minmax-bench.git && cd minmax-bench
+uv sync && uv tool install harbor
+uv run minmax-bench setup   # guided: your Claude login (or an API key), plus `dense login` for condense
+```
+
+Run one short task on Opus 5.5 with your Claude subscription. This does 2 condense runs
+and 3 vanilla runs, each capped at $5:
+
+```bash
+uv run minmax-bench quality run --auth subscription -m claude-opus-5-5 \
+  --arms condense --tasks path-tracing --k 2
+```
+
+It checks your credentials before it spends anything. `uv run minmax-bench quality runs`
+lists your runs and shows how to open each report. Run `quality run` with no flags to get
+a step-by-step wizard instead.
+
+### Why one run proves nothing
+
+Every run takes its own path. Even two vanilla runs differ in turns, cost and whether they
+solve the task. So vanilla runs one extra time to measure how much it varies by itself
+(the noise floor). The optimizer passes if it stays within the vanilla-vs-vanilla spread.
+It doesn't have to match vanilla exactly.
+
+A verdict needs at least 2 finished runs per arm. `--k 2` is a first look; use the
+default `--k 4` for a verdict.
+
+More: [docs/explainer.md](docs/explainer.md) explains why each kind of evaluation exists
+and covers the cheaper incremental mode. [docs/quality.md](docs/quality.md) lists every
+flag.
+
+## How it works
 
 Every context-compression tool advertises token savings. Tokens are not dollars, and
 dollars are not the whole story: a strategy that breaks the prompt cache trades cheap
