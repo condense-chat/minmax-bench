@@ -115,6 +115,165 @@ un-gated, so a new method shows a real verdict rather than quietly vanishing fro
 - `caveman` — the [caveman](https://github.com/JuliusBrussee/caveman) skill (full mode
   only), pinned at `v1.9.1`. A different *class* of method, and the distinction matters
   for how you read it — see below.
+- `rtk` — [RTK](https://github.com/rtk-ai/rtk) ("Rust Token Killer"), pinned at `v0.44.0`.
+  A **third** class: it transforms neither the history nor the agent's output but its
+  **observations** — see below.
+
+### three classes of method, and why the class changes how you read the arm
+
+| class | transforms | arms |
+|---|---|---|
+| history transform | the conversation you resend | `condense`, `headroom` |
+| generation policy | what the agent **writes** | `caveman` |
+| observation transform | what the agent **reads back** | `rtk` |
+
+The first hands back a smaller conversation. The second makes the agent's own messages
+smaller as they accrue. The third leaves both alone and shrinks the *tool output* — which
+is what actually dominates a coding session's prefix, and the exact gap the caveman section
+below names ("tool I/O dominates the prefix and caveman never touches it").
+
+Neither `caveman` nor `rtk` is a proxy, so both read against plain **`vanilla`**, not
+`vanilla-proxy` — they don't carry the ~8-9k non-default-base-URL wiring confound, and
+comparing them to `vanilla-proxy` would credit them with that whole difference.
+
+### rtk is an observation transform
+
+RTK is a single Rust binary and is **deterministic** — rule-based filters, no LLM, nothing
+sampled. A `PreToolUse` hook rewrites a Bash command to its rtk equivalent (`git status` →
+`rtk git status`), rtk runs it, and only the filtered output reaches the model. Consequences:
+
+- **Where the rewrite is recorded depends on the Claude Code build**, which the container does
+  not pin. Through **2.0.x** `updatedInput.command` replaced the tool_use input, so the
+  transcript stored `rtk git status`, not `git status` — unique among the arms and
+  load-bearing: every command-shaped metric un-wraps first (`engine.unrtk`). Without that,
+  `rework_count` scores the arm a flawless **zero** on identical behaviour — its read-only
+  pattern is `^`-anchored so `rtk grep …` never matches, and it looks for `cat`/`head`/`tail`
+  by name while rtk renames all three to `rtk read`. That would be a strawman *in RTK's
+  favour*, the mirror image of the `headroom-kompress` warning above. By **2.1.228** the
+  tool_use keeps the original command and the rewrite is recorded next to it, in a
+  `hook_success` attachment carrying the hook's stdout; `unrtk` then no-ops and the arm's
+  commands are recorded exactly like vanilla's. Old runs still hold the old shape, so both
+  are live artifacts — anything reading commands back must handle both.
+- **In full mode `comp` should be substantial**, unlike caveman's ~0 — it is attacking the
+  part of the prefix that is actually large. Incremental is a different story; see the
+  coverage numbers below.
+- **The risk to watch is information loss, not amnesia.** RTK's claim is "smaller context,
+  same signal" — it keeps failures and drops passing boilerplate. So `milestone` and solve
+  rate are the axes: a filter that ate the one line the agent needed shows up as a failed
+  task, not as a longer trajectory.
+
+```bash
+uv run minmax-bench quality run --arms rtk --tasks long           # full: pinned build per trial
+uv run minmax-bench quality incremental --arms rtk                # incremental: filters locally
+```
+
+**What rtk does and does not activate.** The hook fires on *every* Bash call, but
+`rtk rewrite` has no equivalent for most commands and passes them through — measured, **348 of
+2286 Bash commands (15%)** are actually rewritten on real sessions. rtk also ships a
+model-facing file (`hooks/claude/rtk-awareness.md`, embedded into CLAUDE.md by `rtk init -g`
+and frozen here at `data/rtk/awareness.md`). It is **not** a skill in caveman's sense: ~10
+lines advertising four analytics commands (`gain`/`discover`/`proxy`) plus "everything else is
+rewritten automatically". It never redirects the model off the native Read tool, so it does not
+lift the Bash-only ceiling — but it is installed, because a real `rtk init -g` installs it and
+those lines are a genuine (small) context cost the arm should carry.
+
+**Flagless rewriting is the whole product — confirmed against rtk's own docs.** Unlike
+caveman's `--caveman-mode`, rtk has no level knob the bench could set, and this is by design
+rather than an oversight: `docs/guide/getting-started/configuration.md` documents the config
+file, env vars (`RTK_DISABLED`, `RTK_TEE_DIR`, `RTK_TELEMETRY_DISABLED`, `RTK_HOOK_AUDIT`,
+`SKIP_ENV_VALIDATION`) and custom filters, and mentions no level/ultra/aggressive setting
+anywhere; `src/core/config.rs` has no such key; `--level`/`--ultra-compact` are per-invocation
+flags the hook never emits. rtk's own description of the intended use is *"You run them
+normally — the hook rewrites them transparently before execution."* So installing the hook and
+replacing commands **without flags is the organic configuration**, and that is exactly what
+both modes do. Adding a level would mean shimming `rtk` on PATH — benchmarking a wrapper the
+user would have to build — and could not move the result anyway: the bytes reaching rtk total
+~17kB against multi-million-token transcripts, so deleting them outright is ~0.05%.
+
+**Read rtk's headline numbers against the right denominator.** rtk claims 60-99% reduction
+(`git status` 75-93%, `git log` 80-92%), and its docs are careful about what that measures:
+*"Every percentage below measures bash output bytes removed — the only thing RTK controls.
+Those bytes are one contributor to input tokens."* That is consistent with everything here,
+not in tension with it: those percentages are of **bash output**, and on the Claude Code
+sessions measured bash is 13.4% of observation bytes (Read is 84.1%), with 15% of bash
+commands rewritten. So rtk's numbers can be entirely correct while the whole-session effect
+stays small — translating the former into the latter is precisely this bench's job, and full
+mode is what settles it.
+
+**Silent-inactivity guard.** Structurally stronger than caveman's marker scan, and read from
+three signals, strongest first:
+
+1. **`agent/rtk-gain.json`** — `rtk gain` dumped from the container after the agent exits. rtk
+   counts the commands it actually **ran**, so a non-zero count proves the rewrite was
+   *honoured*, not merely emitted. Present, it is the only signal consulted: a Claude Code
+   that stopped applying `updatedInput` would leave a transcript full of perfect rewrites and
+   an rtk that never executed one, and only this artifact can tell those apart.
+2. a **`hook_success` attachment** whose stdout carries an `rtk`-prefixed `updatedInput`
+   (Claude Code ≥2.1.x).
+3. the **`rtk` prefix in the recorded `tool_use`** itself (Claude Code ≤2.0.x).
+
+None of the three, on a trial that issued Bash, is flagged `⚠ n inactive`. A trial that ran no
+Bash at all is not counted — having nothing to rewrite is a property of the task. The guard
+keyed on signal 3 alone until a run under Claude Code 2.1.228 reported every trial inactive
+while rtk was demonstrably filtering every observation. Container-side, the
+agent smoke-tests both `rtk rewrite` and `rtk hook claude` and refuses to run if either stops
+rewriting. It deliberately wires the **native** `rtk hook claude` rather than upstream's
+`hooks/claude/rtk-rewrite.sh`, which shells out to `jq` and degrades to a silent no-op when jq
+is absent — precisely the failure that makes an arm measure nothing while scoring a clean pass.
+
+**In `quality incremental`, rtk filters the recorded output.** This is far simpler than
+caveman's replay, because the transform is deterministic and independent of anything the model
+says: the whole session is filtered **once** up front through `rtk pipe --filter <name>`, and
+the arm then teacher-forces its transformed history exactly like control teacher-forces the
+original. Same actions, same prose, same step set — only the observations are smaller — so the
+arm is paired with control step-for-step by construction. There is no free-running, no state
+machine, and none of caveman's prose/action stapling.
+
+Which commands rtk touches is decided by `rtk rewrite`, the same registry the hook delegates
+to, so incremental and full agree. The filter set is queried from the binary rather than
+hardcoded, so a pin bump can't silently rot it. A command with no rtk *pipe* filter (`rtk ls`
+has none) passes through verbatim rather than being faked, and a failed filter returns the text
+**unchanged** — dropping an observation would read as a spectacular saving while destroying the
+trajectory.
+
+Two caveats to read it honestly. Both are measured, not asserted — the numbers below come
+from 2286 Bash commands across six real recorded sessions, at the pinned rtk:
+
+- **Incremental reaches about half of what full mode does.** rtk *rewrites* 15% of those
+  Bash commands, but only 7% have a **pipe** filter — the pipe set (25 filters) is much
+  narrower than the rewrite set (100+ commands): `rtk ls`, `rtk read`, `rtk wc` and friends
+  have no pipe equivalent. So a low incremental `comp` is the arm's *coverage ceiling*, not
+  evidence that rtk doesn't work; full mode is where its real reach shows. The run prints
+  how many observations it filtered and how many passed through, and says so outright when
+  it filtered nothing.
+- **Replay runs the REAL rtk command wherever its input can be reconstructed.** For a file
+  read the recorded output *is* the file's content, so it is materialized and the actual
+  `rtk read …` runs on it — exact, and reaching commands no pipe filter covers. Pipe-filtering
+  is the fallback, used only where post-processing stdout is genuinely rtk's mechanism. Where
+  neither applies (`rtk ls`, `rtk wc` need a real filesystem) the observation is left verbatim,
+  never faked. Note `cat x` rewrites to a *bare* `rtk read x`, whose default level is full
+  content — so it returns unchanged, and that is the faithful answer; passing
+  `--level aggressive` would cut ~94% but would measure a method rtk's hook does not implement.
+- **Where the pipe fallback is used, it is EXACT for pure post-processors.**
+  Verified byte-identical for `pytest` and `grep`. It diverges only where rtk re-invokes the
+  underlying tool with its own format: `git status` (hook 35B vs pipe 55B — it emits
+  `* branch / clean`, not a trimmed `git status`), `git log -5` (hook **1856B** vs pipe
+  227B), `git diff <ref>` (34517B vs 13544B). Note `git log` goes the *wrong way*: the real
+  hook produces more output than the pipe filter, so a git-heavy session could show a saving
+  that the real thing does not deliver. On the sessions measured this affects **19 of 170**
+  transformed observations (11%) — the other 89% are exact.
+
+  This gap is intrinsic, not an implementation shortcut: replay only holds the output of the
+  *original* command, and `rtk git log` runs git with its own `--format`, so those bytes were
+  never recorded. Re-executing locally would be worse — the repo has moved on since the
+  recording, so the rtk arm would see different underlying *facts* than control rather than
+  different formatting, breaking the pairing far more badly. **Full mode is the mode that
+  runs rtk for real**; that is the division of labour the two modes exist for.
+- **Incremental uses your LOCAL rtk; full mode uses the pin.** The transform runs on this
+  machine (like condense's `dense` CLI), so if `rtk --version` differs from `v0.44.0` the two
+  legs ran different versions of the method under test. The run warns, `minmax-bench setup`
+  reports the alignment and offers to install/upgrade, and comparing rtk-vs-control *within*
+  one run is unaffected either way.
 
 ### caveman is a generation policy, not a history transform
 
@@ -228,7 +387,7 @@ before spending anything.
 | flag | meaning |
 |---|---|
 | `--tasks` | `N` = first N recommended \| `random:N` (with `--seed`) \| a group: `all`/`long`/`short`/`hard`/`medium` (`long` = author timeout ≥ 30m, biasing toward sessions long enough to compact) \| `a,b,c` by name \| omitted = 5. `--list-tasks` shows everything known. |
-| `--arms` | default `condense,headroom`; vanilla always included; also `headroom-kompress`, `vanilla-proxy`, `caveman` |
+| `--arms` | default `condense,headroom`; vanilla always included; also `headroom-kompress`, `vanilla-proxy`, `caveman`, `rtk` |
 | `-m/--model` | default `claude-sonnet-4-6` |
 | `-d/--dataset` | Harbor dataset; only `terminal-bench/terminal-bench-2-1` is validated so far |
 | `--k` | trials per arm/task (default 4); `--k-vanilla` defaults to k+1 — the extra noise-floor run sharpens every verdict |
@@ -286,7 +445,7 @@ condense arm sends your session content to `api.condense.chat`.
 
 | flag | meaning |
 |---|---|
-| `--arms` | default `condense`; also `headroom` (`--headroom-mode token|cache`, auto-starts/stops the proxy; `--ccr/--no-ccr` injects the retrieve loop via `headroom mcp serve` — `--no-ccr` = kompress); `caveman` (frozen rails, terse-prose drift, `--caveman-mode lite|full|ultra`) |
+| `--arms` | default `condense`; also `headroom` (`--headroom-mode token|cache`, auto-starts/stops the proxy; `--ccr/--no-ccr` injects the retrieve loop via `headroom mcp serve` — `--no-ccr` = kompress); `caveman` (frozen rails, terse-prose drift, `--caveman-mode lite|full|ultra`); `rtk` (filters the recorded tool output through `rtk pipe` — needs rtk installed locally) |
 | `-n/--limit` | max decision points, contiguous from the start (strided sampling was removed — it distorted cost/compaction numbers) |
 | `--budget-usd` | per-arm spend cap, control included (default 2.0) |
 | `--judge` | `off` \| `goal` (rate each action toward the task — robust, recommended) \| `equivalence` (upgrade grep-vs-rg near-misses to "agrees") |
@@ -438,6 +597,7 @@ on the analysis path).
 | `minmax_bench/counterfactual.py` | generate | the rich `quality incremental` front-end (picker, cost preview, summary table) |
 | `harbor_agents/headroom_ccr_claude_code.py` | generate | self-contained CCR wiring for the `headroom` arm (preserves base MCP servers) |
 | `harbor_agents/caveman_claude_code.py` | generate | pinned caveman install + activation smoke test for the full-mode `caveman` arm |
+| `harbor_agents/rtk_claude_code.py` | generate | pinned rtk binary install + PreToolUse hook wiring + rewrite smoke test for the `rtk` arm |
 | `data/caveman/ruleset-<mode>.txt` | generate | frozen SessionStart-hook rulesets injected by incremental caveman (pinned; see `data/caveman/PIN`) |
 | `tests/test_quality.py` | — | unit tests for the metric code (`uv run pytest`) |
 

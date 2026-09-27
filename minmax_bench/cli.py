@@ -60,7 +60,7 @@ def _flag(argv: list[str], name: str, value, default=None) -> None:
 @quality_app.command("run")
 def quality_run(
     tasks: str | None = typer.Option(None, "--tasks", help="N recommended | random:N (with --seed) | group (all|long|short|hard|medium) | a,b,c | omitted = 5. `long`=author timeout ≥30m, biasing toward sessions long enough to compact. See --list-tasks."),
-    arms: str = typer.Option("condense,headroom", "--arms", help="Methods to run; vanilla baseline always included. Also: headroom-kompress (ablation), vanilla-proxy (passthrough control — isolates the proxy-wiring confound), caveman (terse-output skill; not a proxy, reads against plain vanilla)."),
+    arms: str = typer.Option("condense,headroom", "--arms", help="Methods to run; vanilla baseline always included. Also: headroom-kompress (ablation), vanilla-proxy (passthrough control — isolates the proxy-wiring confound), caveman (terse-output skill; not a proxy, reads against plain vanilla), rtk (tool-output filter; not a proxy either, also reads against plain vanilla)."),
     model: str | None = typer.Option(None, "--model", "-m", help="Model id (default claude-sonnet-4-6)."),
     effort: str | None = typer.Option(None, "--effort", help="Thinking effort for the container's Claude Code: low | medium | high | xhigh | max (default: unset — Claude Code's own default, high)."),
     dataset: str = typer.Option(_Q_DATASET, "--dataset", "-d", help="Harbor dataset (only the default is validated)."),
@@ -283,7 +283,7 @@ def _run_incremental(*, session: str | None, arms: str, model: str | None,
 @quality_app.command("incremental")
 def quality_incremental(
     session: str | None = typer.Argument(None, help="A session .jsonl (default: pick from ~/.claude/projects)."),
-    arms: str = typer.Option("condense", "--arms", help="Arms to compare besides control (condense, headroom, caveman)."),
+    arms: str = typer.Option("condense", "--arms", help="Arms to compare besides control (condense, headroom, caveman, rtk)."),
     model: str | None = typer.Option(None, "--model", "-m", help="Model to run the incremental on (default: the session's own, with auto-fallback if an arm can't serve it)."),
     effort: str | None = typer.Option(None, "--effort", help="Thinking effort override stamped onto every replayed request (low | medium | high | xhigh | max). Default: inherit the session's recorded thinking config."),
     limit: int = typer.Option(0, "--limit", "-n", help="Max decision points, contiguous from the start (0 = all). Strided sampling was removed — it distorted the cost/compaction numbers."),
