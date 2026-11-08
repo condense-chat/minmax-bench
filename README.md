@@ -1,32 +1,85 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/img/logo-dark.svg">
-    <img alt="minmax-bench" src="docs/img/logo.svg" height="56">
-  </picture>
-</p>
+![minmax-bench by Condense](docs/img/bench-cover.svg)
 
-<p align="center">
-  <strong>A battlefield for cost-saving strategies.</strong><br>
-  Were tokens saved? Were dollars saved? Was quality kept?
-</p>
+**Does compressing an agent’s context make the task cheaper to finish?** Replay recorded sessions to price the same work, then let the agent run independently to see whether it still solves the task.
 
-<p align="center">
-  <a href="#first-run"><strong>First run</strong></a> ·
-  <a href="#how-it-works"><strong>How it works</strong></a> ·
-  <a href="#strategies"><strong>Strategies</strong></a> ·
-  <a href="#quick-start"><strong>Quick start</strong></a> ·
-  <a href="#see-cached-results"><strong>See cached results</strong></a> ·
-  <a href="#docs"><strong>Docs</strong></a>
-</p>
+[Browse the benchmark site](https://condense-chat.github.io/dense/benchmarks/) · [Reproduce the Opus run](runs/run-5c61ab52-8eea-4fee-97a4-5c64ee5344af/README.md) · [Quality](#quality) · [Explore the datasets](data/README.md)
 
-<p align="center">
-  <img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-blue.svg">
-  <img alt="Python 3.11+" src="https://img.shields.io/badge/python-%E2%89%A53.11-3776AB.svg">
-  <img alt="Runs with uv" src="https://img.shields.io/badge/runtime-uv-black.svg">
-  <img alt="Anthropic and Bedrock" src="https://img.shields.io/badge/providers-Anthropic%20%C2%B7%20Bedrock-black.svg">
-</p>
+## Results by strategy
 
----
+On six SWE-chat sessions capped at 190k input tokens, **Condense cut model cost by 28.0%**, Headroom cache mode by **13.8%**, and Kompress by **1.8%**. All three used Claude Haiku 4.5.
+
+| Strategy | Matched turns | Baseline | After | Input tokens saved | Cost saved |
+| --- | --- | --- | --- | --- | --- |
+| Condense | 1,600 | $18.17 | $13.08 | 50.7% | 28.0% |
+| Headroom · cache mode | 1,573 | $17.66 | $15.22 | 15.2% | 13.8% |
+| Headroom · Kompress | 1,571 | $17.63 | $17.31 | 11.8% | 1.8% |
+
+Kompress cut input tokens by 11.8%, but earlier edits to the prompt meant paying for fresh cache writes. Each row compares the strategy with its own matched baseline. [Inspect the Haiku run](runs/run-202f98bd-a2f1-4390-8307-658b451b7727/README.md).
+
+## Quality
+
+### Does the agent still finish the task?
+
+A cost replay holds the conversation fixed. To test quality, let the agent choose its next step or run the entire task against its verifier.
+
+### What the next-step scores measure
+
+At each step of a recorded Opus coding session, the benchmark gives the agent the history so far and asks what it would do next. **Action agreement** counts how often it picks the same action as the recording. **Goal quality** counts how often a judge rates the proposed action as useful for the task. Two different tool calls can both move the work forward.
+
+![Control matched 46% of recorded actions and Condense matched 24%. The judge rated 58% of control steps and 63% of Condense steps good for the goal.](docs/img/action-vs-goal.svg)
+
+Even the uncompressed control reproduced the original action only **46%** of the time. Its **58%** goal score also fell below the study’s calibration target. The five-point difference on this one session therefore leaves the quality comparison uncertain. Condense also re-read previously retrieved information **17 times**, compared with **14** for control. [See the scoring rubric and replay](docs/quality.md#what-the-next-step-scores-measure).
+
+### What the task verifier found
+
+In a separate Opus 4.8 experiment, Claude Code worked through 14 long Terminal-Bench tasks. Each trial started from the task prompt and ended with an automated check of the final state.
+
+| Agent | Successful trials | Solve rate | Reported 95% interval |
+| --- | --- | --- | --- |
+| Vanilla Claude Code | 23 / 34 | 68% | 51–81% |
+| Condense | 11 / 14 | 79% | 52–92% |
+| Headroom | 10 / 14 | 71% | 45–88% |
+
+The trial counts differ, and the intervals overlap widely. This run leaves the ordering of the three strategies unresolved. [Published trial results](https://condense.chat/blog/evaluating-agent-quality/).
+
+### What an independent trial costs
+
+A second full-task comparison covered 56 Condense trials and 70 vanilla trials. Condense cost **27.9% more per trial** when the agent could choose its own path. The solve-rate difference was **−1.4 percentage points**, with a reported interval from −17 to +14. [Compare cost, turns and solve rate](docs/quality.md#read-a-full-task-result).
+
+## How soon does compression pay off?
+
+![Cumulative savings in one Opus session. At ten steps the model cost was 23% higher. By step 192, tokens were down 62% and cost was down 45%.](docs/img/replay-by-step.svg)
+
+The first ten steps cost **$1.30 with Condense vs. $1.06 with control**. The gap closed around step 20. Across the 192 steps both arms completed, cost went from **$33.61 to $18.53**, with the same average round-trip time of **20.7 seconds**. [See the published experiment](https://condense.chat/blog/evaluating-agent-quality/).
+
+## How much does input length matter?
+
+Across **64 sessions and 11,712 turns**, the Opus 4.8 rewrite replay priced the original requests at **$861.28** and the Condense requests at **$312.20**, a **63.8%** reduction. The estimate simulates cache usage and excludes optimizer fees. [Inspect the Opus run](runs/run-5c61ab52-8eea-4fee-97a4-5c64ee5344af/README.md).
+
+![Estimated cost saved by input length, from 9.2% below 16k tokens to 73.1% at 400k–800k.](docs/img/cost-by-context.svg)
+
+## Try it without a model key
+
+Install [uv](https://docs.astral.sh/uv/), then run the commands below. The first setup downloads dependencies. After that, reporting on the saved measurements works offline.
+
+
+```sh
+git clone https://github.com/condense-chat/minmax-bench.git
+cd minmax-bench
+uv sync
+uv run minmax-bench report 5c61ab52-8eea-4fee-97a4-5c64ee5344af
+```
+
+
+## Explore the reference runs
+
+| Run | Matched turns for Condense | Model cost before → after | Cost saved |
+| --- | --- | --- | --- |
+| [Opus 4.8 · rewrite](runs/run-5c61ab52-8eea-4fee-97a4-5c64ee5344af/README.md) | 11,712 | $861.28 → $312.20 | 63.8% |
+| [Haiku 4.5 · 190k cap](runs/run-202f98bd-a2f1-4390-8307-658b451b7727/README.md) | 1,600 | $18.17 → $13.08 | 28.0% |
+| [Haiku 4.5 · uncapped](runs/run-cba32b86-99ba-4ed7-bf7c-e385edf2ec99/README.md) | 2,909 | $56.69 → $35.52 | 37.3% |
+
+The two Haiku runs use the same six recorded sessions. Each run page includes every measured strategy, its matched turns, and its own baseline.
 
 ## First Run
 
@@ -69,139 +122,15 @@ More: [docs/explainer.md](docs/explainer.md) explains why each kind of evaluatio
 and covers the cheaper incremental mode. [docs/quality.md](docs/quality.md) lists every
 flag.
 
-## How it works
+## Run a new experiment
 
-Every context-compression tool advertises token savings. Tokens are not dollars, and
-dollars are not the whole story: a strategy that breaks the prompt cache trades cheap
-cache-reads for expensive cache-writes, and one that degrades the agent pays back its
-"savings" with interest in extra turns. **minmax-bench** runs the same sessions through
-each strategy and measures both sides of the trade:
+| Question | Where to start |
+| --- | --- |
+| How much would the same recorded work cost? | [Cost replay and cache pricing](docs/cost.md) |
+| Would a shorter history change the next tool call? | [Incremental replay](docs/quality.md#replay-the-next-decision) |
+| Does the agent finish the task at a lower cost? | [Full task runs](docs/quality.md#run-a-task-end-to-end) |
+| How do I compare another strategy? | [Strategy matrix and executors](docs/architecture.md) |
 
-### cost — the *minimize* target
+Run `uv run minmax-bench setup` to configure access, then `uv run minmax-bench run` to choose an experiment. A fresh live run uses model quota. The [evaluation guide](docs/explainer.md) explains how to choose tasks and controls.
 
-How many tokens a strategy saves, and how much of that survives as actual dollars.
-The analysis is cache-aware: **with a suboptimal strategy you can save tokens yet end
-up with a larger bill.** Methodology: [docs/cost.md](docs/cost.md).
-
-![Cost report: per-bucket tokens and cost saved, cache-aware](docs/img/cost-report.png)
-
-### quality — the *maximize* target
-
-How well the agent's trajectory is preserved under a strategy, compared to a control.
-Two flavors: **full** runs complete trajectories and compares them — closest to
-reality, but needs reruns to beat variance; **incremental** is deterministic — does
-the model produce the same step given identical pre-/post-strategy input?
-Methodology: [docs/quality.md](docs/quality.md).
-
-![Quality report: pooled per arm, with error bars](docs/img/quality-overall.png)
-
-Nothing is marked better or worse — a Δ bar straddling zero means *indistinguishable
-from control at this n*, which is the common outcome and not a pass. Read the quality
-columns against **context removed**: an arm at +3.5% next to one at +51% isn't
-gentler, it barely fired.
-
-**Cost tells you what a strategy saves; quality tells you whether those savings are
-real.** Read them together.
-
-## Strategies
-
-The contenders, and how they line up
-(full mechanics: [docs/architecture.md](docs/architecture.md)):
-
-| strategy | what it does | source | mode | transport |
-|---|---|---|---|---|
-| `baseline` | uncompressed control; everything is scored against it | built-in | n/a | n/a |
-| `upstream` | direct call to the provider; live cache-aware baseline | built-in | proxy | anthropic, bedrock |
-| `headroom` | compression proxy, cache-optimized: freezes prior turns for prefix-cache hits | [headroom-ai](https://pypi.org/project/headroom-ai/) | proxy, rewrite | anthropic, bedrock |
-| `headroom-kompress` | the same proxy in token mode: Kompress rewrites history for max compression | [headroom-ai](https://pypi.org/project/headroom-ai/) | proxy, rewrite | anthropic, bedrock |
-| `condense-sync` | whole-conversation compaction, blocking until it lands | [condense.chat](https://condense.chat) | proxy, rewrite\* | anthropic, bedrock |
-| `condense-async` | compaction in the background, paced by realistic think time | [condense.chat](https://condense.chat) | proxy, rewrite\* | anthropic, bedrock |
-| `caveman` | terse-output skill: shrinks what the agent *writes*, so its own messages accumulate smaller | [caveman](https://github.com/JuliusBrussee/caveman) | skill (quality bench only) | anthropic |
-
-**mode** is how a strategy is measured (cost bench only): **proxy** sends the real
-request through the strategy's proxy to the provider — real usage, real costs;
-**rewrite** uses the strategy's rewrite API and simulates caching locally, so a much
-larger dataset costs next to nothing. **skill** is not a proxy at all — the
-intervention runs inside the agent, changing how it writes rather than rewriting its
-history, so it has no cost-bench counterpart and is read against plain `vanilla`.
-**transport** is the provider API behind the bench's own model calls: the Anthropic
-API (API key *or* Claude subscription login) or AWS Bedrock. \* organization account
-only.
-
-## Quick start
-
-Requires [uv](https://docs.astral.sh/uv/) and Python ≥ 3.11.
-
-```bash
-uv sync                       # core (add --extra hf for the SWE-chat dataset loaders)
-uv run minmax-bench setup     # guided: detect creds, fill in keys, write .env
-```
-
-`setup` walks you through Anthropic access (API key **or** Claude Code login), the
-condense arm (`dense login`), and the optional dataset token. `minmax-bench info`
-shows the resolved state at any time. Prefer manual? `cp .env.dist .env` and fill in
-only what you run.
-
-No keys? The offline demo re-scores and replays the committed reference runs:
-
-```bash
-uv run minmax-bench report 202f98bd-a2f1-4390-8307-658b451b7727   # per-bucket tables
-uv run minmax-bench replay 202f98bd-a2f1-4390-8307-658b451b7727   # animated evolution
-uv run minmax-bench strategies                                    # list the matrix
-```
-
-With keys, each bench has a guided run — `minmax-bench run` is the front door that
-asks which one you want:
-
-```bash
-uv run minmax-bench run               # wizard: type, dataset, strategies, model, mode/transport
-uv run minmax-bench cost run          # wizard: dataset, strategies, model, mode/transport
-uv run minmax-bench quality run       # wizard: arms, tasks, model, k, budget → confirm
-```
-
-Or drive them with flags:
-
-```bash
-# cost: the clean head-to-head, truncated under Haiku's 200k cap
-uv run minmax-bench cost run -d swe-chat:32 \
-  -s headroom -s headroom-kompress -s condense-async \
-  -m claude-haiku-4-5 --token-budget 190k
-
-# cost, zero model spend: rewrite mode simulates caching locally
-uv run minmax-bench cost run -d swe-chat:64 -s condense-sync -s headroom --mode rewrite
-
-# quality: how would YOUR session have played out under condense?
-uv run minmax-bench quality incremental
-```
-
-> **Proxy runs cost real money**: you pay for the input tokens of every replayed turn.
-> Iterate with `--limit`, `--token-budget`, or `--mode rewrite`.
-
-## See cached results
-
-`runs/` ships three committed reference runs. Every number recomputes from stored
-usage — no keys, no network, zero spend:
-
-```bash
-uv run minmax-bench report 202f98bd-a2f1-4390-8307-658b451b7727
-uv run minmax-bench report cba32b86-99ba-4ed7-bf7c-e385edf2ec99
-uv run minmax-bench report 5c61ab52-8eea-4fee-97a4-5c64ee5344af
-uv run minmax-bench replay <any of the above>                      # animated
-```
-
-| run | setup | headline |
-|---|---|---|
-| `202f98bd` | headroom vs headroom-kompress vs condense-async, Haiku 4.5, truncated to 190k | the clean head-to-head: condense-async saves **~28%** cost, headroom (cache mode) ~14%, headroom-kompress ~2% — token savings die in cache-writes |
-| `cba32b86` | untruncated long sessions, ~$73.6 baseline | condense's savings *grow* with chain length, reaching **53%** in the 400k+ band |
-| `5c61ab52` | Opus 4.8, 64 sessions / ~11.7k turns, `--mode rewrite` (zero spend) | condense-sync **~73% tokens / ~64% cost** (~$549 off ~$861); headroom slightly negative at this scale |
-
-## Docs
-
-- [docs/explainer.md](docs/explainer.md) — why and how to evaluate a cost optimization: benchmark design, assumptions, and the three eval types.
-- [docs/cost.md](docs/cost.md) — cost-bench methodology: harness simulation, bucketing, cache modeling, run store.
-- [docs/quality.md](docs/quality.md) — quality-bench methodology: noise floor, axes, compaction gate, full + incremental.
-- [docs/architecture.md](docs/architecture.md) — how strategies, mode, and transport come together; module map.
-
-## Licence
-
-[MIT](LICENSE) — © condense.chat.
+[MIT license](LICENSE) · [Report an issue](https://github.com/condense-chat/minmax-bench/issues)

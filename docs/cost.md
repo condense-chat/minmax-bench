@@ -1,12 +1,81 @@
-# Cost bench — methodology
+# Price a recorded session
 
-**The minimize target.** How many tokens does a context-reduction strategy save on real
-agent sessions — and how much of that survives as actual dollars once prompt caching is
-accounted for?
+For each recorded turn, the harness rebuilds what the agent would send. It compares each strategy with the uncompressed request at the **same session and turn**, then groups the pair by the original input length.
+
+## Why token savings and cost savings differ
+
+In the 190k-capped Haiku run, Headroom Kompress removed **11.8% of input tokens**. Model cost fell only **1.8%**. Rewriting earlier messages forced new cache writes on later calls. [See all three strategies](../runs/run-202f98bd-a2f1-4390-8307-658b451b7727/README.md).
+
+| Measurement | What the harness uses | What it costs to generate |
+| --- | --- | --- |
+| Proxy | Usage returned by the upstream model with the output capped | Provider usage or subscription quota |
+| Rewrite | Transformed request, local token counts, simulated cache reads and writes | No upstream model calls for scoring. The rewrite service may require access. |
+| Saved report | Usage already in a run directory, priced by model | No new model calls |
+
+## Read a result
+
+Start with matched turns, then compare **baseline dollars**, **strategy dollars** and **input tokens**. Savings are `(baseline − strategy) / baseline`. A negative value means model cost rose. The all-turns percentage uses summed costs, so expensive turns carry more weight. Offline Claude token counts are approximate.
+
+
+```sh
+uv run minmax-bench report 5c61ab52-8eea-4fee-97a4-5c64ee5344af
+```
+
+[Opus breakdown](../runs/run-5c61ab52-8eea-4fee-97a4-5c64ee5344af/README.md) · [Dataset coverage](../data/README.md) · [Check task quality](quality.md)
+
+## Running
+
+```bash
+uv run minmax-bench cost run -d swe-chat:32 \
+  -s headroom -s headroom-kompress -s condense-async \
+  -m claude-haiku-4-5 --token-budget 190k
+```
+
+Bare `cost run` launches the guided wizard; `-y/--yes` skips it. The main knobs:
+
+| flag | meaning |
+|---|---|
+| `-d/--dataset` | dataset spec (default `sample`) |
+| `-s/--strategy` | strategy name(s), repeatable (default `headroom condense`) |
+| `-m/--model` | model id(s), repeatable (default haiku) |
+| `--mode` | run-wide `proxy` \| `rewrite` (see above) |
+| `--transport` | run-wide `anthropic` \| `bedrock` |
+| `--token-budget` | truncate each conversation at the first turn whose chain reaches N tokens |
+| `-n/--limit` | max conversations to load |
+| `--longest N` | keep only the N longest conversations |
+| `--max-points` | cap turns per conversation (bounds cost) |
+| `--edges` | comma-separated bucket upper edges (tokens) |
+| `--count` | baseline counting: `local` (tiktoken) or `api` (exact, free) |
+| `--run <uuid>` | resume an existing run, reusing its caches — spend only on what's missing |
+| `--refresh` | comma list of strategies (or `all`/`baseline`) to recompute, ignoring cache |
+| `--live/--no-live` | animate the live dashboard while measuring |
+| `--setup` | auto-install/start the local tools the strategies need (`auto`/`none`/list) |
+| `--runs-dir` | root for `run-<uuid>` dirs |
+
+## Run store, resume, and re-scoring
+
+Each run writes `runs/run-<uuid>/`, self-describing and replayable:
 
 ```
-session ─▶ harness simulator ─▶ [request points] ─▶ strategy (via executor) ─▶ usage ─▶ cost ─▶ bucketed report
+run.json                          manifest (dataset, strategies, mode/transport, models)
+report.json                       bucketed metrics
+models/<model>/baseline.json      raw per-turn baseline usage
+models/<model>/strategies/<s>.json  raw per-turn strategy usage
+README.md                         human summary
 ```
+
+Because raw usage is stored, everything downstream is free and offline:
+
+```bash
+uv run minmax-bench report <uuid>            # recompute + print the bucket tables
+uv run minmax-bench report <uuid> --edges …  # re-bucket without re-spending
+uv run minmax-bench replay <uuid>            # animated context + cost evolution
+uv run minmax-bench runs                     # list stored runs
+```
+
+
+<details>
+<summary>Harness reconstruction, cache assumptions, and input limits</summary>
 
 ## Harness simulator
 
@@ -72,97 +141,4 @@ The baseline is always the **noop** path: recorded usage from the transcript, or
 token count (`--count local`, tiktoken) or the free exact Anthropic
 `count_tokens` API (`--count api`).
 
-## Datasets
-
-`--dataset` accepts (`minmax_bench/data/loaders.py`):
-
-| spec | source |
-|---|---|
-| `sample` | built-in offline sample (no keys, no network) |
-| `swe-chat:N` | first N conversations of the SWE-chat dataset (needs `uv sync --extra hf`) |
-| `claude-code:/path/*.jsonl` | your own Claude Code session files |
-| `codex:…` / `opencode:…` | Codex / OpenCode session files |
-| `jsonl:…` | pre-normalized session JSONL |
-
-`minmax-bench fetch` downloads/prepares a dataset into the local shared cache up front.
-
-## Running
-
-```bash
-uv run minmax-bench cost run -d swe-chat:32 \
-  -s headroom -s headroom-kompress -s condense-async \
-  -m claude-haiku-4-5 --token-budget 190k
-```
-
-Bare `cost run` launches the guided wizard; `-y/--yes` skips it. The main knobs:
-
-| flag | meaning |
-|---|---|
-| `-d/--dataset` | dataset spec (default `sample`) |
-| `-s/--strategy` | strategy name(s), repeatable (default `headroom condense`) |
-| `-m/--model` | model id(s), repeatable (default haiku) |
-| `--mode` | run-wide `proxy` \| `rewrite` (see above) |
-| `--transport` | run-wide `anthropic` \| `bedrock` |
-| `--token-budget` | truncate each conversation at the first turn whose chain reaches N tokens |
-| `-n/--limit` | max conversations to load |
-| `--longest N` | keep only the N longest conversations |
-| `--max-points` | cap turns per conversation (bounds cost) |
-| `--edges` | comma-separated bucket upper edges (tokens) |
-| `--count` | baseline counting: `local` (tiktoken) or `api` (exact, free) |
-| `--run <uuid>` | resume an existing run, reusing its caches — spend only on what's missing |
-| `--refresh` | comma list of strategies (or `all`/`baseline`) to recompute, ignoring cache |
-| `--live/--no-live` | animate the live dashboard while measuring |
-| `--setup` | auto-install/start the local tools the strategies need (`auto`/`none`/list) |
-| `--runs-dir` | root for `run-<uuid>` dirs |
-
-## Run store, resume, and re-scoring
-
-Each run writes `runs/run-<uuid>/`, self-describing and replayable:
-
-```
-run.json                          manifest (dataset, strategies, mode/transport, models)
-report.json                       bucketed metrics
-models/<model>/baseline.json      raw per-turn baseline usage
-models/<model>/strategies/<s>.json  raw per-turn strategy usage
-README.md                         human summary
-```
-
-Because raw usage is stored, everything downstream is free and offline:
-
-```bash
-uv run minmax-bench report <uuid>            # recompute + print the bucket tables
-uv run minmax-bench report <uuid> --edges …  # re-bucket without re-spending
-uv run minmax-bench replay <uuid>            # animated context + cost evolution
-uv run minmax-bench runs                     # list stored runs
-```
-
-## Reference runs (committed, zero spend)
-
-Three reference runs ship in `runs/` — every number is recomputed from stored usage:
-
-- **`run-202f98bd`** — `headroom` vs `headroom-kompress` vs `condense-async` on Haiku 4.5
-  over `swe-chat:32` (6 long sessions), truncated to 190k. The clean head-to-head.
-- **`run-cba32b86`** — baseline + `condense-async`, untruncated (baseline ~$73.6 on
-  replay). Shows savings growing with chain length into the 200k–400k+ bands.
-- **`run-5c61ab52`** — `headroom` vs `condense-sync` on Opus 4.8 over the full
-  `swe-chat:64` (64 sessions, ~11.7k scored turns) in `--mode rewrite` — zero spend. At
-  this scale `condense-sync` saves ~73% tokens / ~64% cost (~$549 off an ~$861 baseline)
-  while `headroom` nets slightly negative overall.
-
-### Illustrative findings
-
-| strategy | cost saved (truncated 190k) | notes |
-|---|---|---|
-| `condense-async` | **28%** (37% untruncated) | scales *up* with chain length — 53% saved in the 400k+ band |
-| `headroom` (cache mode) | ~14% | preserves the prefix cache |
-| `headroom-kompress` (token mode) | ~2% | rewrites history, torching the cache — token savings barely survive to cost |
-
-Illustrative of *this* dataset/model, not universal — rerun on your own sessions.
-
-## Caveats
-
-- Offline token counts use `tiktoken` (an approximation for Claude); `--count api` or
-  proxy mode supply exact provider numbers when you need them.
-- Cost tables answer "how much does it save"; "does it still work" is the
-  [quality bench](quality.md) — read savings only where trajectory preservation is
-  confirmed (and where the task actually cleared the compaction gate).
+</details>

@@ -1,42 +1,283 @@
-# Quality bench — trajectory preservation
+# Does the agent still finish the task?
 
-**The maximize target.** Does a context-reduction method **preserve the agent's
-trajectory**, or change what it does? The cost tables assume compaction is behaviorally
-free — that assumption is load-bearing: if a method makes the agent wander or take more
-turns, the "savings" is partly illusory (more turns = more cost).
+A cost replay holds the conversation fixed. To test quality, let the agent choose its next step or run the entire task against its verifier.
 
-The bench runs the **full agent** (not a replay) under each method on real coding tasks
-([Terminal-Bench](https://github.com/laude-institute/terminal-bench) via
-[Harbor](https://github.com/laude-institute/harbor)) and compares trajectories to a
-**vanilla-vs-vanilla noise floor**. The bar is not "identical to control" (two vanilla
-runs already differ) — it's **"within the vanilla-vs-vanilla spread."**
+## What the next-step scores measure
 
-Two clearly separated phases — the same split the cost bench uses (`run` → store →
-`report`):
+![Share of actions matching the recording and share judged good for the goal, for control and Condense.](img/action-vs-goal.svg)
+
+Matching a tool call exactly can penalize another valid way to solve the task. The goal judge allows alternatives, although its control scored below the study’s calibration target on this session. [Study and scoring rubric](https://condense.chat/blog/evaluating-agent-quality/).
+
+| Across 192 shared steps | Uncompressed control | Condense |
+| --- | ---: | ---: |
+| Average context per request | 260k tokens | 99k tokens |
+| Total model cost | $33.61 | $18.53 |
+| Mean end-to-end time per step | 20.7 s | 20.7 s |
+
+## What the task verifier found
+
+The article also reports an **Opus 4.8** comparison across 14 long Terminal-Bench tasks. The verifier scored the final state of each trial.
+
+| Arm | Successful trials | Solve rate | Reported 95% interval |
+| --- | ---: | ---: | ---: |
+| Vanilla Claude Code | 23 / 34 | 68% | 51–81% |
+| Condense | 11 / 14 | 79% | 52–92% |
+| Headroom | 10 / 14 | 71% | 45–88% |
+
+The intervals overlap widely. This sample leaves the ranking unresolved. [Published task results and trial counts](https://condense.chat/blog/evaluating-agent-quality/).
+
+## Read a full-task result
+
+A separate example in the repository’s reporting guide covers **14 tasks**, with **56 Condense trials and 70 vanilla trials**. Each task has equal weight in the comparison.
+
+| Outcome | Vanilla | Condense change vs. vanilla | Reported interval for change |
+| --- | ---: | ---: | ---: |
+| Verifier solve rate | 80% | −1.4 percentage points | −17 to +14 points |
+| Billed turns per trial | 21.9 | +12.7% | −6% to +35% |
+| Model cost per trial | $1.44 | +27.9% | +8% to +53% |
+
+This suite found a higher cost per trial. The solve-rate interval includes both a meaningful loss and a gain. The 63.8% savings in the [Opus cost replay](../runs/run-5c61ab52-8eea-4fee-97a4-5c64ee5344af/README.md) came from a different workload with a fixed trajectory.
+
+## Run a task end to end
+
+Install Docker and Harbor, configure credentials, then run Claude Code against the same Terminal-Bench tasks with each arm. The verifier scores the final state. A short first run checks the setup. Use repeated trials and tasks long enough to trigger compaction for a comparison.
+
+
+```sh
+uv tool install harbor
+uv run minmax-bench setup
+uv run minmax-bench quality run --arms condense --tasks path-tracing --k 2 --budget-usd 5 --dry-run
+```
+
+Remove `--dry-run` to execute. This configuration schedules two Condense trials and three vanilla trials, each with a $5 budget. The default comparison uses four trials per arm and one extra vanilla trial to measure run-to-run variation.
+
+## Replay the next decision
+
+Run `uv run minmax-bench quality incremental` to choose a recorded Claude Code session. The model proposes the next action at each recorded step. The harness keeps the original tool results, so a different action cannot change the rest of the run. Compare agreement with the uncompressed control’s own agreement. This experiment uses model calls.
+
+## Interpret uncertainty
+
+Check how much context the optimizer actually removed. Then read the paired difference and interval. A task below the compaction threshold tells you little about the effect of compression. Crashed or timed-out full trials count as unsolved. For incremental results, steps from one session are correlated, so the reported uncertainty may be too small.
+
+
+<details>
+<summary>Full-run commands, flags, retries, and artifacts</summary>
+
+## `quality run` — full trajectories (SPENDS)
+
+```bash
+uv run minmax-bench quality run                     # bare = guided wizard
+uv run minmax-bench quality run -m claude-haiku-4-5 --tasks 5 --milestones
+```
+
+Runs the agent end-to-end through Harbor (Docker) for `vanilla` + each arm, `--k` repeats
+→ `<out>/<arm>-<task>/**`. Needs Docker + `uv tool install harbor` + creds (validated up
+front — a missing condense credential refuses to start instead of silently running
+unauthenticated). It prints its plan (arms × tasks × k = N trials + the cost ceiling)
+before spending anything.
+
+| flag | meaning |
+|---|---|
+| `--tasks` | `N` = first N recommended \| `random:N` (with `--seed`) \| a group: `all`/`long`/`short`/`hard`/`medium` (`long` = author timeout ≥ 30m, biasing toward sessions long enough to compact) \| `a,b,c` by name \| omitted = 5. `--list-tasks` shows everything known. |
+| `--arms` | default `condense,headroom`; vanilla always included; also `headroom-kompress`, `vanilla-proxy`, `caveman` |
+| `-m/--model` | default `claude-sonnet-4-6` |
+| `-d/--dataset` | Harbor dataset; only `terminal-bench/terminal-bench-2-1` is validated so far |
+| `--k` | trials per arm/task (default 4); `--k-vanilla` defaults to k+1 — the extra noise-floor run sharpens every verdict |
+| `--budget-usd` | per-trial spend cap (default 5.0) |
+| `--wall-timeout` | per-trial wall-clock **floor** (default 2400s); the effective cap **auto-sizes** up to each task's own author budget (× the arm's exec multiplier) + build/setup/verify overhead, so long tasks aren't guillotined |
+| `--retries N` | re-attempt a cell that *crashed or timed out* (no verifier result) until every trial resolves or attempts run out; a trial that ran and scored (even 0) is a real result and is **not** retried |
+| `--force` | full retry: re-run everything. Default is **automatic resume** — re-run the same command/`--out` and finished cells are skipped |
+| `--milestones` | also run the LLM milestone judge → `milestones.json` (grounded in a solved vanilla run, which is then excluded from vanilla's own coverage scoring) |
+| `--out` | results root (default: fresh auto-minted dir under `settings.quality_runs_dir`, `runs/quality/…` — never clobbers) |
+| `--concurrency` | trials of one cell run at once (harbor `-n`); **default 1 = sequential**, and the wizard asks. Cells run one at a time so it is capped by `k`. Same total spend, N× the burn rate — but N containers contending for CPU/RAM/disk can slow the agent's commands and shift the trajectories this bench measures, so sequential is the clean setting |
+| `--agent-timeout-mult` / `--setup-timeout-mult` | Harbor exec/setup timeout multipliers (headroom auto-3; slow container installs) |
+| `--auth` | `auto` \| `api-key` \| `subscription` (force the Claude Code login — no API key needed) |
+| `--dry-run` | print the Harbor commands without running |
+| `--agent` | `claude-code` (default); `codex` / `opencode` = TODO (errors, doesn't fake it) |
+
+Every cell writes `attempted.json` first, so killed trials show up as `⚠ lost` in the
+report (counted as unsolved) instead of vanishing.
+
+**Two runs at once is safe.** On exit — normal, crash, Ctrl-C or SIGTERM — a run reaps the
+docker containers and networks its own trials leaked, identified by the trial directories it
+created under its own cells. It will not touch another run's resources, so you can run two
+arms side by side (different arms, or the same arm from another checkout) without the first
+to finish tearing down the other's live containers. The trade is that a container whose trial
+directory never got written survives until you clean it up by hand.
+
+On a Claude Code subscription (no API key), every upstream call — replay and judges alike —
+carries the CLI's identity system block. Subscription traffic is classified by whether it
+looks like Claude Code, and a request with no system prompt is throttled far harder: without
+this the milestone judge could `429` on three small calls right after the same credentials had
+happily served a whole 6-cell run. A `429` from the judge is transient, not a quota failure —
+re-run it, and `milestones.json` caches per task so you only pay for what's still missing.
+
+</details>
+
+<details>
+<summary>Incremental commands, controls, and budgeting</summary>
+
+## `quality incremental` — teacher-forced replay of your own session (SPENDS)
+
+How would one of your real sessions have played out under condense? Pick any session from
+`~/.claude/projects` and teacher-force it step-by-step through control + each arm. No
+Docker, no Harbor — just auth (API key **or** Claude Code login). It auto-detects the
+session's model (auto-falling back if an arm can't serve it), shows a cost estimate, and
+asks before spending.
+
+```bash
+uv run minmax-bench quality incremental                       # interactive picker + confirm
+uv run minmax-bench quality incremental ~/.claude/projects/<proj>/<id>.jsonl --arms condense -n 30
+```
+
+Per arm you get **same-action agreement** (read against the control floor, not 100%) or,
+with `--judge goal`, a per-step good/degraded/bad rating; plus **avg context tokens**,
+**$ vs control** (over the common step set, cold-cache step 0 excluded), and a
+**recorded** row — what those turns *actually* consumed when the session ran, making the
+table both a comparison and a backtest. It closes with a plain-English **bottom line** per
+arm — *context saved X% · $ saved Y% · <quality>* — where the quality metric is the one you
+chose (goal-quality under `--judge goal`, same-action fidelity otherwise; the structural
+`exact` column is dimmed under `--judge goal` so it isn't mistaken for the verdict). Note the
+condense arm sends your session content to `api.condense.chat`.
+
+| flag | meaning |
+|---|---|
+| `--arms` | default `condense`; also `headroom` (`--headroom-mode token|cache`, auto-starts/stops the proxy; `--ccr/--no-ccr` injects the retrieve loop via `headroom mcp serve` — `--no-ccr` = kompress); `caveman` (frozen rails, terse-prose drift, `--caveman-mode lite|full|ultra`) |
+| `-n/--limit` | max decision points, contiguous from the start (strided sampling was removed — it distorted cost/compaction numbers) |
+| `--budget-usd` | per-arm spend cap, control included (default 2.0) |
+| `--judge` | `off` \| `goal` (rate each action toward the task — robust, recommended) \| `equivalence` (upgrade grep-vs-rg near-misses to "agrees") |
+| `--ctx-gate` | skip sessions whose peak context stays below this (default 50k; 0 = run anyway) |
+| `--caveman-mode` | caveman intensity: `lite` \| `full` (default) \| `ultra`. Injects the pinned hook's ruleset and keeps caveman's terse prose over frozen tool rails; read on `comp` like condense, plus `action-aligned %` (drift) |
+| `--capture` | run your version-matched Claude Code binary once, locally, to capture the exact system prompt + tools instead of a stored template |
+| `--independent-budgets` | default (`--cap-to-control`) caps every arm at the steps control reached within budget — the paired comparison window, no wasted spend; this flag lets each arm run to its own budget instead ("how far can each arm get"), at the cost of ragged step counts |
+| `--resume/--no-resume` | re-running to the same `--out` skips arms that finished cleanly (`.done` sentinel) — a cancel mid-run picks up at the next arm instead of re-running control |
+| `--task` | task label for the report join (default `session`); must match what you pass `quality report --tasks` |
+| `--max-tokens` | per-step output cap (default 6000) |
+| `--auth` | as in `quality run` |
+
+Output: `<out>/incremental/<task>-<arm>.jsonl` (paired, cache-aware, no turn-count noise).
+
+</details>
+
+<details>
+<summary>Report columns, statistical methods, and worked examples</summary>
+
+## `quality report` — display (pure, offline, free)
+
+```bash
+uv run minmax-bench quality report --from results/jobs/run1 --tasks 5 --format md
+```
+
+| flag | meaning |
+|---|---|
+| `--from` | results root produced by `quality run` (default `results/jobs`) |
+| `--tasks` / `--arms` | what to display (must cover what was run) |
+| `--format` | `html` (default) \| `md`; `--out` overrides the output path |
+| `--ctx-gate` | ⊘ threshold for the display (default 50k) |
+
+Reads whatever the generation commands wrote — full run dirs (**length / rework /
+solve**, each vs the vanilla noise floor: ✓ overlap / ✗ disjoint, ≥2 finished runs/arm,
+`⚠ lost` surfaced), `milestones.json` (found recursively), and `incremental/*.jsonl`
+(rendered as **fid** next to the control floor, plus **comp** and **$Δ** over the common
+step set). Deterministic, no network.
+
+### the full-run table — one row per arm, every metric against vanilla
+
+The per-task tables answer *"what happened on this task"*; every cell there is one or a few
+trials, so nothing in them carries an error bar and reading them means holding a column of
+small numbers in your head. The **full runs** table, printed first, answers the other question
+— *"across everything that was run, what did this arm cost, and is the difference bigger than
+the noise?"*
 
 ```
-quality run | incremental  ──▶  results root/**     quality report  ──▶  report.html | report.md
- (SPENDS: run agents / replay)     (artifacts)      (PURE DISPLAY: reads artifacts, never spends)
+┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┓
+┃                        ┃      solve ┃      turns ┃   peak ctx ┃     tokens ┃          $ ┃         $ ┃    cache wr ┃      compact┃
+┃arm                     ┃  rate, pts ┃  per trial ┃     tokens ┃  per trial ┃  per trial ┃  per Mtok ┃       share ┃    per trial┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━┩
+│vanilla                 │        80% │       21.9 │     59,308 │    989,160 │      $1.44 │     $1.45 │        4.0% │         0.00│
+│14 tasks · ground       │            │            │            │            │            │           │             │             │
+├────────────────────────┼────────────┼────────────┼────────────┼────────────┼────────────┼───────────┼─────────────┼─────────────┤
+│condense                │   -1.4 pts │     +12.7% │      -3.8% │     +13.7% │     +27.9% │    +12.4% │     +103.3% │         2.14│
+│14 tasks · 56v70 trials │ [-17, +14] │  [-6, +35] │  [-16, +9] │ [-12, +48] │  [+8, +53] │ [-7, +33] │ [+37, +183] │ [1.39, 2.89]│
+└────────────────────────┴────────────┴────────────┴────────────┴────────────┴────────────┴───────────┴─────────────┴─────────────┘
 ```
 
-**`quality report` never calls a model.** Everything that spends lives in `quality run`
-(full) / `quality incremental` / the judges. The analysis path is pure standard library —
-Docker + Harbor are only needed to *generate* runs.
+The `vanilla` row is the absolute **ground**; every arm row is that arm against it. (The real
+table also carries a `$ per step` column, dropped here for width.)
 
-## Two modes, two claims
+- **solve** — verifier pass rate, in percentage **points**. Not a ratio: a ratio is undefined
+  when vanilla is 0% and meaningless when it is 100%, which is 8 of 14 tasks on this suite.
+  Lost trials count as failures.
+- **turns** — billed requests, deduped by `requestId`. **Steps** (`$ per step`) are `tool_use`
+  blocks — near 1:1 in practice but not the same unit, so a $-per-unit column must say which.
+- **cache wr** — cache-write share of cached tokens. Writes bill at **12.5×** reads, so this
+  is the one cache number that explains a `$/Mtok` move.
+- **compact** — billed turns whose context came back *smaller* than the turn before. Measured
+  on the outcome, not inferred from cache traffic: the old cache-side heuristic (a large
+  `cache_creation` without matching context growth) also fires on ordinary prefix rewrites and
+  over-counts by ~1.6×. Shown **absolute**, because vanilla is exactly 0 and every ratio would
+  be infinite — and validated by exactly that: vanilla and caveman measure `0.00` across 72 and
+  56 trials.
 
-The modes are deliberately complementary — a method can pass one and fail the other, and
-both outcomes are informative:
+Three rules keep it from over-claiming:
 
-- **full** — end-to-end trajectories. Catches *behavioral* changes (turn-count inflation,
-  induced planning, solve rate) but can't attribute them, and needs several repeats to
-  beat the variance.
-- **incremental** (teacher-forced) — replays a recorded session step-by-step: does
-  compressing this exact history change the next decision? Deterministic and paired, so it
-  catches *informational* loss — but it's structurally blind to behavioral effects, and on
-  short sessions threshold-gated compaction never fires. Teacher-forced replay executes no
-  tools, so CCR's retrieve loop can't engage here; the full headroom product belongs to
-  full mode.
+1. **Every % is a geometric mean of per-task ratios** — `exp(mean(log(arm/vanilla))) − 1` — so
+   each task votes once. The pooled ratio-of-sums this replaced was *dollar-weighted in
+   disguise*: on the opus-5 suite three of fourteen tasks carried 41% of the spend, so "cost
+   +81%" was really "+81% on the three tasks that happen to be expensive".
+2. **The interval is a two-level bootstrap**, seeded, so the same artifacts always render the
+   same bars: resample *tasks*, then resample *trials* within each resampled cell. Resampling
+   tasks alone treats a 4-trial cell mean as exact and produces intervals far too narrow —
+   two levels is what makes vanilla's own spread visible. Tasks are shared across arms (the
+   comparison is paired); trial draws are independent per arm.
+3. **Bold marks an interval clear of zero.** Everything else is indistinguishable from vanilla
+   at this n — the common case, and not a pass. Only tasks where *both* the arm and vanilla
+   produced a usable trial are counted, so every number down a column rests on the same tasks.
+
+### the incremental table
+
+Printed below it, and about something else entirely — the teacher-forced replay, whose control
+is a no-compression ceiling rather than a competitor.
+
+```
+┏━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
+┃arm          ┃     quality ┃   redundant ┃     context┃
+┃             ┃ incremental ┃  /100 steps ┃     removed┃
+┡━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
+│control      │  78.1 ± 4.7 │   5.0 ± 2.5 │           —│
+│             │ 317 steps/4s│             │            │
+│condense     │  73.5 ± 4.7 │  11.0 ± 3.5 │      +39.1%│
+│⊘6 passthru  │  Δ-4.6 ± 5.9│  Δ+6.0 ± 3.2│            │
+└─────────────┴─────────────┴─────────────┴────────────┘
+```
+
+- **quality (incremental)** — the share of replayed steps whose action the goal judge rated
+  *good*; without `--judge goal` it falls back to structural agreement with the recording,
+  a much noisier floor.
+- **redundant** — steps that re-fetched information the agent already had, per 100 steps.
+- **context removed** — not a quality axis. It is what the quality columns are the *price
+  of*, and the number without which they can't be read: an arm at `+3%` next to one at
+  `+39%` isn't gentler, it barely fired. `⊘` marks <2%.
+
+Here `±` resamples the paired *steps*, and `Δ` under an arm value is its **paired** difference
+vs control with its own CI — the ± on the values themselves are marginal, since arm and control
+move together step-for-step, so only the Δ answers "is this a real difference?". Steps within a
+session are correlated and are resampled as independent, so those bars are if anything
+optimistic. Sessions the arm passed through are dropped and counted (`⊘6 passthrough`) —
+nothing is dropped quietly.
+   A Δ bar straddling zero means *indistinguishable from control at this n*, which is the
+   common outcome and not a pass. Nothing is coloured or marked better/worse: the table
+   prints the numbers and you draw the line.
+
+Each arm carries its own control reference, paired over that arm's material. When the arms
+ran over the same tasks and sessions one control row heads the table; when they didn't,
+control is repeated per arm, because a single baseline row would be comparing an arm against
+material it never ran.
+
+</details>
+
+<details>
+<summary>Quality axes, compaction gate, and agent-specific controls</summary>
 
 ## Axes
 
@@ -212,206 +453,10 @@ every successful step, so the two legitimately differ; the readout states both.
 bench's `headroom` (token + CCR) has no cost-bench counterpart, because CCR needs a
 running agent.
 
-## `quality run` — full trajectories (SPENDS)
+</details>
 
-```bash
-uv run minmax-bench quality run                     # bare = guided wizard
-uv run minmax-bench quality run -m claude-haiku-4-5 --tasks 5 --milestones
-```
-
-Runs the agent end-to-end through Harbor (Docker) for `vanilla` + each arm, `--k` repeats
-→ `<out>/<arm>-<task>/**`. Needs Docker + `uv tool install harbor` + creds (validated up
-front — a missing condense credential refuses to start instead of silently running
-unauthenticated). It prints its plan (arms × tasks × k = N trials + the cost ceiling)
-before spending anything.
-
-| flag | meaning |
-|---|---|
-| `--tasks` | `N` = first N recommended \| `random:N` (with `--seed`) \| a group: `all`/`long`/`short`/`hard`/`medium` (`long` = author timeout ≥ 30m, biasing toward sessions long enough to compact) \| `a,b,c` by name \| omitted = 5. `--list-tasks` shows everything known. |
-| `--arms` | default `condense,headroom`; vanilla always included; also `headroom-kompress`, `vanilla-proxy`, `caveman` |
-| `-m/--model` | default `claude-sonnet-4-6` |
-| `-d/--dataset` | Harbor dataset; only `terminal-bench/terminal-bench-2-1` is validated so far |
-| `--k` | trials per arm/task (default 4); `--k-vanilla` defaults to k+1 — the extra noise-floor run sharpens every verdict |
-| `--budget-usd` | per-trial spend cap (default 5.0) |
-| `--wall-timeout` | per-trial wall-clock **floor** (default 2400s); the effective cap **auto-sizes** up to each task's own author budget (× the arm's exec multiplier) + build/setup/verify overhead, so long tasks aren't guillotined |
-| `--retries N` | re-attempt a cell that *crashed or timed out* (no verifier result) until every trial resolves or attempts run out; a trial that ran and scored (even 0) is a real result and is **not** retried |
-| `--force` | full retry: re-run everything. Default is **automatic resume** — re-run the same command/`--out` and finished cells are skipped |
-| `--milestones` | also run the LLM milestone judge → `milestones.json` (grounded in a solved vanilla run, which is then excluded from vanilla's own coverage scoring) |
-| `--out` | results root (default: fresh auto-minted dir under `settings.quality_runs_dir`, `runs/quality/…` — never clobbers) |
-| `--concurrency` | trials of one cell run at once (harbor `-n`); **default 1 = sequential**, and the wizard asks. Cells run one at a time so it is capped by `k`. Same total spend, N× the burn rate — but N containers contending for CPU/RAM/disk can slow the agent's commands and shift the trajectories this bench measures, so sequential is the clean setting |
-| `--agent-timeout-mult` / `--setup-timeout-mult` | Harbor exec/setup timeout multipliers (headroom auto-3; slow container installs) |
-| `--auth` | `auto` \| `api-key` \| `subscription` (force the Claude Code login — no API key needed) |
-| `--dry-run` | print the Harbor commands without running |
-| `--agent` | `claude-code` (default); `codex` / `opencode` = TODO (errors, doesn't fake it) |
-
-Every cell writes `attempted.json` first, so killed trials show up as `⚠ lost` in the
-report (counted as unsolved) instead of vanishing.
-
-**Two runs at once is safe.** On exit — normal, crash, Ctrl-C or SIGTERM — a run reaps the
-docker containers and networks its own trials leaked, identified by the trial directories it
-created under its own cells. It will not touch another run's resources, so you can run two
-arms side by side (different arms, or the same arm from another checkout) without the first
-to finish tearing down the other's live containers. The trade is that a container whose trial
-directory never got written survives until you clean it up by hand.
-
-On a Claude Code subscription (no API key), every upstream call — replay and judges alike —
-carries the CLI's identity system block. Subscription traffic is classified by whether it
-looks like Claude Code, and a request with no system prompt is throttled far harder: without
-this the milestone judge could `429` on three small calls right after the same credentials had
-happily served a whole 6-cell run. A `429` from the judge is transient, not a quota failure —
-re-run it, and `milestones.json` caches per task so you only pay for what's still missing.
-
-## `quality incremental` — teacher-forced replay of your own session (SPENDS)
-
-How would one of your real sessions have played out under condense? Pick any session from
-`~/.claude/projects` and teacher-force it step-by-step through control + each arm. No
-Docker, no Harbor — just auth (API key **or** Claude Code login). It auto-detects the
-session's model (auto-falling back if an arm can't serve it), shows a cost estimate, and
-asks before spending.
-
-```bash
-uv run minmax-bench quality incremental                       # interactive picker + confirm
-uv run minmax-bench quality incremental ~/.claude/projects/<proj>/<id>.jsonl --arms condense -n 30
-```
-
-Per arm you get **same-action agreement** (read against the control floor, not 100%) or,
-with `--judge goal`, a per-step good/degraded/bad rating; plus **avg context tokens**,
-**$ vs control** (over the common step set, cold-cache step 0 excluded), and a
-**recorded** row — what those turns *actually* consumed when the session ran, making the
-table both a comparison and a backtest. It closes with a plain-English **bottom line** per
-arm — *context saved X% · $ saved Y% · <quality>* — where the quality metric is the one you
-chose (goal-quality under `--judge goal`, same-action fidelity otherwise; the structural
-`exact` column is dimmed under `--judge goal` so it isn't mistaken for the verdict). Note the
-condense arm sends your session content to `api.condense.chat`.
-
-| flag | meaning |
-|---|---|
-| `--arms` | default `condense`; also `headroom` (`--headroom-mode token|cache`, auto-starts/stops the proxy; `--ccr/--no-ccr` injects the retrieve loop via `headroom mcp serve` — `--no-ccr` = kompress); `caveman` (frozen rails, terse-prose drift, `--caveman-mode lite|full|ultra`) |
-| `-n/--limit` | max decision points, contiguous from the start (strided sampling was removed — it distorted cost/compaction numbers) |
-| `--budget-usd` | per-arm spend cap, control included (default 2.0) |
-| `--judge` | `off` \| `goal` (rate each action toward the task — robust, recommended) \| `equivalence` (upgrade grep-vs-rg near-misses to "agrees") |
-| `--ctx-gate` | skip sessions whose peak context stays below this (default 50k; 0 = run anyway) |
-| `--caveman-mode` | caveman intensity: `lite` \| `full` (default) \| `ultra`. Injects the pinned hook's ruleset and keeps caveman's terse prose over frozen tool rails; read on `comp` like condense, plus `action-aligned %` (drift) |
-| `--capture` | run your version-matched Claude Code binary once, locally, to capture the exact system prompt + tools instead of a stored template |
-| `--independent-budgets` | default (`--cap-to-control`) caps every arm at the steps control reached within budget — the paired comparison window, no wasted spend; this flag lets each arm run to its own budget instead ("how far can each arm get"), at the cost of ragged step counts |
-| `--resume/--no-resume` | re-running to the same `--out` skips arms that finished cleanly (`.done` sentinel) — a cancel mid-run picks up at the next arm instead of re-running control |
-| `--task` | task label for the report join (default `session`); must match what you pass `quality report --tasks` |
-| `--max-tokens` | per-step output cap (default 6000) |
-| `--auth` | as in `quality run` |
-
-Output: `<out>/incremental/<task>-<arm>.jsonl` (paired, cache-aware, no turn-count noise).
-
-## `quality report` — display (pure, offline, free)
-
-```bash
-uv run minmax-bench quality report --from results/jobs/run1 --tasks 5 --format md
-```
-
-| flag | meaning |
-|---|---|
-| `--from` | results root produced by `quality run` (default `results/jobs`) |
-| `--tasks` / `--arms` | what to display (must cover what was run) |
-| `--format` | `html` (default) \| `md`; `--out` overrides the output path |
-| `--ctx-gate` | ⊘ threshold for the display (default 50k) |
-
-Reads whatever the generation commands wrote — full run dirs (**length / rework /
-solve**, each vs the vanilla noise floor: ✓ overlap / ✗ disjoint, ≥2 finished runs/arm,
-`⚠ lost` surfaced), `milestones.json` (found recursively), and `incremental/*.jsonl`
-(rendered as **fid** next to the control floor, plus **comp** and **$Δ** over the common
-step set). Deterministic, no network.
-
-### the full-run table — one row per arm, every metric against vanilla
-
-The per-task tables answer *"what happened on this task"*; every cell there is one or a few
-trials, so nothing in them carries an error bar and reading them means holding a column of
-small numbers in your head. The **full runs** table, printed first, answers the other question
-— *"across everything that was run, what did this arm cost, and is the difference bigger than
-the noise?"*
-
-```
-┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┓
-┃                        ┃      solve ┃      turns ┃   peak ctx ┃     tokens ┃          $ ┃         $ ┃    cache wr ┃      compact┃
-┃arm                     ┃  rate, pts ┃  per trial ┃     tokens ┃  per trial ┃  per trial ┃  per Mtok ┃       share ┃    per trial┃
-┡━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━┩
-│vanilla                 │        80% │       21.9 │     59,308 │    989,160 │      $1.44 │     $1.45 │        4.0% │         0.00│
-│14 tasks · ground       │            │            │            │            │            │           │             │             │
-├────────────────────────┼────────────┼────────────┼────────────┼────────────┼────────────┼───────────┼─────────────┼─────────────┤
-│condense                │   -1.4 pts │     +12.7% │      -3.8% │     +13.7% │     +27.9% │    +12.4% │     +103.3% │         2.14│
-│14 tasks · 56v70 trials │ [-17, +14] │  [-6, +35] │  [-16, +9] │ [-12, +48] │  [+8, +53] │ [-7, +33] │ [+37, +183] │ [1.39, 2.89]│
-└────────────────────────┴────────────┴────────────┴────────────┴────────────┴────────────┴───────────┴─────────────┴─────────────┘
-```
-
-The `vanilla` row is the absolute **ground**; every arm row is that arm against it. (The real
-table also carries a `$ per step` column, dropped here for width.)
-
-- **solve** — verifier pass rate, in percentage **points**. Not a ratio: a ratio is undefined
-  when vanilla is 0% and meaningless when it is 100%, which is 8 of 14 tasks on this suite.
-  Lost trials count as failures.
-- **turns** — billed requests, deduped by `requestId`. **Steps** (`$ per step`) are `tool_use`
-  blocks — near 1:1 in practice but not the same unit, so a $-per-unit column must say which.
-- **cache wr** — cache-write share of cached tokens. Writes bill at **12.5×** reads, so this
-  is the one cache number that explains a `$/Mtok` move.
-- **compact** — billed turns whose context came back *smaller* than the turn before. Measured
-  on the outcome, not inferred from cache traffic: the old cache-side heuristic (a large
-  `cache_creation` without matching context growth) also fires on ordinary prefix rewrites and
-  over-counts by ~1.6×. Shown **absolute**, because vanilla is exactly 0 and every ratio would
-  be infinite — and validated by exactly that: vanilla and caveman measure `0.00` across 72 and
-  56 trials.
-
-Three rules keep it from over-claiming:
-
-1. **Every % is a geometric mean of per-task ratios** — `exp(mean(log(arm/vanilla))) − 1` — so
-   each task votes once. The pooled ratio-of-sums this replaced was *dollar-weighted in
-   disguise*: on the opus-5 suite three of fourteen tasks carried 41% of the spend, so "cost
-   +81%" was really "+81% on the three tasks that happen to be expensive".
-2. **The interval is a two-level bootstrap**, seeded, so the same artifacts always render the
-   same bars: resample *tasks*, then resample *trials* within each resampled cell. Resampling
-   tasks alone treats a 4-trial cell mean as exact and produces intervals far too narrow —
-   two levels is what makes vanilla's own spread visible. Tasks are shared across arms (the
-   comparison is paired); trial draws are independent per arm.
-3. **Bold marks an interval clear of zero.** Everything else is indistinguishable from vanilla
-   at this n — the common case, and not a pass. Only tasks where *both* the arm and vanilla
-   produced a usable trial are counted, so every number down a column rests on the same tasks.
-
-### the incremental table
-
-Printed below it, and about something else entirely — the teacher-forced replay, whose control
-is a no-compression ceiling rather than a competitor.
-
-```
-┏━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
-┃arm          ┃     quality ┃   redundant ┃     context┃
-┃             ┃ incremental ┃  /100 steps ┃     removed┃
-┡━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
-│control      │  78.1 ± 4.7 │   5.0 ± 2.5 │           —│
-│             │ 317 steps/4s│             │            │
-│condense     │  73.5 ± 4.7 │  11.0 ± 3.5 │      +39.1%│
-│⊘6 passthru  │  Δ-4.6 ± 5.9│  Δ+6.0 ± 3.2│            │
-└─────────────┴─────────────┴─────────────┴────────────┘
-```
-
-- **quality (incremental)** — the share of replayed steps whose action the goal judge rated
-  *good*; without `--judge goal` it falls back to structural agreement with the recording,
-  a much noisier floor.
-- **redundant** — steps that re-fetched information the agent already had, per 100 steps.
-- **context removed** — not a quality axis. It is what the quality columns are the *price
-  of*, and the number without which they can't be read: an arm at `+3%` next to one at
-  `+39%` isn't gentler, it barely fired. `⊘` marks <2%.
-
-Here `±` resamples the paired *steps*, and `Δ` under an arm value is its **paired** difference
-vs control with its own CI — the ± on the values themselves are marginal, since arm and control
-move together step-for-step, so only the Δ answers "is this a real difference?". Steps within a
-session are correlated and are resampled as independent, so those bars are if anything
-optimistic. Sessions the arm passed through are dropped and counted (`⊘6 passthrough`) —
-nothing is dropped quietly.
-   A Δ bar straddling zero means *indistinguishable from control at this n*, which is the
-   common outcome and not a pass. Nothing is coloured or marked better/worse: the table
-   prints the numbers and you draw the line.
-
-Each arm carries its own control reference, paired over that arm's material. When the arms
-ran over the same tasks and sessions one control row heads the table; when they didn't,
-control is repeated per arm, because a single baseline row would be comparing an arm against
-material it never ran.
+<details>
+<summary>Other commands, implementation, and earlier findings</summary>
 
 ## The rest of the toolbox
 
@@ -465,3 +510,7 @@ uv run minmax-bench setup                                              # or: cp 
 uv run minmax-bench quality run --out results/jobs/run1 --milestones   # 5 default tasks
 uv run minmax-bench quality report --from results/jobs/run1 --tasks 5
 ```
+
+</details>
+
+[Evaluation design](explainer.md) · [Cost replay](cost.md)

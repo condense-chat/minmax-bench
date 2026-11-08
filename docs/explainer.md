@@ -1,30 +1,24 @@
-# Optimization Evaluation Guide
+# Choose the experiment that can answer your question
 
-# Part 1: Building an Optimization Benchmark
+Suppose an agent reads a large file, edits it, then runs a failing test. A compressor can make the next request cheaper by shortening the file. The harder question is whether the agent still remembers the line it needs to fix.
 
-The measurement target of a cost optimization strategy is simple to phrase:
+| Experiment | Hold fixed | Measure | What it can miss |
+| --- | --- | --- | --- |
+| Cost replay | Every recorded message, tool result and turn | Cache-aware price of the same work | Extra work the agent might do |
+| Incremental replay | History up to each recorded decision | Next action or goal rating against a control | Consequences after a different decision |
+| Full task | Starting task, verifier, model and settings | Solve rate, turns and cost per trial | Small effects when there are few trials |
 
-> Can an agent accomplish the same tasks more cheaply with a chosen strategy than without it?
+## Design a comparison
 
-This carries a couple of assumptions:
-- There exists a good benchmark that models our problem space
-- A given agentic system will predictably solve the same task (with a stable success probability)
-- Identical tasks on an identical agent are comparable in cost and execution
+1. Choose tasks with an external verifier and histories long enough for the intervention to act.
+2. Repeat the unmodified agent to measure how much it varies on its own. Use the same tasks, model and budgets for the other arms.
+3. Compare cost on matched requests, then check solve rate and total cost when the agent runs independently. Report sample sizes and the interval on the difference.
 
-With these assumptions, our evaluation simply becomes:
+In the [long-session cost replay](../runs/run-cba32b86-99ba-4ed7-bf7c-e385edf2ec99/README.md), Condense saved 53.4% in the 400k+ bucket and cost more below 16k. A task mix dominated by short sessions would answer a different question.
 
-```
-Agent :: "Some agentic loop system: harness + model"
-Eval  :: Task -> Agent -> (Score, Cost)
-vanilla_score,  vanilla_cost  = Eval(task, agent)
-strategy_score, strategy_cost = Eval(task, Optimizer(agent))
 
-vanilla_score ~= strategy_score
-vanilla_cost  >= strategy_cost
-```
-
-But each assumption carries critical details that can lead
-to a non-rigorous experimental setup, so we will deconstruct each one.
+<details>
+<summary>Benchmark selection, predictability, and trajectory gating</summary>
 
 ## Choosing a benchmark
 
@@ -121,16 +115,10 @@ This leads to a more refined shape of evaluation:
 
 > Is the optimizer affecting the trajectories and solve rates of the agentic system?
 
-# Part 2: Using an Optimization Benchmark
+</details>
 
-[minmax-bench](https://github.com/condense-chat/minmax-bench) is our take on the benchmark described in Part 1.
-It treats a cost optimization as a two-sided trade: **cost** is the
-*minimize* target, **quality** is the *maximize* target, and neither means
-anything without the other.
-
-The Part 1 conclusion (the optimizer can change the trajectory itself) splits
-the evaluation into three types. Each one answers a different question, and each
-one relies on a different subset of the Part 1 assumptions.
+<details>
+<summary>Assumptions behind the three evaluation methods</summary>
 
 ## 1. Same-trajectory cost evaluation (the ideal case)
 
@@ -232,3 +220,7 @@ incremental to check that those savings don't lose information on long
 sessions, and confirm with full runs that the agent still solves the same tasks
 along similar trajectories. **Cost tells you what a strategy saves; quality
 tells you whether those savings are real.**
+
+</details>
+
+[Price recorded turns](cost.md) · [Evaluate quality](quality.md)

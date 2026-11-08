@@ -1,22 +1,19 @@
-# Architecture — strategies × mode × transport
+# How a request becomes a benchmark result
 
-How a benchmark run is assembled: what a **strategy** is, how the run-wide **mode** and
-**transport** axes change how it's measured, and which **executor** ends up doing the
-work.
+The cost harness reconstructs one request per recorded decision. A strategy transforms or forwards it. The executor records usage, the pricing module applies model rates, and the report pairs that turn with its baseline.
 
-```
-                       run-wide axes
-                    ┌────────────────┐
-                    │  --mode        │  proxy | rewrite
-                    │  --transport   │  anthropic | bedrock
-                    └───────┬────────┘
-                            ▼
- Strategy matrix ──▶ resolve(mode, transport) ──▶ ResolvedStrategy(kind, endpoint, headers)
- (name = runner+config)                                   │
-                                                          ▼
-                                                  executor for `kind`
-                                    proxy | rewrite | rewrite_capture | rewrite_invoke | noop
-```
+| Decision | Example | Implementation |
+| --- | --- | --- |
+| What changes the request? | Condense or Headroom | [Strategy matrix](../minmax_bench/strategies/matrix.py) |
+| How do we measure it? | Proxy usage or a locally priced rewrite | [Executors](../minmax_bench/executors/) |
+| Where do direct calls go? | Anthropic or Bedrock | [Transport](../minmax_bench/transport.py) |
+| How do counts become dollars? | Price uncached input, cache reads, writes and output separately | [Pricing](../minmax_bench/pricing.py) |
+
+## Trace one result
+
+In the [Opus reference run](../runs/run-5c61ab52-8eea-4fee-97a4-5c64ee5344af/README.md), the saved Condense arm is `condense-sync`, mode is `rewrite`, and the report uses Claude Opus 4.8 prices. The mode determines how usage was obtained. The model name in this run identifies the price schedule.
+
+To add a configuration for an existing runner, add a row to the strategy matrix and run `uv run minmax-bench strategies` to inspect it. The matrix supplies both the wizard choices and the names stored in the run manifest.
 
 ## The strategy matrix
 
@@ -36,6 +33,10 @@ benchmark a new variant; the matrix drives the run, the report rows, and the wiz
 
 A strategy is **only the compression technique**. *How* it is measured is resolved at
 run time from the two run-wide axes.
+
+
+<details>
+<summary>Mode, transport, and executor compatibility</summary>
 
 ## The mode axis — `proxy` | `rewrite`
 
@@ -87,6 +88,11 @@ The executors (`minmax_bench/executors/`) then do the measuring:
 - **`noop.py`** — the baseline: recorded usage from the transcript, or a local/API token
   count.
 
+</details>
+
+<details>
+<summary>Module map and quality harness</summary>
+
 ## Module map
 
 ```
@@ -130,3 +136,7 @@ and provisioning, but drives a **real agent** (Claude Code via Harbor) instead o
 harness simulator — arms are wired via `ANTHROPIC_BASE_URL` (proxy arms), the passthrough
 forwarder (`quality/passthrough.py`, the wiring-confound control), or the CCR Harbor agent
 (`harbor_agents/`). Methodology: [quality.md](quality.md).
+
+</details>
+
+[Cost methodology](cost.md) · [Quality methodology](quality.md)
