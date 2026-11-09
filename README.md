@@ -1,5 +1,7 @@
 ![minmax-bench by Condense](docs/img/bench-cover.svg)
 
+[condense.chat](https://condense.chat) · [condense.chat/docs](https://condense.chat/docs/) · [helm.condense.chat](https://helm.condense.chat)
+
 **Does compressing an agent’s context make the task cheaper to finish?** Replay recorded sessions to price the same work, then let the agent run independently to see whether it still solves the task.
 
 [Browse the benchmark site](https://condense-chat.github.io/dense/benchmarks/) · [Reproduce the Opus run](runs/run-5c61ab52-8eea-4fee-97a4-5c64ee5344af/README.md) · [Quality](#quality) · [Explore the datasets](data/README.md)
