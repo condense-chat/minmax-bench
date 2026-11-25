@@ -1986,3 +1986,47 @@ def test_compose_project_matches_harbors_own_sanitiser():
     assert _compose_project("regex-chess__4jcXe5e") == "regex-chess__4jcxe5e"
     assert _compose_project("install-windows-3.11__aB") == "install-windows-3-11__ab"
     assert _compose_project("_leading-underscore") == "0_leading-underscore"
+
+
+def test_bedrock_model_maps_first_party_ids_to_the_regional_profile():
+    from minmax_bench.quality import generate as gen
+    assert gen.bedrock_model("claude-opus-5-5", "eu-south-2") == "eu.anthropic.claude-opus-5-5"
+    assert gen.bedrock_model("claude-sonnet-5-5", "us-east-1") == "us.anthropic.claude-sonnet-5-5"
+    profile = "eu.anthropic.claude-opus-5-5"
+    assert gen.bedrock_model(profile, "us-east-1") == profile
+    arn = "arn:aws:bedrock:eu-south-2:1:inference-profile/x"
+    assert gen.bedrock_model(arn, "eu-south-2") == arn
+
+
+def test_auth_bedrock_needs_a_key_and_drops_first_party_credentials(monkeypatch):
+    from minmax_bench.quality import generate as gen
+    with pytest.raises(SystemExit):
+        gen._apply_auth(SimpleNamespace(auth="bedrock"), {})
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "o")
+    given = {"AWS_BEARER_TOKEN_BEDROCK": "b", "ANTHROPIC_API_KEY": "k"}
+    env = gen._apply_auth(SimpleNamespace(auth="bedrock"), given)
+    assert env["TMB_AUTH"] == "bedrock" and env["AWS_REGION"] == "eu-south-2"
+    assert "ANTHROPIC_API_KEY" not in env
+    assert os.environ["CLAUDE_CODE_USE_BEDROCK"] == "1" and "ANTHROPIC_API_KEY" not in os.environ
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in os.environ
+    assert gen._agent_auth_env(env) == []
+    assert gen._auth_label(env).startswith("AWS Bedrock (eu-south-2")
+
+
+def test_bedrock_wiring_vanilla_direct_condense_through_its_bedrock_route(monkeypatch, tmp_path):
+    from minmax_bench.quality import generate as gen
+    (tmp_path / "token").write_text("ck_test\n")
+    (tmp_path / "user").write_text("u-1\n")
+    _pin_dense_home(monkeypatch, tmp_path)
+    env = {"TMB_AUTH": "bedrock", "AWS_REGION": "eu-south-2"}
+    base, allow, agent, extra = gen._arm_wiring("vanilla", env)
+    host = "bedrock-runtime.eu-south-2.amazonaws.com"
+    assert (base, allow, agent, extra) == ("", host, "claude-code", [])
+    base, allow, agent, extra = gen._arm_wiring("condense", env)
+    assert agent == "claude-code" and base == "" and allow == "api.condense.chat"
+    assert "ANTHROPIC_BEDROCK_BASE_URL=https://api.condense.chat/bedrock/eu-south-2" in extra
+    assert "ANTHROPIC_CUSTOM_HEADERS=x-condense-auth-token: ck_test" in extra
+    assert gen._arm_proc_env("condense", env) == {}  # no dense provisioning on Bedrock
+    with pytest.raises(SystemExit):
+        gen._validate_full(SimpleNamespace(arms="condense,headroom", dry_run=True), env)

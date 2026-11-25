@@ -203,8 +203,44 @@ def _wall_cap(args, task_budget_sec, exec_mult):
     return max(args.wall_timeout, needed)
 
 
+BEDROCK_ARMS = ("vanilla", "condense")
+
+
+def _bedrock_region(env):
+    return env.get("AWS_REGION") or env.get("BEDROCK_REGION") or "eu-south-2"
+
+
+def bedrock_model(model, region):
+    """A first-party model id as the Bedrock cross-region inference profile Claude Code calls
+    (claude-opus-5-5 in eu-south-2 -> eu.anthropic.claude-opus-5-5). Bedrock ids and ARNs
+    pass through unchanged."""
+    if "anthropic." in model or model.startswith("arn:"):
+        return model
+    prefix = {"eu": "eu", "us": "us", "ap": "apac"}.get(region.split("-", 1)[0], "global")
+    return f"{prefix}.anthropic.{model}"
+
+
+def _bedrock_wiring(arm, env):
+    """--auth bedrock: harbor's own Bedrock mode (CLAUDE_CODE_USE_BEDROCK, the API key and
+    AWS_REGION in the harbor-process env) does the auth. Vanilla calls Bedrock directly; the
+    condense arm points Claude Code's Bedrock endpoint at condense's /bedrock/{region} route,
+    the way a Bedrock user integrates condense, and identifies itself with
+    x-condense-auth-token while the Bedrock key rides Authorization."""
+    region = _bedrock_region(env)
+    if arm == "vanilla":
+        return "", f"bedrock-runtime.{region}.amazonaws.com", "claude-code", []
+    creds = eng.condense_creds(env) or {}
+    root = creds.get("url", "https://api.condense.chat/anthropic").removesuffix("/anthropic")
+    host = root.split("://", 1)[-1].split("/", 1)[0]
+    return ("", host, "claude-code",
+            ["--ae", f"ANTHROPIC_BEDROCK_BASE_URL={root}/bedrock/{region}",
+             "--ae", f"ANTHROPIC_CUSTOM_HEADERS=x-condense-auth-token: {creds.get('token', '')}"])
+
+
 def _arm_wiring(arm, env):
     """(base_url, allow_host, harbor_agent, extra_flags) for an arm — how a real user deploys it."""
+    if env.get("TMB_AUTH") == "bedrock":
+        return _bedrock_wiring(arm, env)
     if arm == "vanilla":
         return "https://api.anthropic.com", "api.anthropic.com", "claude-code", []
     if arm == "vanilla-proxy":
@@ -263,7 +299,7 @@ def _arm_proc_env(arm, env):
     read by the agent MODULE, which runs host-side inside harbor, and end up only in the
     files dense reads (~/.config/dense/…) inside the container.
     """
-    if arm != "condense":
+    if arm != "condense" or env.get("TMB_AUTH") == "bedrock":
         return {}
     from minmax_bench.dense import load_profile
     p = load_profile(env.get("CONDENSE_PROFILE") or None)
@@ -426,8 +462,8 @@ def _agent_auth_env(env):
     (so a full run needs no API key — same default as the replay paths). Harbor
     forwards ANTHROPIC_API_KEY from the host env on its own; the OAuth token must be
     passed explicitly."""
-    if env.get("ANTHROPIC_API_KEY"):
-        return []
+    if env.get("TMB_AUTH") == "bedrock" or env.get("ANTHROPIC_API_KEY"):
+        return []  # bedrock: harbor forwards the key and region from its own env
     tok = eng.cc_oauth_token()
     return ["--ae", f"CLAUDE_CODE_OAUTH_TOKEN={tok}"] if tok else []
 
@@ -435,6 +471,8 @@ def _agent_auth_env(env):
 def _auth_label(env):
     """Human label for how upstream calls will ACTUALLY authenticate — so every run says
     plainly whether it's spending API credits or the user's Claude Code subscription."""
+    if env.get("TMB_AUTH") == "bedrock":
+        return f"AWS Bedrock ({_bedrock_region(env)}, Bedrock API key)"
     return {"api-key": "API key (API billing)",
             "subscription": "Claude Code subscription (no API key)"}.get(
                 eng.auth_mode(env), "NONE — set ANTHROPIC_API_KEY or run `claude setup-token`")
@@ -442,7 +480,12 @@ def _auth_label(env):
 
 def _validate_full(args, env):
     arms = ["vanilla"] + [a for a in args.arms.split(",") if a]
-    if not eng.auth_mode(env) and not args.dry_run:
+    if env.get("TMB_AUTH") == "bedrock":
+        other = [a for a in arms if a not in BEDROCK_ARMS]
+        if other:
+            sys.exit(f"--auth bedrock runs only {', '.join(BEDROCK_ARMS)}; "
+                     f"drop {', '.join(other)}.")
+    elif not eng.auth_mode(env) and not args.dry_run:
         sys.exit("no Anthropic auth — set ANTHROPIC_API_KEY, or log in to Claude Code "
                  "(run `claude setup-token` + `export CLAUDE_CODE_OAUTH_TOKEN=…`); the "
                  "container's agent needs it to run.")
@@ -499,7 +542,10 @@ def _preflight_full(arms, env):
         ("Docker daemon", _docker_alive(), "must be running (not just installed)", True),
         ("harbor CLI", bool(shutil.which("harbor")), "uv tool install harbor", True),
         ("Anthropic auth", bool(eng.auth_mode(env)),
-         eng.auth_mode(env) or "ANTHROPIC_API_KEY or `claude setup-token`", True),
+         eng.auth_mode(env) or "ANTHROPIC_API_KEY or `claude setup-token`", True)
+        if env.get("TMB_AUTH") != "bedrock" else
+        ("Bedrock API key", bool(env.get("AWS_BEARER_TOKEN_BEDROCK")),
+         f"AWS_BEARER_TOKEN_BEDROCK for {_bedrock_region(env)}", True),
     ]
     if "condense" in arms:
         creds = eng.condense_creds(env)
@@ -542,6 +588,17 @@ def _apply_auth(args, env):
     `--auth subscription` full run ran on OAuth — the same command reproducing on different
     credentials, which is exactly the wrong property when you are debugging an auth failure.
     """
+    if getattr(args, "auth", "auto") == "bedrock":
+        if not env.get("AWS_BEARER_TOKEN_BEDROCK"):
+            sys.exit("--auth bedrock needs AWS_BEARER_TOKEN_BEDROCK, a Bedrock API key (a "
+                     "short-term one from aws-bedrock-token-generator works).")
+        region = _bedrock_region(env)
+        for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+            os.environ.pop(k, None)  # so harbor can't fall back to first-party auth
+        os.environ.update({"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": region})
+        first_party = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+        kept = {k: v for k, v in env.items() if k not in first_party}
+        return {**kept, "TMB_AUTH": "bedrock", "CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": region}
     if getattr(args, "auth", "auto") != "subscription":
         return env
     os.environ.pop("ANTHROPIC_API_KEY", None)  # so harbor doesn't forward it either
@@ -625,11 +682,21 @@ def full(args, env):
                     # interrupt picks up where it left off instead of re-spending finished trials
                     done = len(glob.glob(f"{cell}/*/*/verifier/reward.txt"))
                     run_k = k if args.force else max(0, k - done)
-                    cmd = ["harbor", "run", "-d", args.dataset, "-a", agent, "-m", model,
+                    run_model = (bedrock_model(model, _bedrock_region(env))
+                                 if env.get("TMB_AUTH") == "bedrock" else model)
+                    cmd = ["harbor", "run", "-d", args.dataset, "-a", agent, "-m", run_model,
                            "-i", f"{org}/{task}", "-k", str(run_k),
                            "-n", str(args.concurrency),
                            "-o", cell, "--ak", f"max_budget_usd={args.budget_usd}",
                            "--allow-agent-host", allow, *_agent_auth_env(env), *extra]
+                    if env.get("TMB_AUTH") == "bedrock":
+                        # harbor aliases side and subagent models only behind a base URL; on
+                        # Bedrock a default Haiku profile may not be enabled in the region
+                        for alias in ("ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                                      "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                                      "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                                      "CLAUDE_CODE_SUBAGENT_MODEL"):
+                            cmd += ["--ae", f"{alias}={run_model}"]
                     if args.effort:
                         # harbor's ClaudeCode reasoning_effort kwarg -> `claude --effort`;
                         # every arm's agent subclasses ClaudeCode, so all arms inherit it
@@ -1088,9 +1155,12 @@ def main(argv=None):
     ap.add_argument("--setup-timeout-mult", type=float, default=3.0,
                     help="harbor agent SETUP timeout multiplier for every arm (installing "
                          "Claude Code + deps per container is slow; default 3 = ~18min)")
-    ap.add_argument("--auth", default="auto", choices=["auto", "api-key", "subscription"],
+    ap.add_argument("--auth", default="auto",
+                    choices=["auto", "api-key", "subscription", "bedrock"],
                     help="auto = API key if set, else Claude Code login; subscription = force "
-                         "the Claude Code login (container agent gets CLAUDE_CODE_OAUTH_TOKEN)")
+                         "the Claude Code login (container agent gets CLAUDE_CODE_OAUTH_TOKEN); "
+                         "bedrock = Claude Code on AWS Bedrock with AWS_BEARER_TOKEN_BEDROCK "
+                         "(arms: vanilla, condense)")
     ap.add_argument("--milestones", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the Harbor commands without running")

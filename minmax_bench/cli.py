@@ -77,7 +77,7 @@ def quality_run(
     setup_timeout_mult: float = typer.Option(3.0, "--setup-timeout-mult", help="Harbor agent SETUP timeout multiplier, all arms (slow container installs; 3 = ~18min)."),
     list_tasks: bool = typer.Option(False, "--list-tasks", help="Print the known tasks and exit."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the Harbor commands without running."),
-    auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force Claude Code login; no API key needed)."),
+    auth: str = typer.Option("auto", "--auth", help="auto | api-key | subscription (force Claude Code login; no API key needed) | bedrock (AWS_BEARER_TOKEN_BEDROCK)."),
     caveman_mode: str | None = typer.Option(None, "--caveman-mode", help="For the caveman arm: lite | full | ultra intensity (default full). Same knob as `quality incremental --caveman-mode`; sets TMB_CAVEMAN_MODE for the container."),
     force: bool = typer.Option(False, "--force", help="Full retry: re-run ALL cells including completed ones (re-spends the whole run). Default resumes — only cells missing trials re-run."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the guided wizard; use flags/defaults."),
