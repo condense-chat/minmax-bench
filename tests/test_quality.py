@@ -2030,3 +2030,18 @@ def test_bedrock_wiring_vanilla_direct_condense_through_its_bedrock_route(monkey
     assert gen._arm_proc_env("condense", env) == {}  # no dense provisioning on Bedrock
     with pytest.raises(SystemExit):
         gen._validate_full(SimpleNamespace(arms="condense,headroom", dry_run=True), env)
+
+
+def test_index_runs_finds_sessions_outside_the_app_workdir(tmp_path):
+    """Tasks whose workdir is not /app (fix-git runs in /app/personal-site) store the
+    transcript under a different project slug; the trial must still be indexed."""
+    from minmax_bench.quality.report import index_runs
+    inst = tmp_path / "condense-fix-git" / "job" / "fix-git__x"
+    (inst / "verifier").mkdir(parents=True)
+    (inst / "verifier" / "reward.txt").write_text("1")
+    sess = inst / "agent" / "sessions" / "projects" / "-app-personal-site"
+    sess.mkdir(parents=True)
+    line = {"type": "user", "message": {"role": "user", "content": "hi"}}
+    (sess / "s.jsonl").write_text(json.dumps(line) + "\n")
+    runs = index_runs(str(tmp_path), "claude-code")["condense-fix-git"]["runs"]
+    assert [r[1] for r in runs] == ["1"]
