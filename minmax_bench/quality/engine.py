@@ -37,9 +37,9 @@ import urllib.request
 from minmax_bench.auth import cc_oauth_token
 from minmax_bench.tls import ssl_context as _ssl_context
 
-# where a Harbor claude-code trial stores its session transcript (cwd=/app slug);
-# shared by report.py and generate.py so the path convention lives in one place
-SESSION_GLOB = "agent/sessions/projects/-app/*.jsonl"
+# where a Harbor claude-code trial stores its session transcript: one project dir named
+# after the task's workdir (-app, -app-personal-site, ...); shared by report.py and generate.py
+SESSION_GLOB = "agent/sessions/projects/*/*.jsonl"
 
 # USD per Mtok: input / output / cache_write (5-min TTL, 1.25x) / cache_read (0.1x).
 # Matched by model-id prefix, longest match wins; extend when replaying new models.
